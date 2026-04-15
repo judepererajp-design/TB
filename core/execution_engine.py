@@ -96,6 +96,13 @@ NEAR_ENTRY_FAST_POLL_DISTANCE = 0.02
 # Minimum decay penalty in confidence points before we require one extra
 # confirmation trigger for a still-pending entry.
 DECAY_TRIGGER_INCREMENT_THRESHOLD = 5.0
+LOCAL_RANGE_EXECUTE_BYPASS_STRATEGIES = frozenset({
+    "InstitutionalBreakout",
+    "Momentum",
+    "MomentumContinuation",
+    "RangeScalper",
+})
+LOCAL_RANGE_WRONG_SIDE_THRESHOLD = 0.20
 
 def _get_watching_timeout(sig) -> int:
     """Return setup-class-aware watching timeout in seconds."""
@@ -117,6 +124,49 @@ def _timeframe_to_seconds(timeframe: str) -> int:
         "1d": 86400,
     }
     return mapping.get(str(timeframe or "").lower(), 3600)
+
+
+def _late_local_range_reason(sig, price: float, ohlcv: list) -> Optional[str]:
+    """Block live execute calls that have drifted into the wrong side of a tight local range."""
+    if getattr(sig, "strategy", "") in LOCAL_RANGE_EXECUTE_BYPASS_STRATEGIES:
+        return None
+    if price <= 0 or not ohlcv or len(ohlcv) < 10:
+        return None
+
+    try:
+        highs = [float(bar[2]) for bar in ohlcv]
+        lows = [float(bar[3]) for bar in ohlcv]
+    except Exception:
+        return None
+
+    range_high = max(highs, default=0.0)
+    range_low = min(lows, default=0.0)
+    if range_high <= range_low:
+        return None
+
+    from config.constants import LocalRange as _LR
+
+    range_pct = (range_high - range_low) / max(price, MIN_PRICE_DENOMINATOR)
+    if range_pct > _LR.RANGE_PCT_THRESHOLD:
+        return None
+
+    eq = (range_high + range_low) / 2
+    half_range = (range_high - range_low) / 2
+    if half_range <= MIN_PRICE_DENOMINATOR:
+        return None
+
+    position = max(-1.0, min(1.0, (price - eq) / half_range))
+    if getattr(sig, "direction", "") == "LONG" and position > LOCAL_RANGE_WRONG_SIDE_THRESHOLD:
+        return (
+            f"Late LONG execute blocked: price drifted into premium of tight local range "
+            f"({position:+.2f}, range {range_pct*100:.1f}%)"
+        )
+    if getattr(sig, "direction", "") == "SHORT" and position < -LOCAL_RANGE_WRONG_SIDE_THRESHOLD:
+        return (
+            f"Late SHORT execute blocked: price drifted into discount of tight local range "
+            f"({position:+.2f}, range {range_pct*100:.1f}%)"
+        )
+    return None
 
 
 def _get_trigger_window_secs(setup_class: str) -> int:
@@ -844,6 +894,20 @@ class ExecutionEngine:
         try:
             baseline = sig.staleness_data or {}
             signal_age_hours = (time.time() - sig.created_at) / 3600
+            ohlcv_1h = None
+
+            # ── Check 0: local-range drift before execute ──────────────
+            # A setup can be valid at publish time but become a bad live trade if
+            # price runs into the wrong side of a tight local range before triggers complete.
+            # This is the "don't buy premium / sell discount after the move already happened"
+            # guard, independent of the optional LLM layer.
+            try:
+                ohlcv_1h = await api.fetch_ohlcv(sig.symbol, "1h", limit=50)
+                _late_reason = _late_local_range_reason(sig, price, ohlcv_1h)
+                if _late_reason:
+                    return _late_reason
+            except Exception:
+                pass
 
             # Only run staleness checks if signal is old enough to have meaningful drift
             # (less than 1 hour old = regime/structure haven't had time to change)
@@ -932,7 +996,8 @@ class ExecutionEngine:
             # on the analysis timeframe. If a LONG setup had bullish structure,
             # and a bearish CHoCH has formed since then, the setup is void.
             try:
-                ohlcv_1h = await api.fetch_ohlcv(sig.symbol, "1h", limit=20)
+                if ohlcv_1h is None:
+                    ohlcv_1h = await api.fetch_ohlcv(sig.symbol, "1h", limit=20)
                 if ohlcv_1h and len(ohlcv_1h) >= 6:
                     import numpy as np
                     closes_1h = np.array([float(b[4]) for b in ohlcv_1h])

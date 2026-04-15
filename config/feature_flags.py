@@ -47,6 +47,7 @@ class FeatureFlags:
         "PUMP_DUMP_DETECTION":      "off",
         "DEGRADATION_ENGINE":       "off",
         "POWER_ALIGNMENT":          "off",
+        "SIGNAL_VALIDATOR":         "off",
     }
 
     def __init__(self):

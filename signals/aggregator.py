@@ -52,6 +52,15 @@ except Exception:
     _tl = None
 
 
+def _validator_issue_text(result: Any, fallback: str = "validator flagged signal") -> str:
+    """Return a safe first validator issue for logging/UI text."""
+    issues = getattr(result, "issues", None) or []
+    if not issues:
+        return fallback
+    issue = str(issues[0] or "").strip()
+    return issue or fallback
+
+
 @dataclass
 class ScoredSignal:
     """A strategy signal that has been fully scored and is ready to publish"""
@@ -662,6 +671,111 @@ class SignalAggregator:
             except Exception:
                 pass
             return None
+
+        # ── 0b. Signal data validation ("Skeptical LLM Mode") ────────
+        # Dual-layer defense: Layer A (programmatic hard checks) catches
+        # impossible values; Layer B (LLM anomaly detection) catches
+        # suspicious indicator/direction combinations.
+        # Feature flag: SIGNAL_VALIDATOR (off | shadow | live)
+        try:
+            from config.feature_flags import ff
+            from signals.signal_validator import signal_validator
+
+            _ff_state = ff.get_state("SIGNAL_VALIDATOR")
+            if _ff_state in ("live", "shadow"):
+                _dir_str_v = getattr(signal.direction, 'value', str(signal.direction))
+                _regime_str_v = getattr(regime_analyzer.regime, 'value', 'UNKNOWN')
+                _val_data = {
+                    "symbol": signal.symbol,
+                    "direction": _dir_str_v,
+                    "strategy": signal.strategy,
+                    "confidence": signal.confidence,
+                    "regime": _regime_str_v,
+                    "entry_low": signal.entry_low,
+                    "entry_high": signal.entry_high,
+                    "stop_loss": signal.stop_loss,
+                    "price": entry_mid,
+                    "rr_ratio": signal.rr_ratio,
+                }
+                # Include raw_data indicators if available
+                _rd = signal.raw_data or {}
+                for _ik in ("rsi", "adx", "macd_histogram", "volume_ratio",
+                            "funding_rate", "bollinger_position", "atr"):
+                    if _ik in _rd:
+                        _val_data[_ik] = _rd[_ik]
+                if signal.atr is not None:
+                    _val_data["atr"] = signal.atr
+
+                # Run LLM layer only when AI mode is active
+                _run_llm = False
+                try:
+                    from analyzers.ai_analyst import ai_analyst
+                    _run_llm = getattr(ai_analyst, '_mode', 'off') != 'off'
+                except Exception:
+                    pass
+
+                _vr = await signal_validator.validate(_val_data, run_llm=_run_llm)
+
+                if _ff_state == "live":
+                    _primary_issue = _validator_issue_text(_vr)
+                    if _vr.status == "ERROR" or _vr.kill_switch:
+                        logger.warning(
+                            "🛑 Signal rejected by validator | %s %s %s | %s%s",
+                            signal.symbol, _dir_str_v, signal.strategy,
+                            "; ".join(_vr.issues) if _vr.issues else _primary_issue,
+                            " [KILL SWITCH]" if _vr.kill_switch else "",
+                        )
+                        if _tl:
+                            _tl.signal(
+                                symbol=signal.symbol, direction=_dir_str_v,
+                                grade="?", confidence=signal.confidence,
+                                entry_low=signal.entry_low, entry_high=signal.entry_high,
+                                stop_loss=signal.stop_loss, tp1=signal.tp1, tp2=signal.tp2,
+                                rr=signal.rr_ratio, strategy=signal.strategy,
+                                regime=_regime_str_v,
+                                result=f"REJECTED(VALIDATOR_ERROR {_primary_issue[:60]})",
+                            )
+                        # Record in diagnostic engine so it appears in Kill Reasons chart
+                        try:
+                            from core.diagnostic_engine import diagnostic_engine
+                            _kill_reason = "VALIDATOR_KILL_SWITCH" if _vr.kill_switch else "VALIDATOR_ERROR"
+                            diagnostic_engine.record_signal_death(
+                                symbol=signal.symbol, direction=_dir_str_v,
+                                strategy=signal.strategy, kill_reason=_kill_reason,
+                                rr=signal.rr_ratio, confidence=signal.confidence,
+                                regime=_regime_str_v,
+                                setup_class=getattr(signal, 'setup_class', 'intraday'),
+                            )
+                        except Exception:
+                            pass
+                        return None
+                    elif _vr.status == "WARNING" and _vr.data_quality in ("LOW", "MEDIUM"):
+                        # Dynamic penalty: scales with LLM distrust level
+                        from signals.signal_validator import DEFAULT_WARNING_PENALTY
+                        _penalty = _vr.dynamic_penalty if _vr.dynamic_penalty > 0 else DEFAULT_WARNING_PENALTY
+                        signal.confidence = max(40, signal.confidence - _penalty)
+                        signal.confluence.append(
+                            f"⚠️ Data validator: {_primary_issue[:80]} (confidence -{_penalty})"
+                        )
+                        logger.info(
+                            "⚠️ Validator warning | %s %s | quality=%s | %s | conf -%d",
+                            signal.symbol, signal.strategy, _vr.data_quality,
+                            _primary_issue[:60],
+                            _penalty,
+                        )
+                else:
+                    # Shadow mode — log only, don't affect signal
+                    if _vr.status != "OK":
+                        logger.info(
+                            "👻 VALIDATOR shadow | %s %s %s | status=%s quality=%s | %s",
+                            signal.symbol, _dir_str_v, signal.strategy,
+                            _vr.status, _vr.data_quality,
+                            "; ".join(_vr.issues)[:120],
+                        )
+        except ImportError:
+            pass  # validator not available — skip gracefully
+        except Exception as _val_err:
+            logger.debug("Signal validator error (non-fatal): %s", _val_err)
 
         # ── 1. Direction string (dedup check moved to post-scoring, step 13a) ──
         # DEDUP-FIX: Dedup now runs AFTER scoring so it compares final vs final confidence.
