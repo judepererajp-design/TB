@@ -132,7 +132,7 @@ class ReversalStrategy(BaseStrategy):
         if direction == "LONG":
             entry_low  = current - atr * rp.entry_zone_tight
             entry_high = current + atr * rp.entry_zone_atr
-            stop_loss  = lows[-3:].min() - atr * rp.sl_atr_mult * 0.25
+            stop_loss  = lows[-3:].min() - atr * rp.sl_atr_mult
             tp1 = current + atr * tp1_m
             tp2 = bb_mid  # Mean reversion target
             tp3 = current + atr * tp3_m
@@ -143,7 +143,7 @@ class ReversalStrategy(BaseStrategy):
         else:
             entry_high = current + atr * rp.entry_zone_tight
             entry_low  = current - atr * rp.entry_zone_atr
-            stop_loss  = highs[-3:].max() + atr * rp.sl_atr_mult * 0.25
+            stop_loss  = highs[-3:].max() + atr * rp.sl_atr_mult
             tp1 = current - atr * tp1_m
             tp2 = bb_mid
             tp3 = current - atr * tp3_m

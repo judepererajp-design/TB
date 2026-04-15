@@ -1,0 +1,46 @@
+2026-04-15 12:17:30 | INFO  | [SOURCE_CREDIBILITY] live | CoinDesk cred=0.95 raw=1.000 → adjusted=0.950
+2026-04-15 12:17:30 | INFO  | [HEADLINE_EVOLUTION] live | evolved: 'SEC Bans All Crypto Trading…' → 'SEC Considers New Framework for Regulati…' sim=0.03 penalty=0.6
+2026-04-15 12:17:30 | INFO  | [FEAR_GREED] live | F&G=10 dir=LONG adj=-0.114 mult=0.886
+2026-04-15 12:17:30 | INFO  | [FEAR_GREED] live | F&G=90 dir=SHORT adj=-0.114 mult=0.886
+2026-04-15 12:17:30 | INFO  | [FEAR_GREED] live | F&G=50 dir=LONG adj=+0.000 mult=1.000
+2026-04-15 12:17:30 | INFO  | [FEAR_GREED] live | F&G=50 dir=SHORT adj=+0.000 mult=1.000
+2026-04-15 12:17:30 | INFO  | [FEAR_GREED] live | F&G=10 dir=SHORT adj=+0.000 mult=1.000
+2026-04-15 12:17:30 | INFO  | [NARRATIVE_TRACKER] live | BTC dir=LONG adj=+0.050 mult=1.050 narratives=['Bitcoin ETF']
+2026-04-15 12:17:30 | INFO  | [NARRATIVE_TRACKER] shadow | BTC dir=LONG adj=+0.050 narratives=['Bitcoin ETF']
+2026-04-15 12:17:30 | INFO  | [NARRATIVE_TRACKER] shadow | BTC dir=LONG raw_adj=+0.000 narratives=['Bitcoin ETF'] (no live effect)
+2026-04-15 12:17:30 | WARNING | [PUMP_DUMP_DETECTION] live | BTCUSDT PUMP price=+12.0% vol=+350% risk=HIGH no_trade=True news_corr=False
+2026-04-15 12:17:30 | WARNING | [PUMP_DUMP_DETECTION] live | ETHUSDT DUMP price=-20.0% vol=+600% risk=VERY_HIGH no_trade=True news_corr=False
+2026-04-15 12:17:30 | WARNING | [PUMP_DUMP_DETECTION] live | SOLUSDT PUMP price=+5.0% vol=+160% risk=MEDIUM no_trade=False news_corr=False
+2026-04-15 12:17:30 | INFO  | [PUMP_DUMP_DETECTION] live | BTCUSDT price=+2.0% vol=+50% — no alert
+2026-04-15 12:17:30 | INFO  | [WHALE_INTENT] live | BTC $60.0M binance → inflow conf=0.90
+2026-04-15 12:17:30 | INFO  | [WHALE_INTENT] live | BTC $30.0M binance → outflow conf=0.80
+2026-04-15 12:17:30 | INFO  | [WHALE_INTENT] live | USDT $500.0M tether_treasury → mint conf=0.85
+2026-04-15 12:17:30 | WARNING | [DEGRADATION_ENGINE] live | news mode: PRIMARY → DEGRADED RSS=20% (3/15)
+2026-04-15 12:17:30 | WARNING | [DEGRADATION_ENGINE] live | news mode: PRIMARY → BLIND RSS=0% (0/15)
+2026-04-15 12:17:30 | WARNING | [PUMP_DUMP_DETECTION] live | BTCUSDT PUMP price=+12.0% vol=+400% risk=HIGH no_trade=True news_corr=False
+2026-04-15 12:17:30 | WARNING | [PUMP_DUMP_DETECTION] live | BTCUSDT PUMP price=+12.0% vol=+400% risk=MEDIUM no_trade=False news_corr=True
+2026-04-15 12:17:30 | WARNING | [PUMP_DUMP_DETECTION] live | BTCUSDT PUMP price=+20.0% vol=+600% risk=HIGH no_trade=True news_corr=True
+2026-04-15 12:17:30 | WARNING | [PUMP_DUMP_DETECTION] live | BTCUSDT PUMP price=+12.0% vol=+400% risk=HIGH no_trade=True news_corr=False
+2026-04-15 12:17:56 | INFO  | [SOURCE_CREDIBILITY] live | CoinDesk cred=0.95 raw=1.000 → adjusted=0.950
+2026-04-15 12:17:56 | INFO  | [HEADLINE_EVOLUTION] live | evolved: 'SEC Bans All Crypto Trading…' → 'SEC Considers New Framework for Regulati…' sim=0.03 penalty=0.6
+2026-04-15 12:17:56 | INFO  | [FEAR_GREED] live | F&G=10 dir=LONG adj=-0.114 mult=0.886
+2026-04-15 12:17:56 | INFO  | [FEAR_GREED] live | F&G=90 dir=SHORT adj=-0.114 mult=0.886
+2026-04-15 12:17:56 | INFO  | [FEAR_GREED] live | F&G=50 dir=LONG adj=+0.000 mult=1.000
+2026-04-15 12:17:56 | INFO  | [FEAR_GREED] live | F&G=50 dir=SHORT adj=+0.000 mult=1.000
+2026-04-15 12:17:56 | INFO  | [FEAR_GREED] live | F&G=10 dir=SHORT adj=+0.000 mult=1.000
+2026-04-15 12:17:56 | INFO  | [NARRATIVE_TRACKER] live | BTC dir=LONG adj=+0.050 mult=1.050 narratives=['Bitcoin ETF']
+2026-04-15 12:17:56 | INFO  | [NARRATIVE_TRACKER] shadow | BTC dir=LONG adj=+0.050 narratives=['Bitcoin ETF']
+2026-04-15 12:17:56 | INFO  | [NARRATIVE_TRACKER] shadow | BTC dir=LONG raw_adj=+0.000 narratives=['Bitcoin ETF'] (no live effect)
+2026-04-15 12:17:56 | WARNING | [PUMP_DUMP_DETECTION] live | BTCUSDT PUMP price=+12.0% vol=+350% risk=HIGH no_trade=True news_corr=False
+2026-04-15 12:17:56 | WARNING | [PUMP_DUMP_DETECTION] live | ETHUSDT DUMP price=-20.0% vol=+600% risk=VERY_HIGH no_trade=True news_corr=False
+2026-04-15 12:17:56 | WARNING | [PUMP_DUMP_DETECTION] live | SOLUSDT PUMP price=+5.0% vol=+160% risk=MEDIUM no_trade=False news_corr=False
+2026-04-15 12:17:56 | INFO  | [PUMP_DUMP_DETECTION] live | BTCUSDT price=+2.0% vol=+50% — no alert
+2026-04-15 12:17:56 | INFO  | [WHALE_INTENT] live | BTC $60.0M binance → inflow conf=0.90
+2026-04-15 12:17:56 | INFO  | [WHALE_INTENT] live | BTC $30.0M binance → outflow conf=0.80
+2026-04-15 12:17:56 | INFO  | [WHALE_INTENT] live | USDT $500.0M tether_treasury → mint conf=0.85
+2026-04-15 12:17:56 | WARNING | [DEGRADATION_ENGINE] live | news mode: PRIMARY → DEGRADED RSS=20% (3/15)
+2026-04-15 12:17:56 | WARNING | [DEGRADATION_ENGINE] live | news mode: PRIMARY → BLIND RSS=0% (0/15)
+2026-04-15 12:17:57 | WARNING | [PUMP_DUMP_DETECTION] live | BTCUSDT PUMP price=+12.0% vol=+400% risk=HIGH no_trade=True news_corr=False
+2026-04-15 12:17:57 | WARNING | [PUMP_DUMP_DETECTION] live | BTCUSDT PUMP price=+12.0% vol=+400% risk=MEDIUM no_trade=False news_corr=True
+2026-04-15 12:17:57 | WARNING | [PUMP_DUMP_DETECTION] live | BTCUSDT PUMP price=+20.0% vol=+600% risk=HIGH no_trade=True news_corr=True
+2026-04-15 12:17:57 | WARNING | [PUMP_DUMP_DETECTION] live | BTCUSDT PUMP price=+12.0% vol=+400% risk=HIGH no_trade=True news_corr=False

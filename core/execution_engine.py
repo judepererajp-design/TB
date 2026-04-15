@@ -1043,7 +1043,14 @@ class ExecutionEngine:
         rng  = h - l if (h - l) > 0 else 1e-9
 
         # Compute ATR-14 early — used by both rejection candle and momentum checks
-        atr_14 = float(np.mean(np.abs(closes[1:] - closes[:-1])[-14:])) if len(closes) >= 15 else (rng * 0.5)
+        # BUG-1 FIX: use True Range (max of H-L, |H-prev_close|, |L-prev_close|) instead
+        # of close-to-close differences, which understate ATR on wick-heavy candles.
+        if len(closes) >= 2:
+            _prev_c = np.concatenate([[closes[0]], closes[:-1]])
+            _tr = np.maximum(highs - lows, np.maximum(np.abs(highs - _prev_c), np.abs(lows - _prev_c)))
+            atr_14 = float(np.mean(_tr[-14:])) if len(_tr) >= 14 else float(np.mean(_tr))
+        else:
+            atr_14 = rng * 0.5
         avg_vol = float(np.mean(vols[-10:])) if len(vols) >= 10 else float(vols[-1])
 
         # Trigger 1: rejection candle — wick-heavy candle with meaningful size

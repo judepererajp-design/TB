@@ -182,10 +182,15 @@ class Momentum(BaseStrategy):
             tp2         = entry_low - atr * rp.volatility_scaled_tp2(tf, vp)
             tp3         = entry_low - atr * rp.volatility_scaled_tp3(tf, vp)
 
-        risk = (entry_low - stop_loss) if direction == "LONG" else (stop_loss - entry_high)
+        # BUG-6 FIX: use entry_mid for risk calculation to match the aggregator's
+        # geometry-validation formula (entry_mid - stop_loss / tp2 - entry_mid).
+        # Previously used entry_low (LONG) / entry_high (SHORT) which inflated
+        # internal R:R by 10-30% and passed signals the aggregator would later correct.
+        entry_mid = (entry_low + entry_high) / 2.0
+        risk = (entry_mid - stop_loss) if direction == "LONG" else (stop_loss - entry_mid)
         if risk <= 0:
             return None
-        rr_ratio = abs(tp2 - current_close) / risk
+        rr_ratio = abs(tp2 - entry_mid) / risk
 
         confluence: List[str] = [
             f"✅ MACD {'bullish' if direction == 'LONG' else 'bearish'} crossover",

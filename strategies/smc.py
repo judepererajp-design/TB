@@ -285,9 +285,13 @@ class SmartMoneyConcepts(BaseStrategy):
 
             for i in range(2, search_bars):
                 # Bullish OB: last bearish candle before a bullish impulse
-                if (opens[-i] > closes[-i]  # bearish OB candle
+                # BUG-9 FIX: measure impulse size relative to the OB body, not the
+                # impulse candle's own open price. On near-zero-price tokens, dividing
+                # by open price produces extreme percentages that fire on noise.
+                _bull_ob_body = opens[-i] - closes[-i]  # bearish OB body
+                if (_bull_ob_body > 0
                         and closes[-i + 1] > opens[-i + 1]   # impulse candle is bullish
-                        and (closes[-i + 1] - opens[-i + 1]) / opens[-i + 1] >= ob_min_impulse):
+                        and (closes[-i + 1] - opens[-i + 1]) / _bull_ob_body >= ob_min_impulse):
                     ob_high = opens[-i]
                     ob_low  = closes[-i]
                     if ob_low <= current_close <= ob_high + atr * 0.5:
@@ -301,9 +305,10 @@ class SmartMoneyConcepts(BaseStrategy):
                         break
 
                 # Bearish OB: last bullish candle before a bearish impulse
-                if (closes[-i] > opens[-i]  # bullish OB candle
+                _bear_ob_body = closes[-i] - opens[-i]  # bullish OB body
+                if (_bear_ob_body > 0
                         and closes[-i + 1] < opens[-i + 1]  # impulse is bearish
-                        and (opens[-i + 1] - closes[-i + 1]) / opens[-i + 1] >= ob_min_impulse):
+                        and (opens[-i + 1] - closes[-i + 1]) / _bear_ob_body >= ob_min_impulse):
                     ob_high = closes[-i]
                     ob_low  = opens[-i]
                     if ob_low - atr * 0.5 <= current_close <= ob_high:
