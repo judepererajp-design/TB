@@ -725,6 +725,19 @@ class SignalAggregator:
                                 regime=_regime_str_v,
                                 result=f"REJECTED(VALIDATOR_ERROR {_vr.issues[0][:60]})",
                             )
+                        # Record in diagnostic engine so it appears in Kill Reasons chart
+                        try:
+                            from core.diagnostic_engine import diagnostic_engine
+                            _kill_reason = "VALIDATOR_KILL_SWITCH" if _vr.kill_switch else "VALIDATOR_ERROR"
+                            diagnostic_engine.record_signal_death(
+                                symbol=signal.symbol, direction=_dir_str_v,
+                                strategy=signal.strategy, kill_reason=_kill_reason,
+                                rr=signal.rr_ratio, confidence=signal.confidence,
+                                regime=_regime_str_v,
+                                setup_class=getattr(signal, 'setup_class', 'intraday'),
+                            )
+                        except Exception:
+                            pass
                         return None
                     elif _vr.status == "WARNING" and _vr.data_quality in ("LOW", "MEDIUM"):
                         # Dynamic penalty: scales with LLM distrust level

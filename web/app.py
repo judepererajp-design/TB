@@ -1304,6 +1304,8 @@ class DashboardApp:
                     "DEDUP_WINDOW": "Dedup cooldown - same setup recently published, waiting for cooldown",
                     "RISK_LIMIT": "Risk limit - daily trade counter exhausted",
                     "CONFLUENCE": "Confluence threshold - not enough confirming factors",
+                    "VALIDATOR_ERROR": "Data validator - signal data failed programmatic or LLM integrity checks",
+                    "VALIDATOR_KILL_SWITCH": "Validator kill-switch - critical data confidence failure or multiple violations",
                 }
                 bottleneck_desc = reason_labels.get(top_killer, f"{top_killer} - {top_killer_count} signals killed")
 
@@ -1376,6 +1378,18 @@ class DashboardApp:
                 logger.debug("Failed to build near-miss metrics: %s", _nm_err)
                 near_miss_data["error"] = str(_nm_err)
 
+            # ── Signal Validator stats ────────────────────────────────
+            validator_stats = {}
+            try:
+                from config.feature_flags import ff
+                _vff = ff.get_state("SIGNAL_VALIDATOR")
+                if _vff in ("live", "shadow"):
+                    from signals.signal_validator import signal_validator
+                    validator_stats = signal_validator.get_stats()
+                    validator_stats["mode"] = _vff
+            except Exception as _vs_err:
+                logger.debug("Failed to load validator stats: %s", _vs_err)
+
             return _json_response({
                 "pipeline": pipeline_diag,
                 "kill_reasons": kill_reasons,           # from get_death_breakdown (sorted)
@@ -1385,6 +1399,7 @@ class DashboardApp:
                 "stats": stats,
                 "execution_gate": exec_gate_data,
                 "near_miss_tracking": near_miss_data,
+                "validator_stats": validator_stats,
             })
         except Exception as e:
             return _json_response({"error": str(e)})
@@ -1468,6 +1483,26 @@ class DashboardApp:
             # Add engine-level pre-filter stats
             db_funnel["scanned"] = getattr(diagnostic_engine, '_total_scan_count', 0)
             db_funnel["raw_generated"] = getattr(diagnostic_engine, '_total_signals_generated', 0)
+            # Add validator kill/warning counts from death log
+            try:
+                death_log = diagnostic_engine._death_log
+                import time as _t
+                _cutoff = _t.time() - hours * 3600
+                _recent = [d for d in death_log if d.get("ts", 0) >= _cutoff]
+                db_funnel["validator_kills"] = sum(
+                    1 for d in _recent
+                    if d.get("kill_reason", "").startswith("VALIDATOR_")
+                )
+            except Exception:
+                db_funnel["validator_kills"] = 0
+            try:
+                from config.feature_flags import ff
+                if ff.get_state("SIGNAL_VALIDATOR") in ("live", "shadow"):
+                    from signals.signal_validator import signal_validator
+                    _vs = signal_validator.get_stats()
+                    db_funnel["validator_warnings"] = _vs.get("llm_warnings", 0)
+            except Exception:
+                pass
             return _json_response(db_funnel)
         except Exception as e:
             return _json_response({"error": str(e)})
