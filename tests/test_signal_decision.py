@@ -41,7 +41,7 @@ def test_build_inputs_used_captures_signal_market_and_execution_context():
     inputs = _build_inputs_used(detail, ctx)
 
     assert any("confidence 78/100" in item for item in inputs["signal"])
-    assert any("entry 100.0 -> 101.0" in item for item in inputs["signal"])
+    assert any("entry 100.0 → 101.0" in item for item in inputs["signal"])
     assert any("regime at decision BULL_TREND" in item for item in inputs["market"])
     assert any("live price 100.4" in item for item in inputs["market"])
     assert any("execution score 58" in item for item in inputs["execution"])
@@ -63,11 +63,17 @@ def test_signal_decision_endpoint_returns_review(monkeypatch):
         "inputs_used": {"signal": ["stub"], "market": [], "execution": []},
     }
 
-    monkeypatch.setattr("data.database.db.get_signal", AsyncMock(return_value=sig))
+    sys.modules["config.loader"] = types.SimpleNamespace(
+        cfg=types.SimpleNamespace(ai={}, database=types.SimpleNamespace(path=":memory:"))
+    )
     monkeypatch.setattr("web.app._json_response", lambda data, status=200: data)
     monkeypatch.setattr(DashboardApp, "_build_signal_detail_payload", AsyncMock(return_value=detail))
-    monkeypatch.setattr("signals.signal_decision.review_signal", AsyncMock(return_value=review))
-    sys.modules["config.loader"] = types.SimpleNamespace(cfg=types.SimpleNamespace(ai={}))
+    sys.modules["data.database"] = types.SimpleNamespace(
+        db=types.SimpleNamespace(get_signal=AsyncMock(return_value=sig))
+    )
+    sys.modules["signals.signal_decision"] = types.SimpleNamespace(
+        review_signal=AsyncMock(return_value=review)
+    )
 
     app = DashboardApp()
     request = types.SimpleNamespace(match_info={"id": "42"})
