@@ -1,0 +1,699 @@
+# ============================================================
+# TITANBOT PRO — MASTER CONFIGURATION
+# Version: 3.0.0 | v300 — Full Overhaul (all audited bugs fixed)
+# ============================================================
+# THIS IS THE ONLY FILE YOU NEED TO EDIT.
+# All modules read from this file via ConfigLoader singleton.
+#
+# v300 CHANGES (full audit fix):
+#   - API keys removed from YAML — use .env (see .env.example)
+#   - Duplicate PRAGMA block removed from database.py
+#   - Indicator cache collision fixed (timeframe-aware keys)
+#   - get_recent_signals LIMIT raised to 500
+#   - EXPIRED outcome now calls portfolio close + price_cache unsub
+#   - Circuit breaker is_active no longer calls create_task from property
+#   - asyncio.get_event_loop() replaced with get_running_loop()
+#   - Learning loop evidence counters decrement on history trim
+#   - Backtester now runs all 13 strategies + full filter pipeline
+#   - Dashboard: ticker selector fixed, BE filter fixed, XSS fixed
+#   - Dashboard: Scan Notebook runs all 13 strategies
+#   - Dashboard: auth token on mutating endpoints
+#   - SSE no longer triggers full loadOv() every 5s
+#   - Period selector on outcomes chart now works
+#   - CORS allows all localhost ports
+# ============================================================
+
+# ============================================================
+# GLOBAL SWITCHES — Start here before touching anything else
+# ============================================================
+global:
+  debug_mode: false
+  test_mode: false
+  paper_trading: true
+  timezone: "UTC"
+  version: "3.0.0"
+
+  # ── AI Analyst (Nemotron-3-Super via OpenRouter) ───────────
+  # OpenRouter key format: sk-or-v1-xxxx
+  # Get your free key from: https://openrouter.ai
+  # Model used: nvidia/nemotron-3-super-120b-a12b:free ($0/token)
+  openrouter_api_key: "${OPENROUTER_API_KEY}"
+
+  # AI mode: "full" | "off" | "diagnosis_only"
+  #   full            — signal AI + self-healing diagnostic
+  #   diagnosis_only  — only diagnostic engine, no signal AI
+  #   off             — pure rule-based mode (v19 behaviour)
+  ai_mode: "full"
+
+  # ── HyperTracker (CMM) — Smart Money Intelligence ──────────
+  # Get your key from: app.coinmarketman.com/hypertracker → API
+  # Free tier: 100 req/day  |  Pulse: 50,000 req/month
+  # Cohort intel fetched ON DEMAND for A/A+ signals only (not on a timer).
+  # Watched wallets polled every 30 minutes.
+  hypertracker_api_key: ""   # No key needed — uses free Hyperliquid public API
+  # Watched wallets auto-populated by scripts/fetch_hl_wallets.py
+  # Run: python scripts/fetch_hl_wallets.py  to refresh from HL leaderboard
+  hypertracker_watched_wallets:
+    []   # populated by fetch_hl_wallets.py — run the script first
+
+# ============================================================
+# SYSTEM — Tuned for MacBook Pro 2013 / 8GB RAM / SSD
+# ============================================================
+system:
+  async_workers: 10
+  max_symbols: 200
+  batch_size: 10
+  tier1_interval: 120
+  tier2_interval: 300
+  tier3_interval: 900
+  stalker_interval: 180
+  regime_interval: 300
+  rotation_interval: 600
+  universe_refresh: 3600
+  prevent_sleep: true
+  reentry_cooldown_mins: 15  # V17: reduced from 30 to 15 min
+  # ── Logging ─────────────────────────────────────────────────
+  # log_level: verbosity of the main log and console (INFO or DEBUG).
+  # To capture everything for bug-finding, change debug_mode (above) to true.
+  #
+  # Files produced every run:
+  #   logs/titanbot.log — normal run log (INFO by default, DEBUG if debug_mode: true)
+  #   logs/errors.log   — ALWAYS captures WARNING/ERROR/CRITICAL from every module,
+  #                       with file name + line number. Commit this file to the repo
+  #                       after a run so a developer can review all issues at once.
+  #   logs/debug.log    — written ONLY when debug_mode: true; full exhaustive trace
+  #                       of every decision the bot makes.
+  #   logs/trades.log   — ALWAYS active; one line per signal/trigger/trail/outcome.
+  #                       Commit this file to trace trading-logic errors: wrong TPs,
+  #                       weak trigger arming, bad trailing stop behaviour, etc.
+  #
+  # Tip: set debug_mode: true (at the top of this file) for a full debug run,
+  # then commit logs/errors.log, logs/trades.log, and logs/debug.log for review.
+  log_level: "INFO"
+  log_file: "logs/titanbot.log"
+  error_log_file: "logs/errors.log"
+  debug_log_file: "logs/debug.log"
+  trade_log_file: "logs/trades.log"
+  log_max_bytes: 10485760      # 10 MB per file before rotation
+  log_backup_count: 5          # keep 5 rotated copies of each log
+  pending_signal_timeout: 14400
+  invalidation_check_interval: 30
+  entry_refiner_enabled: true
+  confirmation_bars: 2
+  liquidation_heatmap_enabled: true
+  liquidation_cache_ttl: 300
+  min_cluster_usd: 50000
+  backtest_window: 200
+  backtest_max_hold: 48
+
+# ============================================================
+# EXCHANGE — Binance Perpetual Futures
+# ============================================================
+exchange:
+  name: "binance"
+  type: "future"
+  testnet: false
+  rate_limit_buffer: 0.8
+  timeout_ms: 30000        # increased: load_markets() downloads 300+ contracts
+  connect_timeout_ms: 15000
+  retry_attempts: 5
+  retry_delay: 3.0
+  recv_window: 5000
+  excluded_symbols:
+    - "UP/USDT"
+    - "DOWN/USDT"
+    - "BEAR/USDT"
+    - "BULL/USDT"
+    - "LUNA/USDT"
+    - "USTC/USDT"
+    - "FTT/USDT"
+    - "EUR/USDT"
+    - "GBP/USDT"
+    - "FDUSD/USDT"
+    - "BUSD/USDT"
+    - "TUSD/USDT"
+    - "USDP/USDT"
+    # Commodity pairs — not suitable for crypto-focused ensemble scoring
+    - "XAU/USDT"
+    - "XAG/USDT"
+    - "PAXG/USDT"
+    # Symbols that consistently time out on OHLCV fetches (low liquidity)
+    - "BSW/USDT"
+    - "AMB/USDT"
+    - "YALA/USDT"
+    - "NEIROETH/USDT"
+    - "MEMEFI/USDT"
+    - "LEVER/USDT"
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+telegram:
+  # Token and chat_id loaded from .env
+  # chat_id        = SIGNALS channel
+  # market_chat_id = MARKET channel  (digests)
+  # admin_chat_id  = ADMIN channel   (system chatter, debug)
+  parse_mode: "HTML"
+  disable_web_preview: true
+  market_digest_interval_hours: 4
+  send_signals: true
+  send_watchlist_alerts: true
+  send_whale_alerts: true
+  send_tier_promotions: true
+  send_circuit_breaker_alerts: true
+  send_daily_summary: true
+  send_weekly_report: true
+  send_startup_message: true
+  send_error_alerts: true
+  daily_summary_hour: 8
+  weekly_report_day: 6
+  min_signal_interval: 60
+  max_signals_per_hour: 12  # Matched aggregator increase
+  emoji_style: "professional"
+  show_confluence_stack: true
+  show_invalidation: true
+  show_session_info: true
+
+# ============================================================
+# SCANNING — Tiered universe management
+# ============================================================
+scanning:
+  quote_currency: "USDT"
+  min_price_usdt: 0.000001
+  tier1:
+    enabled: true
+    max_symbols: 120
+    min_volume_24h: 5000000
+    description: "Institutional Grade"
+  tier2:
+    enabled: true
+    max_symbols: 120
+    min_volume_24h: 1000000
+    description: "Active Accumulation"
+  tier3:
+    enabled: true
+    max_symbols: 80
+    min_volume_24h: 200000
+    description: "Early Detection"
+  auto_promotion:
+    enabled: true
+    volume_spike_multiplier: 3.0
+    min_volume_for_promotion: 500000
+    cooldown_hours: 24
+    send_telegram_alert: true
+  whale_detection:
+    enabled: true
+    min_order_usd: 75000
+    min_volume_spike: 3.0
+    cooldown_minutes: 45
+    send_telegram_alert: true
+  priority_sectors:
+    - "LAYER1"
+    - "LAYER2"
+    - "DEFI"
+    - "AI"
+    - "GAMING"
+    - "RWA"
+    - "DEPIN"
+    - "EXCHANGE"
+    - "LSD"
+
+# ============================================================
+# STRATEGIES
+# ============================================================
+strategies:
+
+  smc:
+    enabled: true
+    timeframes: ["4h", "1h", "15m"]
+    confidence_base: 75
+    min_volume_24h: 2000000
+    structure:
+      lookback_swings: 20
+      min_break_pct: 0.002
+    order_blocks:
+      min_impulse_pct: 0.008
+      max_ob_age_bars: 50
+      require_volume_spike: true
+      volume_spike_mult: 1.5
+    fvg:
+      min_size_pct: 0.002
+      track_mitigation: true
+      ce_zone_pct: 0.5
+    sweeps:
+      lookback: 30
+      min_wick_pct: 0.003
+    killzones:
+      london_open: [7, 10]
+      ny_open: [12, 15]
+      london_close: [15, 17]
+      asia_open: [0, 3]
+      killzone_bonus: 10
+
+  breakout:
+    enabled: true
+    timeframe: "1h"
+    confidence_base: 78
+    min_volume_24h: 10000000
+    donchian_period: 20
+    min_adx: 28
+    volume_confirmation_mult: 1.8
+    retest_window_bars: 5
+    false_breakout_filter: true
+
+  reversal:
+    enabled: true
+    timeframe: "15m"
+    confidence_base: 72
+    min_volume_24h: 3000000
+    rsi_period: 14
+    rsi_oversold: 28
+    rsi_overbought: 72
+    bb_period: 20
+    bb_std: 2.5
+    require_divergence: true
+    require_rejection_candle: true
+
+  mean_reversion:
+    enabled: true
+    timeframes: ["1h", "15m"]
+    confidence_base: 65
+    min_volume_24h: 2000000
+    z_score_threshold: 2.2
+    z_score_period: 48
+    volume_confirmation_mult: 1.5
+    max_adx: 35
+    require_rejection: true
+
+  price_action:
+    enabled: true
+    timeframes: ["4h", "1h"]
+    confidence_base: 68
+    min_volume_24h: 1000000
+    patterns:
+      pin_bar: true
+      engulfing: true
+      inside_bar: true
+      morning_star: true
+      evening_star: true
+      doji_reversal: true
+    pin_bar_wick_ratio: 2.5
+    pin_bar_body_pct: 0.35
+    engulfing_min_size: 1.2
+    require_key_level: true
+
+  momentum:
+    enabled: true
+    timeframe: "1h"
+    confidence_base: 70
+    min_volume_24h: 5000000
+    macd_fast: 12
+    macd_slow: 26
+    macd_signal: 9
+    min_adx: 30
+    volume_surge_mult: 2.0
+    histogram_expansion: true
+
+  ichimoku:
+    enabled: true
+    timeframe: "4h"
+    confidence_base: 73
+    min_volume_24h: 3000000
+    tenkan: 9
+    kijun: 26
+    senkou_b: 52
+    displacement: 26
+    require_above_cloud: true
+    require_tk_cross: true
+    require_chikou_clear: true
+
+  elliott_wave:
+    enabled: true
+    timeframe: "4h"
+    confidence_base: 72
+    min_volume_24h: 5000000
+    min_wave_pct: 0.03
+    fibonacci_tolerance: 0.08
+    max_wave_bars: 200
+    target_wave: [3, 5]
+    fib_ratios:
+      wave2: [0.382, 0.500, 0.618]
+      wave3: [1.618, 2.000, 2.618]
+      wave4: [0.236, 0.382]
+      wave5: [0.618, 1.000, 1.618]
+
+  funding_arb:
+    enabled: true
+    timeframe: "1h"
+    confidence_base: 74
+    min_volume_24h: 10000000
+    extreme_long_threshold: 0.05
+    extreme_short_threshold: -0.03
+    min_oi_change: 8.0
+    lookback_periods: 3
+    counter_trend_only: true
+
+  range_scalper:
+    enabled: true
+    timeframes: ["15m", "1h"]
+    confidence_base: 62
+    min_volume_24h: 1000000
+    range_lookback: 40
+    edge_pct: 0.20
+    rsi_overbought: 68
+    rsi_oversold: 32
+    vol_confirmation: 1.3
+    min_range_atr: 3.0
+    min_rr: 1.3
+
+  wyckoff:
+    enabled: true
+    timeframe: "4h"
+    confidence_base: 76
+    min_volume_24h: 5000000
+    accumulation:
+      ps_volume_mult: 1.5
+      sc_volume_mult: 2.0
+      spring_min_pct: -0.03
+      spring_recovery_pct: 0.02
+    distribution:
+      bc_volume_mult: 1.5
+      utad_volume_decline: 0.7
+
+  harmonic:
+    enabled: true
+    timeframes: ["4h", "1h"]
+    confidence_base: 74
+    min_volume_24h: 2000000
+    setup_class: "swing"
+
+  geometric:
+    enabled: true
+    timeframes: ["4h", "1h"]
+    confidence_base: 72
+    min_volume_24h: 2000000
+    setup_class: "swing"
+
+# ============================================================
+# ANALYZERS
+# ============================================================
+analyzers:
+
+  volume:
+    vwap_window: 24
+    profile_bins: 100
+    value_area_pct: 0.70
+    obv_period: 20
+    mfi_period: 14
+
+  orderflow:
+    depth_limit: 50
+    wall_threshold_mult: 4.0
+    anti_spoofing: true
+    snapshot_samples: 2
+    snapshot_delay: 0.5
+    cache_ttl: 3
+
+  derivatives:
+    enabled: true
+    funding_threshold: 0.01
+    oi_change_threshold: 10
+    ls_extreme_high: 2.0
+    ls_extreme_low: 0.7
+    cache_ttl: 30
+
+  regime:
+    btc_sma_fast: 20
+    btc_sma_slow: 50
+    btc_dominance_bull: 50.0
+    btc_dominance_bear: 58.0
+    fear_greed_api: "https://api.alternative.me/fng/"
+    fear_greed_cache_ttl: 1800
+    chop_adx_max: 20
+    volatile_atr_mult: 2.0
+
+  rotation:
+    sectors:
+      LAYER1: ["BTC", "ETH", "SOL", "ADA", "AVAX", "DOT", "ATOM", "NEAR", "APT", "SUI", "TON", "TRX", "XRP", "BCH", "LTC", "DASH", "XMR", "ZEC", "XLM", "ETC"]
+      LAYER2: ["MATIC", "ARB", "OP", "IMX", "STRK", "ZK", "MANTA", "POL", "SEI", "INJ", "NTRN", "TIA", "RUNE", "STX", "ICP", "FLOW", "GLMR", "KLAY"]
+      DEFI: ["UNI", "AAVE", "CRV", "SUSHI", "COMP", "MKR", "SNX", "DYDX", "GMX", "PENDLE", "SKY", "ENA", "ETHFI", "RDNT", "STG", "CVX", "BAL", "ALPHA"]
+      AI: ["FET", "AGIX", "OCEAN", "RENDER", "TAO", "WLD", "ARKM", "VIRTUAL", "KAITO", "AIOZ", "AIOT", "GRASS"]
+      GAMING: ["AXS", "SAND", "MANA", "ENJ", "GALA", "BEAM", "PIXEL", "YGG", "VOXEL", "GHST", "CHZ", "DAR", "LOKA", "ROBO"]
+      MEME: ["DOGE", "SHIB", "PEPE", "FLOKI", "BONK", "WIF", "FARTCOIN", "PNUT", "TRUMP", "PENGU", "MOODENG", "GOAT", "TURBO", "MYRO", "SLERF"]
+      RWA: ["ONDO", "POLYX", "CFG", "TRU", "PAXG", "XAUT"]
+      DEPIN: ["HNT", "FIL", "AR", "STORJ", "GRT", "AKT", "IOTX", "UNFI"]
+      EXCHANGE: ["BNB", "OKB", "CRO", "DEXE", "HOOK"]
+      LSD: ["LDO", "RPL", "FXS", "ANKR"]
+      INFRA: ["LINK", "BAND", "PYTH", "JTO", "JUP", "ENS", "SNT", "QNT", "ORBS", "NKN", "ONT", "ONG", "HBAR"]
+      SOCIAL: ["HYPE", "HYPER", "CYBER", "KAITO", "UXLINK"]
+      L1_ALT: ["ALGO", "CELO", "VET", "ZIL", "WAVES", "NEO", "OMG", "ZEN", "XEM", "ICX"]
+    hot_sector_gain: 5.0
+    cold_sector_loss: -3.0
+    rotation_window_hours: 24
+
+  sentiment:
+    fear_greed_enabled: true
+    extreme_fear_threshold: 25
+    extreme_greed_threshold: 75
+
+  correlation:
+    btc_correlation_window: 48
+    high_correlation_threshold: 0.85
+    sector_correlation_penalty: 0.8
+
+# ============================================================
+# SIGNAL AGGREGATOR
+# ============================================================
+aggregator:
+  # First-pass geometry filter in the aggregator.
+  # Intentionally LOW — the engine's get_adaptive_min_confidence() is the
+  # real quality gate (direction-aware, F&G-adjusted, regime-adaptive).
+  # Setting this too high kills valid signals before they reach the smart gate.
+  # 62 = absolute floor (geometrically broken setups, wrong direction, etc.)
+  min_confidence: 60  # Lowered from 62: AI recommends allowing borderline signals to reach the engine's smarter adaptive gate (which is 69+ in BULL_TREND)
+
+  max_signals_per_symbol: 3        # 3/day per symbol — allows genuine re-setups across sessions
+  dedup_window_minutes: 180        # Was 240 — 3hr window still prevents spam but catches real re-setups
+
+  weights:
+    technical: 0.30
+    volume: 0.15
+    orderflow: 0.18
+    derivatives: 0.20
+    sentiment: 0.07
+    correlation: 0.10
+
+  # Regime adjustments.
+  #
+  # CHOPPY min_confidence_override: 80 → 70
+  #   The old value of 80 was HIGHER than apply_regime_filter's interpolated
+  #   confidence floor at moderate chop (e.g. ~73 at chop=0.25). This meant
+  #   signals that passed apply_regime_filter were silently killed here,
+  #   completely defeating the chop interpolation fix from V6.
+  #   70 = regime_thresholds.REGIME_THRESHOLDS["CHOPPY"]["trend_floor"]
+  #   The adaptive engine gate (get_adaptive_min_confidence) scales
+  #   dynamically from 70 → 82 based on actual chop_strength above this.
+  #
+  # VOLATILE min_confidence_override: 78 → 75
+  #   Same issue — adaptive engine handles the real scaling.
+  regime_adjustments:
+    BULL_TREND:
+      derivatives: +0.05
+      technical: -0.05
+    BEAR_TREND:
+      orderflow: +0.05
+      sentiment: +0.05
+      technical: -0.10
+    CHOPPY:
+      min_confidence_override: 70
+    VOLATILE:
+      derivatives: +0.08
+      min_confidence_override: 75
+
+  adaptation:
+    enabled: true
+    ewma_decay: 0.1
+    min_signals_before_adapt: 10
+    max_weight_boost: 0.15
+    max_weight_penalty: -0.15
+
+# ============================================================
+# RISK MANAGEMENT
+# ============================================================
+risk:
+  account_size: 5000
+  # account_balance is read by portfolio_engine for live capital tracking.
+  # It starts equal to account_size and is updated in memory as trades close.
+  # On restart it resets to this value — adjust to your current balance.
+  account_balance: 5000
+  base_currency: "USDT"
+
+  risk_per_trade: 0.007            # Was 0.005 ($25/trade). Now $35/trade at $5k — still conservative
+  max_risk_per_trade: 0.012        # Was 0.01 — small headroom for high-conviction A+ grades
+  min_risk_per_trade: 0.003        # Was 0.002
+
+  tier_risk:
+    tier1: 0.005
+    tier2: 0.003
+    tier3: 0.001
+
+  min_rr: 2.0
+  min_rr_trending: 2.0
+  min_rr_choppy: 1.5
+  min_rr_neutral: 1.8
+  target_rr: 2.5
+  max_rr: 6.0
+
+  use_kelly: true
+  kelly_fraction: 0.25            # Was 0.15 (15% of Kelly). 0.25 = quarter-Kelly — still very safe
+  max_position_pct: 0.05
+  max_entry_delay_min: 20
+
+  atr_period: 14
+  sl_atr_mult: 1.2
+  tp1_atr_mult: 1.8
+  tp2_atr_mult: 2.8
+  tp3_atr_mult: 4.0
+  entry_zone_atr_mult: 0.20
+  entry_zone_tight_mult: 0.10
+
+  rsi_overbought: 70
+  rsi_oversold: 30
+  rsi_extreme_ob: 80
+  rsi_extreme_os: 20
+  adx_trend_threshold: 25
+  adx_strong_trend: 40
+  adx_no_trend: 20
+  volume_spike_mult: 2.0
+
+  use_trailing: true
+  trail_activation: 1.0
+  trail_distance_atr: 1.0
+
+  max_daily_trades: 150       # 320 symbols * multiple strategies, allow plenty of room
+  max_daily_loss_pct: 0.03
+  max_concurrent_signals: 4       # Was 5 — matches max_correlated_positions*2 sectors realistically
+
+  correlation_adjustment: true
+  max_correlated_positions: 2
+
+  circuit_breaker:
+    max_consecutive_losses: 4     # Was 3 — too tight on cold start with no prior data; tighten after 30+ trades
+    max_losses_per_hour: 3        # Was 2 — 3 losses/hr still protective without hair-trigger pauses
+    cooldown_minutes: 45
+    max_drawdown_pct: 0.08
+    max_peak_drawdown_pct: 0.12   # T3-FIX: halt if capital drops 12% from today's intraday high
+    max_absolute_day_loss_pct: 0.20  # ISSUE-8: hard kill if total day loss exceeds 20% — no cooldown, clears at midnight
+
+# ============================================================
+# DATABASE
+# ============================================================
+database:
+  path: "data/titanbot.db"
+  wal_mode: true
+  pool_size: 3
+  timeout: 5.0
+  enable_backup: true
+  backup_interval: 86400
+  backup_path: "data/backups/"
+
+# ============================================================
+# PATTERNS
+# ============================================================
+patterns:
+
+  harmonic:
+    enabled: true
+    tolerance: 0.10
+    pivot_order: 5
+    min_swing_pct: 0.03
+    patterns:
+      gartley: true
+      bat: true
+      crab: true
+      butterfly: true
+      shark: true
+      cypher: true
+
+  geometric:
+    enabled: true
+    pivot_order: 3
+    lookback: 50
+    patterns:
+      flags: true
+      triangles: true
+      head_shoulders: true
+      double_top_bottom: true
+      wedges: true
+    confidence_threshold: 65
+
+  wyckoff:
+    enabled: true
+    min_range_bars: 20
+    volume_sensitivity: 1.3
+
+# ============================================================
+# GOVERNANCE
+# ============================================================
+governance:
+  outcome_tracking: true
+  report_windows: [7, 30, 90]
+  auto_disable:
+    enabled: true
+    min_signals: 20
+    min_win_rate: 0.35
+    re_enable_after_days: 7
+  health_check_interval: 60
+  unhealthy_threshold: 3
+
+# ============================================================
+# REGIME THRESHOLDS — Strategy chop weight overrides
+# ============================================================
+# These override the defaults in signals/regime_thresholds.py.
+# Only add entries for strategies you want to change.
+# trend = weight at chop_strength=0.0 (pure trend market)
+# chop  = weight at chop_strength=1.0 (pure choppy market)
+# Interpolated linearly between. Range: 0.25 to 1.35
+#
+# After 2-4 weeks of paper trading, check which strategies
+# are winning/losing in each regime and adjust accordingly.
+# Default values are documented here for reference:
+#
+#   SmartMoneyConcepts:    trend: 1.00  chop: 0.85
+#   InstitutionalBreakout: trend: 1.00  chop: 0.45
+#   MomentumContinuation:  trend: 1.00  chop: 0.40
+#   ElliottWave:           trend: 1.00  chop: 0.35
+#   IchimokuCloud:         trend: 1.00  chop: 0.50
+#   MeanReversion:         trend: 0.75  chop: 1.30
+#   ExtremeReversal:       trend: 0.80  chop: 1.20
+#   PriceAction:           trend: 1.00  chop: 0.90
+#   FundingRateArb:        trend: 1.00  chop: 1.10
+#   RangeScalper:          trend: 0.30  chop: 1.35
+#
+# Example override (uncomment and adjust after data):
+# regime_thresholds:
+#   chop_weights:
+#     ElliottWave:
+#       trend: 1.00
+#       chop: 0.25    # Lower if EW keeps losing in chop
+
+# ============================================================
+# CACHE
+# ============================================================
+cache:
+  ohlcv_ttl: 60
+  orderflow_ttl: 3
+  derivatives_ttl: 30
+  regime_ttl: 300
+  rotation_ttl: 600
+  sentiment_ttl: 1800
+  universe_ttl: 3600
+
+# ── Time Filters ─────────────────────────────────────────────────────────────
+# Dead zone: no trading during low-liquidity hours (UTC)
+# Avoid 03:00–07:00 UTC (Asian session close, EU pre-open, low volume)
+time_filters:
+  dead_zone_start_utc: 3      # Hour to start avoiding signals (UTC)
+  dead_zone_end_utc:   7      # Hour to stop avoiding signals (UTC)
+  enable_dead_zone:    true   # Set false to disable entirely
+
