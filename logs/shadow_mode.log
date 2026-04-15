@@ -1,9 +1,0 @@
-2026-04-15 12:17:30,100 | {"ts": 1776255450.1001484, "feature": "NARRATIVE_TRACKER", "symbol": "BTC", "direction": "LONG", "active_narratives": [{"name": "Bitcoin ETF", "momentum": "rising", "velocity": 7.0, "unique_titles_24h": 3}], "adjustment": 0.05, "multiplier": 1.05}
-2026-04-15 12:17:30,151 | {"ts": 1776255450.151491, "feature": "TEST_FEATURE", "key": "value", "number": 42}
-2026-04-15 12:17:30,152 | {"ts": 1776255450.1521058, "feature": "TEST", "string": "hello", "number": 3.14, "list": [1, 2, 3], "nested": {"a": "b"}}
-2026-04-15 12:17:56,857 | {"ts": 1776255476.857323, "feature": "NARRATIVE_TRACKER", "symbol": "BTC", "direction": "LONG", "active_narratives": [{"name": "Bitcoin ETF", "momentum": "rising", "velocity": 7.0, "unique_titles_24h": 3}], "adjustment": 0.05, "multiplier": 1.05}
-2026-04-15 12:17:56,899 | {"ts": 1776255476.8993337, "feature": "TEST_FEATURE", "key": "value", "number": 42}
-2026-04-15 12:17:56,899 | {"ts": 1776255476.8999698, "feature": "TEST", "string": "hello", "number": 3.14, "list": [1, 2, 3], "nested": {"a": "b"}}
-2026-04-15 12:45:23,647 | {"ts": 1776257123.6471727, "feature": "NARRATIVE_TRACKER", "symbol": "BTC", "direction": "LONG", "active_narratives": [{"name": "Bitcoin ETF", "momentum": "rising", "velocity": 7.0, "unique_titles_24h": 3}], "adjustment": 0.05, "multiplier": 1.05}
-2026-04-15 12:45:23,699 | {"ts": 1776257123.6993632, "feature": "TEST_FEATURE", "key": "value", "number": 42}
-2026-04-15 12:45:23,700 | {"ts": 1776257123.7000227, "feature": "TEST", "string": "hello", "number": 3.14, "list": [1, 2, 3], "nested": {"a": "b"}}
