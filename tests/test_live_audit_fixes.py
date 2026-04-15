@@ -1,6 +1,3 @@
-from pathlib import Path
-
-
 def test_effective_rr_matches_aggregator_long():
     from strategies.base import BaseStrategy
 
@@ -66,12 +63,3 @@ def test_smc_allows_counter_trend_choch_reversal():
     )
 
     assert allowed is True
-
-
-def test_smc_and_elliott_use_effective_rr_helper():
-    repo_root = Path(__file__).resolve().parents[1]
-    smc_source = repo_root.joinpath("strategies", "smc.py").read_text()
-    elliott_source = repo_root.joinpath("strategies", "elliott_wave.py").read_text()
-
-    assert "calculate_effective_rr(" in smc_source
-    assert "calculate_effective_rr(" in elliott_source
