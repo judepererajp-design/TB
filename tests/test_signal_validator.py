@@ -226,13 +226,14 @@ class TestLayerBLLMCheck:
 
     async def test_llm_warning_detected(self, validator):
         """LLM returning a WARNING should populate llm_warnings."""
-        mock_response = '{"status": "WARNING", "data_confidence": 35, "issues": ["RSI is 80 but signal is BUY — overbought condition"]}'
-        with patch("utils.free_llm.call_llm", new_callable=AsyncMock, return_value=mock_response):
-            with patch("utils.free_llm.parse_json_response", return_value={
-                "status": "WARNING",
-                "data_confidence": 35,
-                "issues": ["RSI is 80 but signal is BUY — overbought condition"],
-            }):
+        llm_parsed = {
+            "status": "WARNING",
+            "data_confidence": 35,
+            "issues": ["RSI is 80 but signal is BUY — overbought condition"],
+        }
+        # call_llm returns raw text; parse_json_response converts it to dict
+        with patch("utils.free_llm.call_llm", new_callable=AsyncMock, return_value='{"status":"WARNING"}'):
+            with patch("utils.free_llm.parse_json_response", return_value=llm_parsed):
                 # Force LLM to run (reset cooldown)
                 validator._last_llm_validation = 0
                 result = await validator.validate(
@@ -245,7 +246,8 @@ class TestLayerBLLMCheck:
 
     async def test_llm_ok_passes_clean(self, validator):
         """LLM returning OK should not add warnings."""
-        with patch("utils.free_llm.call_llm", new_callable=AsyncMock, return_value='{}'):
+        # call_llm raw text is irrelevant — parse_json_response mock controls the parsed result
+        with patch("utils.free_llm.call_llm", new_callable=AsyncMock, return_value='{"status":"OK"}'):
             with patch("utils.free_llm.parse_json_response", return_value={
                 "status": "OK",
                 "data_confidence": 95,
