@@ -25,9 +25,9 @@ def _make_ohlcv_bars(n=20, price_start=100.0, price_end=100.0):
         if i < n - 5:
             c = price_start
         else:
-            frac = (i - (n - 5)) / 4  # 0.0 → 1.0 over last 5 bars
+            frac = (i - (n - 5)) / (5 - 1)  # 0.0 → 1.0 over the last 5 bars
             c = price_start + frac * (price_end - price_start)
-        atr = c * 0.01  # 1% ATR per bar
+        atr = c * 0.01  # ATR = 1 % of each bar's close price
         h = c + atr / 2
         lo = c - atr / 2
         bars.append([ts, c, h, lo, c, 1000.0])
@@ -75,10 +75,11 @@ def _run_gate5(dir_str, bars, warmup_end_time, current_p=None):
         if len(_chk_bars) >= 8:
             _c_now  = float(_chk_bars[-1][4])
             _c_4ago = float(_chk_bars[-5][4])
+            _atr_period = 14
             _atr = (
                 sum(float(_chk_bars[i][2]) - float(_chk_bars[i][3])
-                    for i in range(-14, 0)) / 14
-            ) if len(_chk_bars) >= 14 else 0.0
+                    for i in range(-_atr_period, 0)) / _atr_period
+            ) if len(_chk_bars) >= _atr_period else 0.0
             if _c_4ago > 0 and _atr > 0 and _c_now > 0:
                 _4h_chg = (_c_now - _c_4ago) / _c_4ago * 100
                 _atr_pct = _atr / _c_now * 100

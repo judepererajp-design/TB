@@ -4448,6 +4448,8 @@ class Engine:
                     # direction.  Prevents "catch-up" signals published at extended prices
                     # when moves happened before the bot was running.
                     # Only active during the post-startup window; no impact after that.
+                    # Note: falls back to 4h bars when 1h is unavailable, which widens the
+                    # measured window to ~16h — intentionally conservative for that case.
                     _psfilt_active = (
                         self._warmup_end_time > 0
                         and time.time() - self._warmup_end_time < Timing.POST_STARTUP_FILTER_SECS
@@ -4459,10 +4461,11 @@ class Engine:
                             if len(_chk_bars) >= 8:
                                 _c_now  = float(_chk_bars[-1][4])
                                 _c_4ago = float(_chk_bars[-5][4])
+                                _atr_period = 14
                                 _atr = (
                                     sum(float(_chk_bars[i][2]) - float(_chk_bars[i][3])
-                                        for i in range(-14, 0)) / 14
-                                ) if len(_chk_bars) >= 14 else 0.0
+                                        for i in range(-_atr_period, 0)) / _atr_period
+                                ) if len(_chk_bars) >= _atr_period else 0.0
                                 if _c_4ago > 0 and _atr > 0 and _c_now > 0:
                                     _4h_chg = (_c_now - _c_4ago) / _c_4ago * 100
                                     _atr_pct = _atr / _c_now * 100
