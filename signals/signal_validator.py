@@ -103,6 +103,10 @@ KILL_SWITCH_CRITICAL_ISSUES = 3      # Hard reject if ≥ this many critical iss
 DRIFT_WINDOW_SIZE = 50               # Rolling window for flag rate
 DRIFT_ALERT_THRESHOLD = 0.30         # Alert if >30% flagged
 
+# LLM response limits
+MAX_LLM_ISSUES = 3                   # Cap issues extracted from LLM response
+DEFAULT_WARNING_PENALTY = 4          # Fallback penalty when dynamic_penalty is 0
+
 
 class SignalValidator:
     """
@@ -471,7 +475,7 @@ class SignalValidator:
 
             parsed = parse_json_response(raw)
             if not parsed:
-                logger.debug("Signal validator LLM response not parseable — skipping")
+                logger.debug("Signal validator LLM JSON parse failed — skipping Layer B")
                 return
 
             # Extract LLM verdict
@@ -482,7 +486,7 @@ class SignalValidator:
             result.llm_confidence_in_data = max(0, min(100, confidence))
 
             if status in ("ERROR", "WARNING") and issues:
-                for issue in issues[:3]:  # cap at 3 issues
+                for issue in issues[:MAX_LLM_ISSUES]:
                     if isinstance(issue, str):
                         result.llm_warnings.append(issue)
             elif confidence < 50:

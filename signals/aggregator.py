@@ -728,7 +728,8 @@ class SignalAggregator:
                         return None
                     elif _vr.status == "WARNING" and _vr.data_quality in ("LOW", "MEDIUM"):
                         # Dynamic penalty: scales with LLM distrust level
-                        _penalty = _vr.dynamic_penalty if _vr.dynamic_penalty > 0 else 4
+                        from signals.signal_validator import DEFAULT_WARNING_PENALTY
+                        _penalty = _vr.dynamic_penalty if _vr.dynamic_penalty > 0 else DEFAULT_WARNING_PENALTY
                         signal.confidence = max(40, signal.confidence - _penalty)
                         signal.confluence.append(
                             f"⚠️ Data validator: {_vr.issues[0][:80]} (confidence -{_penalty})"
