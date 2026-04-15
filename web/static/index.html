@@ -3331,6 +3331,10 @@ function sdpRender(){
     body+=`<div class="sdm-section" style="margin-top:12px">Setup</div>`;
     body+=`<div class="sdm-row"><span class="sdm-label">Strategy</span><span class="sdm-val">${d.strategy||'—'}</span></div>`;
     body+=`<div class="sdm-row"><span class="sdm-label">Class</span><span class="sdm-val">${d.setup_class||'intraday'}</span></div>`;
+    var _scEtf2=d.entry_timeframe||(({'scalp':'15m','intraday':'1h','swing':'4h','positional':'1d'})[d.setup_class||'intraday']||'1h');
+    var _scCtf2=({'scalp':'5m','intraday':'15m','swing':'1h','positional':'4h'})[d.setup_class||'intraday']||'15m';
+    body+=`<div class="sdm-row"><span class="sdm-label">Entry Chart</span><span class="sdm-val">${_scEtf2}</span></div>`;
+    body+=`<div class="sdm-row"><span class="sdm-label">Confirm On</span><span class="sdm-val">${_scCtf2}</span></div>`;
     body+=`<div class="sdm-row"><span class="sdm-label">Sector</span><span class="sdm-val">${d.sector||'—'}</span></div>`;
     body+=`<div class="sdm-section" style="margin-top:12px">Execution Guidance</div>`;
     body+=`<div class="sdm-row"><span class="sdm-label">Expected fill</span><span class="sdm-val">${d.expected_fill_low&&d.expected_fill_high?fp(d.expected_fill_low)+' – '+fp(d.expected_fill_high):'—'}</span></div>`;
@@ -3606,6 +3610,11 @@ function renderSdm(){
     body+=`<div class="sdm-section" style="margin-top:14px">Setup Context</div>`;
     body+=_sdmRow('Strategy',d.strategy||'—','');
     body+=_sdmRow('Setup Class',(d.setup_class||'intraday').charAt(0).toUpperCase()+(d.setup_class||'intraday').slice(1),'');
+    var _scConfirmMap={'scalp':'5m','intraday':'15m','swing':'1h','positional':'4h'};
+    var _scEntryTf=d.entry_timeframe||(({'scalp':'15m','intraday':'1h','swing':'4h','positional':'1d'})[d.setup_class||'intraday']||'1h');
+    var _scConfirmTf=_scConfirmMap[d.setup_class||'intraday']||'15m';
+    body+=_sdmRow('Entry Chart',_scEntryTf,'');
+    body+=_sdmRow('Confirm On',_scConfirmTf,'');
     body+=_sdmRow('Sector',d.sector||'Unknown','');
     body+=_sdmRow('Direction',d.direction||'—',d.direction==='LONG'?'up':'dn');
   } else if(_sdmTab==='logic'){
