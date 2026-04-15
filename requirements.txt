@@ -1,0 +1,43 @@
+# TitanBot Pro v6 — Python Dependencies
+# Install: pip install -r requirements.txt
+# Python 3.10+ required  (tested on 3.11.9 macOS, 3.12 Linux)
+#
+# Quick start:
+#   python3 -m venv venv
+#   source venv/bin/activate      # Windows: venv\Scripts\activate
+#   pip install -r requirements.txt
+#   cp .env.example .env          # then fill in your keys
+#   python main.py
+
+# ── Exchange connectivity ──────────────────────────────────────────────────
+ccxt==4.3.91                    # Crypto exchange library — Binance Futures public API
+
+# ── Telegram bot ──────────────────────────────────────────────────────────
+python-telegram-bot==20.8       # Async PTB with inline keyboards + callback handlers
+
+# ── AI / OpenRouter ───────────────────────────────────────────────────────
+openai>=1.30.0                  # OpenAI-compatible client — used to call OpenRouter
+                                # (ai_analyst.py + veto_system.py use AsyncOpenAI)
+
+# ── Data processing ───────────────────────────────────────────────────────
+numpy>=1.26.0                   # Numerical computing (backtester, feature store)
+pandas>=2.2.0                   # Data manipulation (regime, performance)
+
+# ── Async HTTP ────────────────────────────────────────────────────────────
+aiohttp>=3.9.0                  # Async HTTP client (news scraper, liquidation, APIs)
+aiohttp-cors>=0.7.0             # CORS middleware for web dashboard
+
+# ── Database ──────────────────────────────────────────────────────────────
+aiosqlite>=0.20.0               # Async SQLite (all persistence)
+
+# ── Configuration ─────────────────────────────────────────────────────────
+python-dotenv>=1.0.0            # Load .env file at startup
+PyYAML>=6.0.0                   # Parse settings.yaml
+
+# ── System monitoring ─────────────────────────────────────────────────────
+psutil>=5.9.0                   # CPU, RAM, temperature (health monitor + MacBook guard)
+
+# ── Optional performance boost ────────────────────────────────────────────
+# uvloop>=0.19.0                # 2-3x faster async event loop (Linux + macOS only)
+                                # Install: pip install uvloop
+                                # Uncomment the import in main.py if installed
