@@ -224,7 +224,7 @@ async def _call_ai(prompt: str, api_key: str = "") -> Dict[str, Any]:
         raise ValueError("No response from AI provider")
     result = _parse_json_response(raw)
     if result is None:
-        raise ValueError(f"Failed to parse AI response: {raw[:200]}")
+        raise ValueError("Failed to parse AI response")
     return result
 
 

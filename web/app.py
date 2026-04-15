@@ -2133,7 +2133,8 @@ class DashboardApp:
                 return _json_response({"error": "Signal not found"})
             return _json_response(await self._build_signal_detail_payload(signal_id, sig))
         except Exception as e:
-            return _json_response({"error": str(e)})
+            logger.exception("Failed to build signal detail payload")
+            return _json_response({"error": "Failed to load signal detail"})
 
     async def _handle_signal_decision(self, request: "web.Request") -> "web.Response":
         """GET /api/signals/{id}/decision - run an on-demand AI decision review."""
@@ -2142,7 +2143,7 @@ class DashboardApp:
             from data.database import db
             sig = await db.get_signal(signal_id)
             if not sig:
-                return _json_response({"error": "Signal not found"}, 404)
+                return _json_response({"error": "Signal not found"})
             from config.loader import cfg
             from signals.signal_decision import review_signal
             detail = await self._build_signal_detail_payload(signal_id, sig)
@@ -2153,7 +2154,8 @@ class DashboardApp:
             )
             return _json_response({"signal_id": signal_id, **review})
         except Exception as e:
-            return _json_response({"error": str(e)})
+            logger.exception("Failed to run signal decision review")
+            return _json_response({"error": "Failed to run AI review"})
 
     async def _handle_signal_enter(self, request: "web.Request") -> "web.Response":
         """POST /api/signals/{id}/enter - user confirms entry from dashboard (Option B flow)."""
