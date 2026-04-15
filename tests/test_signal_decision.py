@@ -84,7 +84,7 @@ def test_signal_decision_endpoint_returns_review(monkeypatch):
     assert data["summary"].startswith("Price is in-zone")
 
 
-def test_review_signal_times_out_to_rule_based_fallback(monkeypatch):
+def test_review_signal_timeout_fallback(monkeypatch):
     import signals.signal_decision as signal_decision
 
     async def slow_call(*_args, **_kwargs):
