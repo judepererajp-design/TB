@@ -106,6 +106,7 @@ DRIFT_ALERT_THRESHOLD = 0.30         # Alert if >30% flagged
 # LLM response limits
 MAX_LLM_ISSUES = 3                   # Cap issues extracted from LLM response
 DEFAULT_WARNING_PENALTY = 4          # Fallback penalty when dynamic_penalty is 0
+WARNING_HISTORY_LIMIT = 1000         # Rolling history for time-windowed warning counts
 
 
 class SignalValidator:
@@ -135,6 +136,7 @@ class SignalValidator:
         }
         # Drift detection: rolling window of (flagged: bool) for last N signals
         self._flag_history: deque = deque(maxlen=DRIFT_WINDOW_SIZE)
+        self._warning_history: deque = deque(maxlen=WARNING_HISTORY_LIMIT)
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -193,6 +195,7 @@ class SignalValidator:
             result.status = "WARNING"
             result.issues = list(result.llm_warnings)
             self._stats["llm_warnings"] += 1
+            self._warning_history.append(time.time())
             # Data quality based on LLM confidence
             if result.llm_confidence_in_data < 40:
                 result.data_quality = "LOW"
@@ -231,6 +234,13 @@ class SignalValidator:
         stats = dict(self._stats)
         stats["drift_flag_rate"] = self.get_drift_rate()
         return stats
+
+    def get_warning_count(self, hours: Optional[float] = None) -> int:
+        """Return total or time-windowed LLM warning count."""
+        if hours is None:
+            return self._stats["llm_warnings"]
+        cutoff = time.time() - (hours * 3600)
+        return sum(1 for ts in self._warning_history if ts >= cutoff)
 
     def get_drift_rate(self) -> float:
         """Return the rolling flag rate (0.0 - 1.0)."""

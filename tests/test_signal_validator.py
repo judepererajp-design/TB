@@ -10,9 +10,9 @@ Covers:
   - Integration: feature flag gating, throttling, stats tracking
 """
 
-import asyncio
-import sys
 import os
+import sys
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -394,6 +394,15 @@ class TestStats:
         assert stats["total_checked"] == 3
         assert stats["hard_errors"] == 1
         assert stats["passed_clean"] == 2
+
+    def test_get_warning_count_supports_time_window(self, validator):
+        validator._warning_history.extend([100.0, 200.0, 500.0])
+        validator._stats["llm_warnings"] = 3
+
+        with patch("signals.signal_validator.time.time", return_value=500.0):
+            assert validator.get_warning_count() == 3
+            assert validator.get_warning_count(hours=0.1) == 2
+            assert validator.get_warning_count(hours=0.01) == 1
 
 
 # ══════════════════════════════════════════════════════════════════════

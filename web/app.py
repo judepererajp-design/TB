@@ -1499,10 +1499,11 @@ class DashboardApp:
                 from config.feature_flags import ff
                 if ff.get_state("SIGNAL_VALIDATOR") in ("live", "shadow"):
                     from signals.signal_validator import signal_validator
-                    _vs = signal_validator.get_stats()
-                    db_funnel["validator_warnings"] = _vs.get("llm_warnings", 0)
+                    db_funnel["validator_warnings"] = signal_validator.get_warning_count(hours=hours)
+                else:
+                    db_funnel["validator_warnings"] = 0
             except Exception:
-                pass
+                db_funnel["validator_warnings"] = 0
             return _json_response(db_funnel)
         except Exception as e:
             return _json_response({"error": str(e)})

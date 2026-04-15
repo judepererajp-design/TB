@@ -1695,6 +1695,7 @@ function renderFunnel(f){
     {l:'Symbols Scanned',n:f.scanned||0,c:'var(--blue)',p:100},
     {l:'Signals Generated',n:f.raw_generated||0,c:'var(--purple2)',p:f.scanned?(f.raw_generated||0)/(f.scanned||1)*100:0},
   ];
+  if(f.validator_warnings>0){steps.push({l:'Validator Warnings',n:f.validator_warnings,c:'var(--amber)',p:f.raw_generated?(f.validator_warnings)/(f.raw_generated||1)*100:0});}
   if(f.validator_kills>0){steps.push({l:'Validator Kills',n:f.validator_kills,c:'var(--red)',p:f.raw_generated?(f.validator_kills)/(f.raw_generated||1)*100:0});}
   steps.push(
     {l:'Published',n:f.published||0,c:'var(--amber)',p:f.raw_generated?(f.published||0)/(f.raw_generated||1)*100:0},
