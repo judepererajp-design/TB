@@ -3,6 +3,8 @@ import sys
 import types
 from unittest.mock import AsyncMock
 
+import signals.signal_decision as signal_decision
+
 
 def test_build_inputs_used_captures_signal_market_and_execution_context():
     from signals.signal_decision import _build_inputs_used
@@ -85,9 +87,10 @@ def test_signal_decision_endpoint_returns_review(monkeypatch):
 
 
 def test_review_signal_timeout_fallback(monkeypatch):
-    import signals.signal_decision as signal_decision
+    called = {"value": False}
 
     async def slow_call(*_args, **_kwargs):
+        called["value"] = True
         await asyncio.sleep(0.05)
         return {
             "verdict": "TAKE",
@@ -132,3 +135,4 @@ def test_review_signal_timeout_fallback(monkeypatch):
     assert review["verdict"] == "AVOID"
     assert review["summary"] != "Should not be returned"
     assert review["inputs_used"]["signal"]
+    assert called["value"] is True
