@@ -58,10 +58,25 @@ class SmartMoneyConcepts(BaseStrategy):
         "CHOPPY":      -10,
         "UNKNOWN":     0,
     }
+    _COUNTER_TREND_REVERSAL_SETUPS = {"LiquiditySweep"}
 
     def __init__(self):
         super().__init__()
         self._cfg = cfg.strategies.smc
+
+    @classmethod
+    def _allows_counter_trend_setup(
+        cls,
+        setup_type: str,
+        has_choch: bool,
+        choch_direction: str,
+        direction: str,
+    ) -> bool:
+        """Allow only genuine reversal-style counter-trend SMC setups upstream."""
+        if setup_type in cls._COUNTER_TREND_REVERSAL_SETUPS:
+            return True
+        expected_choch = "BULLISH" if direction == "LONG" else "BEARISH"
+        return has_choch and choch_direction == expected_choch
 
     async def analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:
         try:
@@ -270,9 +285,13 @@ class SmartMoneyConcepts(BaseStrategy):
 
             for i in range(2, search_bars):
                 # Bullish OB: last bearish candle before a bullish impulse
-                if (opens[-i] > closes[-i]  # bearish OB candle
+                # BUG-9 FIX: measure impulse size relative to the OB body, not the
+                # impulse candle's own open price. On near-zero-price tokens, dividing
+                # by open price produces extreme percentages that fire on noise.
+                _bull_ob_body = opens[-i] - closes[-i]  # bearish OB body
+                if (_bull_ob_body > 0
                         and closes[-i + 1] > opens[-i + 1]   # impulse candle is bullish
-                        and (closes[-i + 1] - opens[-i + 1]) / opens[-i + 1] >= ob_min_impulse):
+                        and (closes[-i + 1] - opens[-i + 1]) / _bull_ob_body >= ob_min_impulse):
                     ob_high = opens[-i]
                     ob_low  = closes[-i]
                     if ob_low <= current_close <= ob_high + atr * 0.5:
@@ -286,9 +305,10 @@ class SmartMoneyConcepts(BaseStrategy):
                         break
 
                 # Bearish OB: last bullish candle before a bearish impulse
-                if (closes[-i] > opens[-i]  # bullish OB candle
+                _bear_ob_body = closes[-i] - opens[-i]  # bullish OB body
+                if (_bear_ob_body > 0
                         and closes[-i + 1] < opens[-i + 1]  # impulse is bearish
-                        and (opens[-i + 1] - closes[-i + 1]) / opens[-i + 1] >= ob_min_impulse):
+                        and (opens[-i + 1] - closes[-i + 1]) / _bear_ob_body >= ob_min_impulse):
                     ob_high = closes[-i]
                     ob_low  = opens[-i]
                     if ob_low - atr * 0.5 <= current_close <= ob_high:
@@ -336,6 +356,8 @@ class SmartMoneyConcepts(BaseStrategy):
         if _is_with_trend or regime not in ("BULL_TREND", "BEAR_TREND"):
             regime_bonus = self._REGIME_CONF_WITH_TREND.get(regime, 0)
         else:
+            if not self._allows_counter_trend_setup(setup_type, has_choch, choch_direction, direction):
+                return None
             regime_bonus = self._REGIME_CONF_COUNTER_TREND.get(regime, 0)
         confidence += regime_bonus
 
@@ -381,7 +403,13 @@ class SmartMoneyConcepts(BaseStrategy):
         if risk <= 0:
             return None
 
-        rr_ratio = abs(tp2 - entry_ref) / risk if risk > 0 else 0.0
+        rr_ratio = self.calculate_effective_rr(
+            direction=direction,
+            entry_low=entry_low,
+            entry_high=entry_high,
+            stop_loss=stop_loss,
+            tp2=tp2,
+        )
 
         # Confluence additions
         confluence.append(f"📊 Setup: {setup_type} | TF: {tf}")

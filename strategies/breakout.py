@@ -181,7 +181,9 @@ class BreakoutStrategy(BaseStrategy):
             stop_loss = min(_atr_sl, _range_sl)
             tp1        = channel_low - range_size * 0.50
             tp2        = channel_low - range_size * 1.00
-            tp3        = channel_low - range_size * 1.50
+            # BUG-8 FIX: tp3 can go negative on low-price assets when range_size > channel_low/1.5.
+            # Floor at a minimum positive price to prevent physically impossible targets.
+            tp3        = max(channel_low * 0.01, channel_low - range_size * 1.50)
 
         risk = abs(channel_high - stop_loss) if direction == "LONG" else abs(channel_low - stop_loss)
         rr   = abs(tp2 - (channel_high if direction == "LONG" else channel_low)) / risk if risk > 0 else 0

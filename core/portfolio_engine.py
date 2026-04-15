@@ -340,13 +340,18 @@ class PortfolioEngine:
         if base_risk_pct > remaining_risk:
             exposure_adjustment *= (remaining_risk / base_risk_pct)
 
-        # Direction imbalance
+        # Direction imbalance — BUG-5 FIX: estimate the actual position notional using
+        # the real formula (risk_amount / stop_dist_pct) rather than a made-up
+        # `effective_capital * base_risk_pct * 10` proxy. With tight stops the proxy
+        # was 50-100× too small, so this gate effectively never fired.
+        _imbal_stop_dist = max(0.001, abs(entry_price - stop_loss) / entry_price if entry_price > 0 else 0.01)
+        _estimated_pos_size = (effective_capital * base_risk_pct) / _imbal_stop_dist
         if direction == "LONG":
-            long_ratio = (state.total_long_exposure + effective_capital * base_risk_pct * 10) / \
-                         max(1, state.gross_exposure + effective_capital * base_risk_pct * 10)
+            long_ratio = (state.total_long_exposure + _estimated_pos_size) / \
+                         max(1, state.gross_exposure + _estimated_pos_size)
         else:
             long_ratio = state.total_long_exposure / \
-                         max(1, state.gross_exposure + effective_capital * base_risk_pct * 10)
+                         max(1, state.gross_exposure + _estimated_pos_size)
         short_ratio = 1 - long_ratio
 
         if (direction == "LONG" and long_ratio > self._max_direction_imbalance) or \

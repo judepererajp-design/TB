@@ -112,7 +112,6 @@ class SignalDeduplicator:
         # lookups and reduces the chance of the dicts drifting out of sync.
         self._recent: Dict[str, _DedupEntry] = {}   # key -> (ts, conf, grade)
         self._window = cfg.aggregator.get('dedup_window_minutes', 180) * 60
-        self._recent_score_buffer: deque = deque(maxlen=100)  # last 100 signal scores
         self._c_window = cfg.aggregator.get('c_grade_dedup_minutes', 60) * 60
         self._conf_breakthrough = RateLimiting.CONF_BREAKTHROUGH_PTS  # Allow resend if final_confidence ↑ this much
         self._db_loaded = False
@@ -507,6 +506,13 @@ class SignalAggregator:
                 if _tl:
                     _tl.signal(symbol=signal.symbol, direction="LONG", grade="?", confidence=signal.confidence, entry_low=signal.entry_low, entry_high=signal.entry_high, stop_loss=signal.stop_loss, tp1=signal.tp1, tp2=signal.tp2, rr=signal.rr_ratio, strategy=signal.strategy, regime="UNKNOWN", result="REJECTED(GEOMETRY_INVALID tp1<=entry_mid LONG)")
                 return None
+            # BUG-3 FIX: TP2 must be above TP1 for LONG — reversed ordering causes early
+            # exit at the wrong (lower) target and inflated reported R:R.
+            if signal.tp2 <= signal.tp1:
+                logger.info(f"Geometry rejected {signal.symbol}: TP2 {signal.tp2:.6f} <= TP1 {signal.tp1:.6f} (LONG)")
+                if _tl:
+                    _tl.signal(symbol=signal.symbol, direction="LONG", grade="?", confidence=signal.confidence, entry_low=signal.entry_low, entry_high=signal.entry_high, stop_loss=signal.stop_loss, tp1=signal.tp1, tp2=signal.tp2, rr=signal.rr_ratio, strategy=signal.strategy, regime="UNKNOWN", result="REJECTED(GEOMETRY_INVALID tp2<=tp1 LONG)")
+                return None
             risk = entry_mid - signal.stop_loss
             reward = signal.tp2 - entry_mid   # Use TP2 — the primary target
         else:
@@ -520,6 +526,13 @@ class SignalAggregator:
                 logger.info(f"Geometry rejected {signal.symbol}: TP1 {signal.tp1:.6f} >= entry_mid {entry_mid:.6f} (SHORT)")
                 if _tl:
                     _tl.signal(symbol=signal.symbol, direction="SHORT", grade="?", confidence=signal.confidence, entry_low=signal.entry_low, entry_high=signal.entry_high, stop_loss=signal.stop_loss, tp1=signal.tp1, tp2=signal.tp2, rr=signal.rr_ratio, strategy=signal.strategy, regime="UNKNOWN", result="REJECTED(GEOMETRY_INVALID tp1>=entry_mid SHORT)")
+                return None
+            # BUG-3 FIX: TP2 must be below TP1 for SHORT — reversed ordering causes early
+            # exit at the wrong (higher) target and inflated reported R:R.
+            if signal.tp2 >= signal.tp1:
+                logger.info(f"Geometry rejected {signal.symbol}: TP2 {signal.tp2:.6f} >= TP1 {signal.tp1:.6f} (SHORT)")
+                if _tl:
+                    _tl.signal(symbol=signal.symbol, direction="SHORT", grade="?", confidence=signal.confidence, entry_low=signal.entry_low, entry_high=signal.entry_high, stop_loss=signal.stop_loss, tp1=signal.tp1, tp2=signal.tp2, rr=signal.rr_ratio, strategy=signal.strategy, regime="UNKNOWN", result="REJECTED(GEOMETRY_INVALID tp2>=tp1 SHORT)")
                 return None
             risk = signal.stop_loss - entry_mid
             reward = entry_mid - signal.tp2   # Use TP2 — the primary target
@@ -1124,6 +1137,18 @@ class SignalAggregator:
         # Apply bonuses
         final = base_score + scored.killzone_bonus + scored.sector_adjustment + _candle_bonus
         final = max(0.0, min(99.0, final))
+
+        # BUG-7 FIX: Apply slippage penalty to confidence.
+        # get_adjustment_factor() was calculated but never wired in, meaning thin
+        # alts with chronic adverse slippage executed at the same confidence as BTC.
+        try:
+            from core.slippage_tracker import slippage_tracker as _st
+            _slip_factor = _st.get_adjustment_factor(signal.symbol, direction_str)
+            if _slip_factor < 1.0:
+                final = final * _slip_factor
+        except Exception:
+            pass
+
         scored.final_confidence = final
 
         # ── 10. Apply regime minimum confidence override ──────
@@ -1155,8 +1180,9 @@ class SignalAggregator:
         if regime_override:
             min_conf = min(max(min_conf, regime_override), 65)
 
-        # Record score into rolling buffer for adaptive threshold learning
-        self._recent_score_buffer.append(final)
+        # BUG-2 FIX: Only record scores that passed the AGG_THRESHOLD gate.
+        # Previously appended BEFORE the gate, poisoning the adaptive floor percentile
+        # with rejected signals and keeping the threshold artificially low.
 
         if final < min_conf:
             logger.info(
@@ -1194,6 +1220,10 @@ class SignalAggregator:
             return None
 
         # ── 11. Grade the signal ──────────────────────────────
+        # BUG-2 FIX (cont): record score AFTER the gate — only approved signals
+        # should influence the adaptive floor percentile calculation.
+        self._recent_score_buffer.append(final)
+
         scored.confluence_multiplier = getattr(signal, 'confluence_multiplier', 1.0)
         scored.grade = self._grade_signal(final, scored)
         scored.all_confluence = signal.confluence

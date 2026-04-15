@@ -258,7 +258,7 @@ class BaseStrategy(ABC):
 
     @staticmethod
     def calculate_bollinger(closes: np.ndarray, period: int = 20,
-                             std_mult: float = 2.0) -> Tuple[float, float, float]:
+                              std_mult: float = 2.0) -> Tuple[float, float, float]:
         """
         Bollinger Bands.
         Returns (mid, upper, lower).
@@ -271,6 +271,29 @@ class BaseStrategy(ABC):
         mid    = float(np.mean(window))
         std    = float(np.std(window, ddof=1))
         return mid, mid + std_mult * std, mid - std_mult * std
+
+    @staticmethod
+    def calculate_effective_rr(
+        direction: SignalDirection | str,
+        entry_low: float,
+        entry_high: float,
+        stop_loss: float,
+        tp2: float,
+    ) -> float:
+        """Calculate R:R from entry midpoint, matching aggregator enforcement."""
+        direction_str = direction.value if hasattr(direction, "value") else str(direction)
+        entry_mid = (entry_low + entry_high) / 2.0
+
+        if direction_str == SignalDirection.LONG.value:
+            risk = entry_mid - stop_loss
+            reward = tp2 - entry_mid
+        else:
+            risk = stop_loss - entry_mid
+            reward = entry_mid - tp2
+
+        if risk <= 0 or reward <= 0:
+            return 0.0
+        return round(reward / risk, 2)
 
     # ── Signal validation ──────────────────────────────────────────────
     def validate_signal(self, sig: SignalResult) -> bool:
