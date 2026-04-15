@@ -743,6 +743,7 @@ tr:hover td{background:rgba(255,255,255,.015)}
     </div>
     <div style="display:flex;gap:5px;flex-shrink:0">
       <button id="sdp-enter-btn" class="btn btn-sm" style="display:none;background:rgba(0,232,122,.15);color:var(--green);font-weight:600" onclick="sdpEnter()">✅ In</button>
+      <button id="sdp-ai-btn" class="btn btn-sm" style="display:none;background:rgba(41,121,255,.14);color:var(--blue);font-weight:600" onclick="sdpDecision()">🧠 AI</button>
       <button class="btn btn-sm" onclick="sdpChart()" title="Open TradingView">📊 Chart</button>
       <button class="btn btn-sm" onclick="closeSigPanel()">✕</button>
     </div>
@@ -3188,10 +3189,7 @@ function openSigPanel(sigId){
     // Power alignment badge in detail panel header
     var _paEl=document.getElementById('sdp-power');
     if(_paEl){if(d.power_aligned){_paEl.style.display='';_paEl.title=d.power_alignment_reason||'Power Aligned';}else{_paEl.style.display='none';}}
-    // Show enter button if signal is actionable
-    var entBtn=document.getElementById('sdp-enter-btn');
-    var state=d.exec_state||'';
-    entBtn.style.display=(state==='EXECUTE'||state==='ENTRY_ZONE'||state==='ALMOST')?'':'none';
+    updateSdpActionButtons(d);
     sdpRender();
   });
 }
@@ -3203,6 +3201,15 @@ function closeSigPanel(){
   // Collapse chart
   document.getElementById('sdp-chart-wrap').style.height='0';
   _sdpChartOpen=false;
+}
+
+function updateSdpActionButtons(d){
+  var state=(d&&d.exec_state)||'';
+  var actionable=(state==='EXECUTE'||state==='ENTRY_ZONE'||state==='ALMOST');
+  var entBtn=document.getElementById('sdp-enter-btn');
+  var aiBtn=document.getElementById('sdp-ai-btn');
+  if(entBtn)entBtn.style.display=actionable?'':'none';
+  if(aiBtn)aiBtn.style.display=actionable?'':'none';
 }
 
 function sdpTab(tab,btn){
@@ -3246,6 +3253,64 @@ function sdpEnter(){
       if(d.ok){document.getElementById('sdp-enter-btn').textContent='✓ In';document.getElementById('sdp-enter-btn').disabled=true;setTimeout(()=>{loadSignals();loadPositions();},600);}
       else alert('Could not enter: '+(d.error||'unknown'));
     });
+}
+
+function showAiOverlay(title,html){
+  var overlay=document.createElement('div');
+  overlay.style.cssText='position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px';
+  overlay.innerHTML=`
+    <div style="background:var(--bg1);border:1px solid var(--border2);border-radius:var(--radius-lg);padding:24px;max-width:640px;width:100%;max-height:80vh;overflow-y:auto;position:relative">
+      <button onclick="this.closest('[style*=fixed]').remove()" style="position:absolute;top:12px;right:12px;background:none;border:none;color:var(--text2);cursor:pointer;font-size:16px">✕</button>
+      <div style="font-size:15px;font-weight:700;margin-bottom:12px;color:var(--text)">${esc(title)}</div>
+      ${html}
+    </div>`;
+  document.body.appendChild(overlay);
+  overlay.addEventListener('click',e=>{if(e.target===overlay)overlay.remove();});
+}
+
+async function sdpDecision(){
+  if(!_sdpSigId||!_sdpData)return;
+  var btn=document.getElementById('sdp-ai-btn');
+  if(btn){btn.disabled=true;btn.textContent='⏳';}
+  try{
+    var d=await api('/api/signals/'+_sdpSigId+'/decision',20000);
+    if(!d||d.error||!d.verdict){alert('AI review failed: '+(d?.error||'unknown error'));return;}
+    var vc={TAKE:'var(--green)',WAIT:'var(--amber)',AVOID:'var(--red)'}[d.verdict]||'var(--blue)';
+    var renderList=function(items,empty,color){
+      items=Array.isArray(items)?items:[];
+      if(!items.length)return`<div style="font-size:11px;color:var(--text3)">${esc(empty)}</div>`;
+      return items.map(x=>`<div style="padding:4px 0;border-bottom:1px solid var(--border);font-size:11.5px;color:${color||'var(--text2)'}">${esc(x)}</div>`).join('');
+    };
+    var renderInputs=function(obj){
+      obj=obj||{};
+      return Object.entries(obj).map(function(entry){
+        var sec=entry[0],items=entry[1];
+        return `<div style="margin-top:10px"><div class="sdm-section" style="font-size:9px">${esc(sec)}</div>${renderList(items,'No context captured')}</div>`;
+      }).join('');
+    };
+    showAiOverlay(
+      'AI Decision Review — '+(_sdpData.symbol||'Signal'),
+      `
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px">
+        <div style="font-size:22px;font-weight:800;color:${vc}">${esc(d.verdict)}</div>
+        <div style="font-size:12px;color:var(--text2)">Confidence <span style="color:${vc};font-weight:700">${Math.round(d.confidence||0)}%</span></div>
+      </div>
+      <div style="padding:10px 12px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;font-size:12px;color:var(--text);line-height:1.6">${esc(d.summary||'No summary')}</div>
+      <div class="sdm-section" style="margin-top:12px">Strengths</div>
+      ${renderList(d.strengths,'No strengths highlighted','var(--green)')}
+      <div class="sdm-section" style="margin-top:12px">Risks</div>
+      ${renderList(d.risks,'No risks highlighted','var(--amber)')}
+      <div class="sdm-section" style="margin-top:12px">Execution Guidance</div>
+      <div style="padding:8px 0 2px;font-size:11.5px;color:var(--text2);line-height:1.6">${esc(d.entry_guidance||'—')}</div>
+      <div class="sdm-section" style="margin-top:12px">Inputs Used</div>
+      ${renderInputs(d.inputs_used)}
+      `
+    );
+  }catch(e){
+    alert('AI review failed: '+e.message);
+  }finally{
+    if(btn){btn.disabled=false;btn.textContent='🧠 AI';}
+  }
 }
 
 function sdpRender(){
@@ -3411,9 +3476,7 @@ function handleNotification(ev){
     api('/api/signals/'+_sdpSigId+'/detail',5000).then(function(d){
       if(!d||d.error||!_sdpSigId)return;
       _sdpData=d;
-      var entBtn=document.getElementById('sdp-enter-btn');
-      var state=d.exec_state||'';
-      if(entBtn)entBtn.style.display=(state==='EXECUTE'||state==='ENTRY_ZONE'||state==='ALMOST')?'':'none';
+      updateSdpActionButtons(d);
       sdpRender();
     });
   }

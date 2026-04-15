@@ -2014,6 +2014,115 @@ class DashboardApp:
         except Exception as e:
             return _json_response({"error": str(e), "context": {}, "headlines": []})
 
+    async def _build_signal_detail_payload(self, signal_id: int, sig: Dict[str, Any]) -> Dict[str, Any]:
+        # Get live scored signal from bot memory if available
+        scored = None
+        try:
+            from tg.bot import telegram_bot
+            rec = telegram_bot._by_signal_id.get(signal_id)
+            if rec and rec.scored:
+                scored = rec.scored
+        except Exception as _e:
+            logger.debug("Failed to load scored signal from bot memory: %s", _e)
+
+        from utils.signal_guidance import guidance_payload
+
+        raw = {}
+        try:
+            raw = json.loads(sig.get("raw_scores") or "{}")
+        except Exception as _e:
+            logger.debug("Failed to parse raw_scores: %s", _e)
+
+        confluence = []
+        try:
+            _conf_raw = sig.get("confluence") or "[]"
+            confluence = json.loads(_conf_raw)
+            if isinstance(confluence, list):
+                confluence = [str(c) for c in confluence]
+        except Exception as _e:
+            logger.debug("Failed to parse confluence: %s", _e)
+
+        def _score(attr, raw_key, default=0):
+            if scored and hasattr(scored, attr):
+                val = getattr(scored, attr)
+                if val is not None:
+                    return val
+            return raw.get(raw_key, raw.get(attr, default))
+
+        result = {
+            "signal_id": signal_id,
+            "symbol": sig.get("symbol"),
+            "direction": sig.get("direction"),
+            "strategy": sig.get("strategy"),
+            "confidence": sig.get("confidence"),
+            "p_win": sig.get("p_win"),
+            "alpha_grade": sig.get("alpha_grade"),
+            "regime": sig.get("regime"),
+            "sector": sig.get("sector"),
+            "setup_class": sig.get("setup_class", "intraday"),
+            "confluence": confluence,
+            "technical_score": _score("technical_score", "technical", 50),
+            "volume_score": _score("volume_score", "volume", 50),
+            "orderflow_score": _score("orderflow_score", "orderflow", 50),
+            "derivatives_score": _score("derivatives_score", "derivatives", 50),
+            "sentiment_score": _score("sentiment_score", "sentiment", 50),
+            "has_ob": raw.get("has_ob", False),
+            "has_fvg": raw.get("has_fvg", False),
+            "has_sweep": raw.get("has_sweep", False),
+            "wave_type": raw.get("wave_type", ""),
+            "wyckoff_event": raw.get("wyckoff_event", ""),
+            "htf_structure": raw.get("htf_structure", ""),
+            "adx": float(raw.get("adx", 0) or 0),
+            "rsi": float(raw.get("rsi", 0) or 0),
+            "funding_rate": float(raw.get("funding_rate", 0) or 0),
+            "vol_ratio": float(raw.get("vol_ratio", 0) or 0),
+            "ichimoku_above_cloud": any("above cloud" in str(c).lower() for c in confluence),
+            "ichimoku_below_cloud": any("below cloud" in str(c).lower() for c in confluence),
+            "ichimoku_tk_aligned": any("tk aligned" in str(c).lower() for c in confluence),
+            "ichimoku_chikou": any("chikou" in str(c).lower() for c in confluence),
+            "entry_low": sig.get("entry_low"),
+            "entry_high": sig.get("entry_high"),
+            "stop_loss": sig.get("stop_loss"),
+            "tp1": sig.get("tp1"),
+            "tp2": sig.get("tp2"),
+            "tp3": sig.get("tp3"),
+            "rr_ratio": sig.get("rr_ratio"),
+            "ev_r": sig.get("ev_r", 0),
+            "confidence_adjustments": raw.get("confidence_adjustments") or [],
+            "outcome": sig.get("outcome"),
+            "pnl_r": sig.get("pnl_r"),
+            "entry_price": sig.get("entry_price"),
+            "entry_time": sig.get("entry_time"),
+            "exit_price": sig.get("exit_price"),
+            "exit_reason": sig.get("exit_reason"),
+            "max_r": sig.get("max_r"),
+            "zone_reached": sig.get("zone_reached", 0),
+            "zone_reached_at": sig.get("zone_reached_at"),
+            "publish_price": sig.get("publish_price"),
+            "published": sig.get("message_id") is not None,
+            "exec_state": "ALMOST" if sig.get("exec_state", "WATCHING") == "ARMED" else sig.get("exec_state", "WATCHING"),
+            "created_at": sig.get("created_at"),
+            "power_aligned": getattr(scored, "power_aligned", False) if scored else False,
+            "power_alignment_reason": getattr(scored, "power_alignment_reason", "") if scored else "",
+            "setup_context": raw.get("setup_context"),
+            "execution_context": raw.get("execution_context"),
+            "execution_score": raw.get("execution_score"),
+            "execution_factors": raw.get("execution_factors"),
+            "execution_bad_factors": raw.get("execution_bad_factors"),
+            "execution_kill_combo": raw.get("execution_kill_combo"),
+        }
+        guidance = guidance_payload(sig, confluence=confluence)
+        result["fee_adjusted_rr"] = guidance.get("fee_adjusted_rr")
+        result["round_trip_friction_pct"] = guidance.get("round_trip_friction_pct")
+        result["expected_fill_low"] = guidance.get("expected_fill_low")
+        result["expected_fill_high"] = guidance.get("expected_fill_high")
+        result["expected_fill_mid"] = guidance.get("expected_fill_mid")
+        result["skip_rule"] = guidance.get("skip_rule")
+        result["skip_level"] = guidance.get("skip_level")
+        result["session_warning"] = guidance.get("session_warning")
+        result["size_modifier"] = guidance.get("size_modifier")
+        return result
+
     async def _handle_signal_detail(self, request: "web.Request") -> "web.Response":
         """GET /api/signals/{id}/detail - full scored signal data for dashboard panels."""
         try:
@@ -2022,125 +2131,27 @@ class DashboardApp:
             sig = await db.get_signal(signal_id)
             if not sig:
                 return _json_response({"error": "Signal not found"})
+            return _json_response(await self._build_signal_detail_payload(signal_id, sig))
+        except Exception as e:
+            return _json_response({"error": str(e)})
 
-            # Get live scored signal from bot memory if available
-            scored = None
-            try:
-                from tg.bot import telegram_bot
-                rec = telegram_bot._by_signal_id.get(signal_id)
-                if rec and rec.scored:
-                    scored = rec.scored
-            except Exception as _e:
-                logger.debug("Failed to load scored signal from bot memory: %s", _e)
-
-            # Build response - static data from DB + dynamic from scored if available
-            import json as _json
-            from utils.signal_guidance import guidance_payload
-
-            raw = {}
-            try: raw = _json.loads(sig.get("raw_scores") or "{}")
-            except Exception as _e: logger.debug("Failed to parse raw_scores: %s", _e)
-
-            confluence = []
-            try:
-                _conf_raw = sig.get("confluence") or "[]"
-                confluence = _json.loads(_conf_raw)
-                # Ensure list of strings
-                if isinstance(confluence, list):
-                    confluence = [str(c) for c in confluence]
-            except Exception as _e: logger.debug("Failed to parse confluence: %s", _e)
-
-            # Helper: get score from scored object (in-memory) or raw_scores (DB)
-            def _score(attr, raw_key, default=0):
-                if scored and hasattr(scored, attr):
-                    val = getattr(scored, attr)
-                    if val is not None:
-                        return val
-                return raw.get(raw_key, raw.get(attr, default))
-
-            result = {
-                "signal_id": signal_id,
-                "symbol": sig.get("symbol"),
-                "direction": sig.get("direction"),
-                "strategy": sig.get("strategy"),
-                "confidence": sig.get("confidence"),
-                "p_win": sig.get("p_win"),
-                "alpha_grade": sig.get("alpha_grade"),
-                "regime": sig.get("regime"),
-                "sector": sig.get("sector"),
-                "setup_class": sig.get("setup_class", "intraday"),
-                # Confluence factors (the actual text items shown in Telegram)
-                "confluence": confluence,
-                # Score components - try in-memory first, fall back to DB raw_scores
-                "technical_score":   _score("technical_score",   "technical",   50),
-                "volume_score":      _score("volume_score",       "volume",      50),
-                "orderflow_score":   _score("orderflow_score",    "orderflow",   50),
-                "derivatives_score": _score("derivatives_score",  "derivatives", 50),
-                "sentiment_score":   _score("sentiment_score",    "sentiment",   50),
-                # Logic panel fields (from raw_data saved into raw_scores)
-                "has_ob":        raw.get("has_ob",        False),
-                "has_fvg":       raw.get("has_fvg",       False),
-                "has_sweep":     raw.get("has_sweep",     False),
-                "wave_type":     raw.get("wave_type",     ""),
-                "wyckoff_event": raw.get("wyckoff_event", ""),
-                "htf_structure": raw.get("htf_structure", ""),
-                "adx":           float(raw.get("adx",    0) or 0),
-                "rsi":           float(raw.get("rsi",    0) or 0),
-                "funding_rate":  float(raw.get("funding_rate", 0) or 0),
-                "vol_ratio":     float(raw.get("vol_ratio",    0) or 0),
-                # IchimokuCloud specific logic (derive from confluence text if not raw_data)
-                "ichimoku_above_cloud": any("above cloud" in str(c).lower() for c in confluence),
-                "ichimoku_below_cloud": any("below cloud" in str(c).lower() for c in confluence),
-                "ichimoku_tk_aligned":  any("tk aligned" in str(c).lower() for c in confluence),
-                "ichimoku_chikou":      any("chikou" in str(c).lower() for c in confluence),
-                # Trade levels
-                "entry_low":  sig.get("entry_low"),
-                "entry_high": sig.get("entry_high"),
-                "stop_loss":  sig.get("stop_loss"),
-                "tp1":        sig.get("tp1"),
-                "tp2":        sig.get("tp2"),
-                "tp3":        sig.get("tp3"),
-                "rr_ratio":   sig.get("rr_ratio"),
-                "ev_r":       sig.get("ev_r", 0),
-                # Confidence adjustment trace (source, delta, context per influencer)
-                "confidence_adjustments": raw.get("confidence_adjustments") or [],
-                # Execution analytics — answers "what actually happened?"
-                "outcome":       sig.get("outcome"),
-                "pnl_r":         sig.get("pnl_r"),
-                "entry_price":   sig.get("entry_price"),
-                "entry_time":    sig.get("entry_time"),
-                "exit_price":    sig.get("exit_price"),
-                "exit_reason":   sig.get("exit_reason"),
-                "max_r":         sig.get("max_r"),
-                "zone_reached":  sig.get("zone_reached", 0),
-                "zone_reached_at": sig.get("zone_reached_at"),
-                "publish_price": sig.get("publish_price"),
-                "published":     sig.get("message_id") is not None,
-                # Migration: map legacy "ARMED" DB values to "ALMOST"
-                "exec_state":    "ALMOST" if sig.get("exec_state", "WATCHING") == "ARMED" else sig.get("exec_state", "WATCHING"),
-                "created_at":    sig.get("created_at"),
-                # Power alignment — cross-category signal strength badge
-                "power_aligned":        getattr(scored, 'power_aligned', False) if scored else False,
-                "power_alignment_reason": getattr(scored, 'power_alignment_reason', '') if scored else '',
-                "setup_context":        raw.get("setup_context"),
-                "execution_context":    raw.get("execution_context"),
-                # Execution gate factor breakdown (stored in raw_data by engine)
-                "execution_score":       raw.get("execution_score"),
-                "execution_factors":     raw.get("execution_factors"),
-                "execution_bad_factors": raw.get("execution_bad_factors"),
-                "execution_kill_combo":  raw.get("execution_kill_combo"),
-            }
-            guidance = guidance_payload(sig, confluence=confluence)
-            result["fee_adjusted_rr"] = guidance.get("fee_adjusted_rr")
-            result["round_trip_friction_pct"] = guidance.get("round_trip_friction_pct")
-            result["expected_fill_low"] = guidance.get("expected_fill_low")
-            result["expected_fill_high"] = guidance.get("expected_fill_high")
-            result["expected_fill_mid"] = guidance.get("expected_fill_mid")
-            result["skip_rule"] = guidance.get("skip_rule")
-            result["skip_level"] = guidance.get("skip_level")
-            result["session_warning"] = guidance.get("session_warning")
-            result["size_modifier"] = guidance.get("size_modifier")
-            return _json_response(result)
+    async def _handle_signal_decision(self, request: "web.Request") -> "web.Response":
+        """GET /api/signals/{id}/decision - run an on-demand AI decision review."""
+        try:
+            signal_id = int(request.match_info.get("id", 0))
+            from data.database import db
+            sig = await db.get_signal(signal_id)
+            if not sig:
+                return _json_response({"error": "Signal not found"}, 404)
+            from config.loader import cfg
+            from signals.signal_decision import review_signal
+            detail = await self._build_signal_detail_payload(signal_id, sig)
+            review = await review_signal(
+                sig,
+                detail,
+                openrouter_api_key=cfg.ai.get("openrouter_api_key", ""),
+            )
+            return _json_response({"signal_id": signal_id, **review})
         except Exception as e:
             return _json_response({"error": str(e)})
 
@@ -2418,9 +2429,10 @@ class DashboardApp:
         app.router.add_get("/api/learning",              self._handle_learning_state)
         app.router.add_post("/api/backtest",             self._handle_backtest_run)
         app.router.add_post("/api/signals/{id}/note",    self._handle_signal_note)
-        app.router.add_get("/api/signals/{id}/check",   self._handle_signal_check)
-        app.router.add_get("/api/signals/{id}/detail",  self._handle_signal_detail)
-        app.router.add_post("/api/signals/{id}/enter",  self._handle_signal_enter)
+        app.router.add_get("/api/signals/{id}/check",    self._handle_signal_check)
+        app.router.add_get("/api/signals/{id}/detail",   self._handle_signal_detail)
+        app.router.add_get("/api/signals/{id}/decision", self._handle_signal_decision)
+        app.router.add_post("/api/signals/{id}/enter",   self._handle_signal_enter)
         app.router.add_get("/api/journal",               self._handle_journal)
         app.router.add_get("/api/institutional",          self._handle_institutional)
         app.router.add_get("/api/btc-news",               self._handle_btc_news)   # NEW: BTC event intelligence
