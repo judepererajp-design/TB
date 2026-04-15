@@ -1,0 +1,135 @@
+{
+  "name": "crypto-news-copilot",
+  "displayName": "Crypto News for Copilot",
+  "description": "Real-time crypto news, prices, sentiment analysis, AI research reports & market data in GitHub Copilot Chat",
+  "version": "2.0.0",
+  "publisher": "free-crypto-news",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Chat"
+  ],
+  "keywords": [
+    "crypto",
+    "news",
+    "bitcoin",
+    "ethereum",
+    "copilot",
+    "ai",
+    "defi",
+    "prices",
+    "gas",
+    "fear-greed",
+    "sentiment",
+    "research",
+    "breaking"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "chatParticipants": [
+      {
+        "id": "crypto-news.crypto",
+        "fullName": "Crypto",
+        "name": "crypto",
+        "description": "Real-time crypto news, prices, sentiment, AI research & market data from cryptocurrency.cv",
+        "isSticky": true,
+        "commands": [
+          {
+            "name": "breaking",
+            "description": "Latest breaking crypto news with priority & sentiment"
+          },
+          {
+            "name": "news",
+            "description": "Get the latest crypto news headlines"
+          },
+          {
+            "name": "price",
+            "description": "Get current price for a coin (e.g. /price bitcoin)"
+          },
+          {
+            "name": "market",
+            "description": "Market overview with prices, Fear & Greed Index & sentiment"
+          },
+          {
+            "name": "sentiment",
+            "description": "AI sentiment analysis for a coin (e.g. /sentiment BTC)"
+          },
+          {
+            "name": "search",
+            "description": "Search news articles (e.g. /search ETF)"
+          },
+          {
+            "name": "gas",
+            "description": "Current Ethereum gas prices"
+          },
+          {
+            "name": "fear-greed",
+            "description": "Fear & Greed Index with trend & breakdown"
+          },
+          {
+            "name": "explain",
+            "description": "Why is a topic trending? AI explainer (e.g. /explain DeFi)"
+          },
+          {
+            "name": "research",
+            "description": "Deep AI research report on a topic (e.g. /research Solana)"
+          }
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "command": "crypto.refresh",
+        "title": "Refresh Crypto Data",
+        "category": "Crypto"
+      },
+      {
+        "command": "crypto.openDashboard",
+        "title": "Open Crypto Dashboard",
+        "category": "Crypto"
+      }
+    ],
+    "configuration": {
+      "title": "Crypto News",
+      "properties": {
+        "crypto.apiUrl": {
+          "type": "string",
+          "default": "https://cryptocurrency.cv",
+          "description": "Base URL of the cryptocurrency.cv API"
+        },
+        "crypto.defaultLimit": {
+          "type": "number",
+          "default": 10,
+          "description": "Default number of items to fetch per request"
+        },
+        "crypto.showSentiment": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show sentiment indicators alongside news"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "bun run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.3.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nirholas/free-crypto-news"
+  },
+  "homepage": "https://cryptocurrency.cv",
+  "icon": "media/icon.png"
+}

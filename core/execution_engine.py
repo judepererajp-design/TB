@@ -1,0 +1,1132 @@
+
+"""
+TitanBot Pro — Execution Engine (Upgraded)
+==========================================
+Human‑anticipation execution lifecycle.
+
+States:
+  APPROVED   → Signal created
+  PREPARING  → Price moving toward entry (early awareness)
+  WATCHING   → Price approaching entry
+  ENTRY_ZONE → Price inside entry zone
+  ALMOST     → 1 trigger detected
+  EXECUTE    → 2+ triggers confirmed
+  FILLED / EXPIRED / INVALIDATED
+
+Triggers (need 2 of 4):
+  1. Rejection candle
+  2. Structure shift
+  3. Momentum expansion
+  4. Liquidity reaction ⭐
+"""
+
+import asyncio
+import logging
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Dict, Optional, Callable
+
+from config.loader import cfg
+from data.api_client import api
+from signals.liquidity_reaction import detect_liquidity_reaction
+from analyzers.market_state_builder import build_market_state
+from analyzers.market_brain import build_market_profile
+from governance.execution_journal import log_execution
+from governance.regime_tracker import compute_regime_stats
+from governance.risk_governor import get_risk_adjustment
+from governance.execution_confidence import compute_confidence
+from core.price_cache import price_cache
+from config.constants import Timing
+
+logger = logging.getLogger(__name__)
+try:
+    from utils.trade_logger import trade_logger as _tl
+except Exception:
+    _tl = None
+
+
+def _safe_ensure_future(coro, *, context: str = "DB write"):
+    """Schedule a coroutine as a fire-and-forget task with error logging.
+
+    FIX #2 (AUDIT): All previous ``asyncio.ensure_future()`` calls swallowed
+    exceptions silently.  This wrapper attaches a done-callback that logs
+    failures so operators can detect persistence problems from the log stream.
+    """
+    task = asyncio.ensure_future(coro)
+
+    def _on_done(t: asyncio.Task):
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            logger.error(f"[{context}] background task failed: {exc}")
+
+    task.add_done_callback(_on_done)
+    return task
+
+
+class SignalState(Enum):
+    APPROVED = "APPROVED"
+    PREPARING = "PREPARING"
+    WATCHING = "WATCHING"
+    ENTRY_ZONE = "ENTRY_ZONE"
+    ALMOST = "ALMOST"
+    EXECUTE = "EXECUTE"
+    FILLED = "FILLED"
+    EXPIRED = "EXPIRED"
+    INVALIDATED = "INVALIDATED"
+
+
+# FIX #31: Setup-class-aware timeouts.
+# Previously a flat 4h timeout applied to ALL signals equally.
+# A 15m scalp signal should expire in ~1.5h; a 4h swing signal in 8h.
+# Scalp/intraday entries have tight zones that go stale quickly.
+# Swing/positional setups legitimately take 6-12h to develop.
+EXECUTION_WATCHING_TIMEOUT_BY_SETUP = Timing.EXECUTION_WATCHING_BY_SETUP
+EXECUTION_WATCHING_TIMEOUT = Timing.EXECUTION_WATCHING_TIMEOUT_SECS
+EXECUTION_ALMOST_TIMEOUT    = Timing.EXECUTION_ALMOST_TIMEOUT_SECS
+EXECUTION_CHECK_INTERVAL    = Timing.EXECUTION_CHECK_INTERVAL_SECS
+EXECUTION_FAST_CHECK_INTERVAL = Timing.EXECUTION_FAST_CHECK_INTERVAL_SECS
+TRIGGER_WINDOW_CONFIRMATION_BARS = 4
+TRIGGER_WINDOW_MIN_SECS = 20 * 60
+TRIGGER_WINDOW_MAX_SECS = 48 * 3600
+MIN_PRICE_DENOMINATOR = 1e-9
+NEAR_ENTRY_FAST_POLL_DISTANCE = 0.02
+# Minimum decay penalty in confidence points before we require one extra
+# confirmation trigger for a still-pending entry.
+DECAY_TRIGGER_INCREMENT_THRESHOLD = 5.0
+
+def _get_watching_timeout(sig) -> int:
+    """Return setup-class-aware watching timeout in seconds."""
+    if sig is None:
+        return EXECUTION_WATCHING_TIMEOUT
+    sc = getattr(sig, 'setup_class', None) or 'intraday'
+    return EXECUTION_WATCHING_TIMEOUT_BY_SETUP.get(sc, EXECUTION_WATCHING_TIMEOUT)
+
+
+def _timeframe_to_seconds(timeframe: str) -> int:
+    mapping = {
+        "1m": 60,
+        "3m": 180,
+        "5m": 300,
+        "15m": 900,
+        "30m": 1800,
+        "1h": 3600,
+        "4h": 14400,
+        "1d": 86400,
+    }
+    return mapping.get(str(timeframe or "").lower(), 3600)
+
+
+def _get_trigger_window_secs(setup_class: str) -> int:
+    from strategies.base import SETUP_CLASS_CONFIRM_TF
+
+    confirm_tf = SETUP_CLASS_CONFIRM_TF.get(setup_class or "intraday", "15m")
+    # Keep triggers coherent within roughly four confirmation bars while retaining
+    # a hard 20m floor for fast setups and a 48h cap for very slow ones.
+    return max(
+        TRIGGER_WINDOW_MIN_SECS,
+        min(
+            TRIGGER_WINDOW_MAX_SECS,
+            _timeframe_to_seconds(confirm_tf) * TRIGGER_WINDOW_CONFIRMATION_BARS,
+        ),
+    )
+
+
+def _distance_to_entry_zone(sig, price: float) -> float:
+    if price <= 0:
+        return 1.0
+    if sig.entry_low <= price <= sig.entry_high:
+        return 0.0
+    nearest_boundary = min(abs(price - sig.entry_low), abs(price - sig.entry_high))
+    return nearest_boundary / max(price, MIN_PRICE_DENOMINATOR)
+
+
+def _resolve_check_interval(tracked: Dict[int, "TrackedExecution"]) -> int:
+    for sig in tracked.values():
+        if sig.state in (
+            SignalState.ENTRY_ZONE,
+            SignalState.ALMOST,
+            SignalState.PREPARING,
+            SignalState.WATCHING,
+        ):
+            return EXECUTION_FAST_CHECK_INTERVAL
+        price = price_cache.get(sig.symbol)
+        if price is not None and _distance_to_entry_zone(sig, price) <= NEAR_ENTRY_FAST_POLL_DISTANCE:
+            return EXECUTION_FAST_CHECK_INTERVAL
+
+    return EXECUTION_CHECK_INTERVAL
+
+
+@dataclass
+class TrackedExecution:
+    signal_id: int
+    symbol: str
+    direction: str
+    strategy: str
+    entry_low: float
+    entry_high: float
+    stop_loss: float
+    confidence: float
+    tp1: float = 0.0
+    tp2: float = 0.0
+    tp3: Optional[float] = None
+    rr_ratio: float = 0.0
+    state: SignalState = SignalState.APPROVED
+    created_at: float = field(default_factory=time.time)
+    watching_since: Optional[float] = None   # B1: when signal entered WATCHING
+    almost_since: Optional[float] = None      # B1: when signal entered ALMOST
+
+    has_rejection_candle: bool = False
+    has_structure_shift: bool = False
+    has_momentum_expansion: bool = False
+    has_liquidity_reaction: bool = False
+
+    # FIX STICKY-TRIGGERS: record when trigger accumulation window started.
+    # Triggers older than TRIGGER_WINDOW_SECS are stale and must be reset —
+    # a rejection candle from 2 hours ago + structure shift from now is NOT
+    # confluence.  When the window expires without reaching min_triggers, all
+    # flags reset and a fresh window begins. track() overwrites TRIGGER_WINDOW_SECS
+    # per signal via _get_trigger_window_secs(setup_class).
+    trigger_window_since: Optional[float] = None
+    TRIGGER_WINDOW_SECS: int = 1200  # 20 minutes
+
+    last_price: float = 0
+    message_id: Optional[int] = None  # V10: Telegram message_id for threading
+    grade: str = "B"                   # V11: alpha grade (A+/A/B+/B)
+    min_triggers: int = 2              # V11: triggers needed (grade-dependent)
+    setup_class: str = "intraday"      # FIX #31: scalp/intraday/swing/positional
+    staleness_data: Optional[dict] = None  # BUG-13: conditions at signal creation time
+
+    # FIX #32: Trigger quality weights — structure_shift outweighs rejection_candle
+    TRIGGER_WEIGHTS: dict = None  # set as class var below (dataclass limitation)
+
+    @property
+    def entry_mid(self):
+        return (self.entry_low + self.entry_high) / 2
+
+    @property
+    def triggers_met(self) -> float:
+        """
+        STRATEGIST SCORE SYSTEM (from trade review session):
+        Scores each confirmation type by quality:
+          Structure shift     = +2  (break of structure — real demand/supply)
+          Momentum candle     = +2  (volume + body expansion — real buyers/sellers)
+          Liquidity reaction  = +1  (price swept liq — valid but weak alone)
+          Rejection candle    = +1  (wick rejection — valid but weak alone)
+
+        LONG entry requires ≥ 3 points  (min: structure+liquidity, or momentum alone)
+        SHORT entry requires ≥ 3 points (same rule)
+        LONG in HTF BEARISH week requires ≥ 4 points (set externally via min_triggers)
+
+        Old weights: structure=1.5, liquidity=1.3, momentum=1.0, rejection=0.7
+        → AAVE entered on liquidity_reaction ONLY (score=1.3) — too permissive
+        New weights make liquidity alone (score=1.0) insufficient to trigger entry.
+        """
+        score = 0.0
+        if self.has_structure_shift:    score += 2.0  # Real structural break
+        if self.has_momentum_expansion: score += 2.0  # Real buyer/seller participation
+        if self.has_liquidity_reaction: score += 1.0  # Valid but not standalone
+        if self.has_rejection_candle:   score += 1.0  # Valid but not standalone
+        return score
+
+
+class ExecutionEngine:
+
+    def __init__(self):
+        self._tracked: Dict[int, TrackedExecution] = {}
+        self._running = False
+        self._check_interval = Timing.EXECUTION_CHECK_INTERVAL_SECS
+        self._task = None
+        self.on_stage_change: Optional[Callable] = None
+        self._stage_msg_sent: Dict[int, set] = {}  # V10: signal_id -> set of states already messaged
+
+    def track(self, signal_id, symbol, direction, strategy,
+              entry_low, entry_high, stop_loss, confidence,
+              tp1=0.0, tp2=0.0, tp3=None, rr_ratio=0.0, message_id=None,
+              grade: str = "B", staleness_data: Optional[dict] = None,
+              setup_class: str = "intraday"):
+        # FIX #3 (AUDIT): setup_class parameter added so callers can pass the
+        # signal's actual setup class (scalp/intraday/swing/positional) through
+        # to TrackedExecution. Previously this was always the dataclass default
+        # "intraday", causing wrong WATCHING timeouts and max-hold limits for
+        # scalp and swing signals routed through execution_engine.
+        # ── Strategy-specific trigger requirements ─────────────────────────────
+        # Different strategies have fundamentally different entry mechanics.
+        # A universal "2 triggers" rule is wrong — it causes slippage on
+        # momentum/breakout strategies and redundant waiting on pattern strategies.
+        #
+        # 0 triggers: enter as soon as price is in zone (momentum/breakout/limit-based)
+        # 1 trigger:  one confirmation (most setups — a single 5m confirmation is enough)
+        # 2 triggers: two confirmations (B/B+ grade signals need extra validation)
+        # STRATEGIST ENTRY RULES:
+        # "LONG (Mean Reversion): must have Structure shift + Momentum candle (not just reaction)"
+        # "SHORT (Trend/Wyckoff): current logic is GOOD — keep unchanged"
+        # With new weights (structure=2, momentum=2, liquidity=1, rejection=1):
+        #   Score ≥ 3 = minimum entry (structure+liquidity OR momentum+liquidity OR momentum+rejection)
+        #   Score ≥ 4 = quality entry (structure+momentum = both confirm)
+        #   Score = 1 = liquidity reaction alone → BLOCKED (was the AAVE problem)
+        _STRATEGY_MIN_TRIGGERS = {
+            # Enter immediately (score=0 means enter on zone touch)
+            "InstitutionalBreakout": 0,    # Breakout IS the signal — no wait
+            "Momentum":              0,    # EMA alignment bars = entry
+            "MomentumContinuation":  0,    # Legacy alias
+            "RangeScalper":          0,    # Boundary touch is the entry
+            # Mean reversion / funding squeeze: need ≥ 3 score
+            # Strategist: "Must have structure shift + momentum candle, NOT just reaction"
+            # Score 3 requires either: structure(2)+liquidity(1) OR momentum(2)+liquidity(1)
+            # Score 1 (liquidity alone) is explicitly blocked
+            "FundingRateArb":        3,    # STRATEGIST: structure+liq OR momentum+liq minimum
+            "MeanReversion":         3,    # Same — Z-score extreme alone not enough
+            "ExtremeReversal":       3,    # Same — RSI extreme alone not enough
+            # Trend continuation / structure: need ≥ 3 score (already working well)
+            "PriceAction":           3,    # Strategist confirmed this needs structure
+            "Ichimoku":              3,    # Cloud cross + structure confirmation
+            "IchimokuCloud":         3,    # Legacy alias
+            "SmartMoneyConcepts":    3,    # OB tap + structure + volume ideally
+            # Wave / event strategies: need ≥ 3 score
+            "ElliottWave":           3,    # Momentum into Fib zone
+            "WyckoffAccDist":        3,    # Volume + structure shift confirms Spring/UTAD
+            "Wyckoff":               3,    # Legacy alias
+            "HarmonicPattern":       3,    # Pattern completion confirmation
+            "GeometricPattern":      3,    # Same
+        }
+        _strategy_trig = _STRATEGY_MIN_TRIGGERS.get(strategy, None)
+
+        # Grade still acts as a floor — a B+ signal always needs at least what the
+        # grade requires, even if strategy says 0.
+        _grade_trig = {"A+": 0, "A": 1, "B+": 1, "B": 2, "C": 3}.get(grade, 2)
+
+        if _strategy_trig is not None:
+            # Use whichever is higher: strategy requirement or grade floor
+            # Exception: if grade is A+ (confident setup), trust the strategy minimum
+            if grade == "A+":
+                _min_trig = _strategy_trig
+            else:
+                _min_trig = max(_strategy_trig, _grade_trig)
+        else:
+            _min_trig = _grade_trig
+
+        # FIX: Counter-trend signals in bear/choppy regimes require +1 trigger
+        # Evidence: AAVE LONG entered on 1.3/1 score (liquidity reaction only) — lost $193
+        # KITE LONG entered on 2.2/1 score — lost $638. Both counter-trend in BEAR_TREND.
+        try:
+            from analyzers.regime import regime_analyzer as _ee_ra
+            from analyzers.htf_guardrail import htf_guardrail as _ee_htf
+            _ee_regime = _ee_ra.regime.value
+            _is_counter = (
+                (direction == "LONG" and _ee_htf._weekly_bias == "BEARISH") or
+                (direction == "SHORT" and _ee_htf._weekly_bias == "BULLISH")
+            )
+            if _is_counter and _ee_regime in ("BEAR_TREND", "CHOPPY") and _ee_htf._weekly_adx >= 25:
+                _min_trig = max(_min_trig, 2)  # Always need at least 2 triggers for counter-trend
+        except Exception:
+            pass
+
+        # BUG-13: Snapshot baseline conditions at creation time for pre-fill staleness check.
+        # When price finally reaches the zone hours later, we compare current conditions
+        # against these baselines to detect if the market has genuinely reversed.
+        if staleness_data is None:
+            try:
+                from analyzers.regime import regime_analyzer
+                from analyzers.htf_guardrail import htf_guardrail as _htf
+                staleness_data = {
+                    'regime': getattr(regime_analyzer.regime, 'value', 'UNKNOWN'),
+                    'chop': regime_analyzer.chop_strength,
+                    'weekly_bias': getattr(_htf, '_weekly_bias', 'NEUTRAL'),
+                    'fear_greed': regime_analyzer.fear_greed,
+                    'created_price': price_cache.get(symbol) or ((entry_low + entry_high) / 2),
+                }
+            except Exception:
+                staleness_data = {}
+
+        self._tracked[signal_id] = TrackedExecution(
+            signal_id=signal_id, symbol=symbol, direction=direction,
+            strategy=strategy, entry_low=entry_low, entry_high=entry_high,
+            stop_loss=stop_loss, confidence=confidence,
+            tp1=tp1, tp2=tp2, tp3=tp3, rr_ratio=rr_ratio,
+            message_id=message_id,
+            grade=grade, min_triggers=_min_trig,
+            staleness_data=staleness_data,
+            setup_class=setup_class,
+        )
+        self._tracked[signal_id].TRIGGER_WINDOW_SECS = _get_trigger_window_secs(setup_class)
+        price_cache.subscribe(symbol)
+        # Persist immediately so a crash/restart before the first state change
+        # doesn't lose this signal entirely.
+        try:
+            from data.database import db as _ee_db
+            _safe_ensure_future(
+                _ee_db.save_tracked_signal(
+                    signal_id=signal_id, symbol=symbol, direction=direction,
+                    strategy=strategy, state="APPROVED",
+                    entry_low=entry_low, entry_high=entry_high,
+                    stop_loss=stop_loss, confidence=confidence,
+                    grade=grade, message_id=message_id,
+                    tp1=tp1, tp2=tp2, tp3=tp3, rr_ratio=rr_ratio,
+                    min_triggers=_min_trig,
+                    setup_class=setup_class,
+                ),
+                context=f"save_tracked APPROVED #{signal_id}",
+            )
+        except Exception:
+            pass
+
+    def invalidate_regime_cache(self):
+        """FIX L2: Called by engine when regime changes to clear stale regime stats."""
+        self._regime_cache_invalidated = True
+
+    def untrack(self, signal_id: int):
+        """Remove a signal from execution tracking and release price cache subscription."""
+        sig = self._tracked.pop(signal_id, None)
+        if sig:
+            # Only unsubscribe if no other tracked signal needs same symbol
+            still_needed = any(s.symbol == sig.symbol for s in self._tracked.values())
+            if not still_needed:
+                price_cache.unsubscribe(sig.symbol)
+            logger.debug(f"ExecutionEngine: untracked #{signal_id} {sig.symbol}")
+            try:
+                from data.database import db as _ee_db
+                _safe_ensure_future(
+                    _ee_db.delete_tracked_signal(signal_id),
+                    context=f"delete_tracked #{signal_id}",
+                )
+            except Exception:
+                pass
+
+    async def restore(self) -> None:
+        """Reload pre-fill signals from tracked_signals_v1 on startup.
+
+        Recovers signals that were in APPROVED/PREPARING/WATCHING/ALMOST/ENTRY_ZONE
+        state when the bot last stopped, including any trigger flags that had
+        already been set.  Called before start() so the loop resumes immediately.
+        """
+        _pre_fill_states = [
+            "APPROVED", "PREPARING", "WATCHING", "ALMOST", "ENTRY_ZONE",
+            "ARMED",  # legacy: DB may still contain old state name
+        ]
+        try:
+            from data.database import db as _ee_db
+            rows = await _ee_db.load_tracked_signals(states=_pre_fill_states)
+        except Exception as _re:
+            logger.warning(f"ExecutionEngine.restore: DB load failed (non-fatal): {_re}")
+            return
+
+        restored = 0
+        for row in rows:
+            sid = row['signal_id']
+            if sid in self._tracked:
+                continue  # already present (e.g. added by engine recovery logic)
+            try:
+                te = TrackedExecution(
+                    signal_id=sid,
+                    symbol=row['symbol'],
+                    direction=row['direction'],
+                    strategy=row['strategy'],
+                    entry_low=row['entry_low'],
+                    entry_high=row['entry_high'],
+                    stop_loss=row['stop_loss'],
+                    confidence=row['confidence'],
+                    tp1=row.get('tp1', 0.0),
+                    tp2=row.get('tp2', 0.0),
+                    tp3=row.get('tp3'),
+                    rr_ratio=row.get('rr_ratio', 0.0),
+                    message_id=row.get('message_id'),
+                    grade=row.get('grade', 'B'),
+                    min_triggers=row.get('min_triggers', 2),
+                    setup_class=row.get('setup_class', 'intraday'),
+                    has_rejection_candle=bool(row.get('has_rejection_candle', 0)),
+                    has_structure_shift=bool(row.get('has_structure_shift', 0)),
+                    has_momentum_expansion=bool(row.get('has_momentum_expansion', 0)),
+                    has_liquidity_reaction=bool(row.get('has_liquidity_reaction', 0)),
+                    created_at=row.get('created_at', time.time()),
+                )
+                # Restore the state enum
+                try:
+                    # Migration: map legacy "ARMED" DB values to "ALMOST"
+                    _raw_state = row['state']
+                    if _raw_state == "ARMED":
+                        _raw_state = "ALMOST"
+                    te.state = SignalState(_raw_state)
+                except ValueError:
+                    te.state = SignalState.WATCHING  # safe fallback
+                # Restore timing fields so timeout logic is correct.
+                # Use the timestamp of the most recent persisted state transition
+                # when available. save_tracked_signal() updates updated_at on every
+                # state change, so this is the best proxy for "when did we enter
+                # WATCHING/ALMOST/ENTRY_ZONE" after a restart.
+                _state_changed_at = row.get('updated_at') or te.created_at
+                if te.state in (SignalState.WATCHING, SignalState.ENTRY_ZONE):
+                    te.watching_since = _state_changed_at
+                elif te.state == SignalState.ALMOST:
+                    te.almost_since = _state_changed_at
+
+                self._tracked[sid] = te
+                price_cache.subscribe(te.symbol)
+                restored += 1
+            except Exception as _row_err:
+                logger.debug(f"ExecutionEngine.restore: skipped row #{sid}: {_row_err}")
+
+        if restored:
+            logger.info(f"🔄 ExecutionEngine restored {restored} pre-fill signal(s) from DB")
+
+    def start(self):
+        self._running = True
+        self._task = asyncio.create_task(self._loop())
+
+    async def stop(self):
+        """Clean shutdown"""
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+
+    def get_status_summary(self) -> str:
+        """Return a brief status string for heartbeat logging"""
+        total = len(self._tracked)
+        executing = sum(1 for s in self._tracked.values() if s.state == SignalState.EXECUTE)
+        watching = sum(1 for s in self._tracked.values() if s.state in (SignalState.WATCHING, SignalState.ENTRY_ZONE, SignalState.ALMOST))
+        return f"{total} tracked | {executing} execute | {watching} watching"
+
+    async def _loop(self):
+        _regime_stats_cache = {}
+        _regime_stats_last = 0.0
+        _REGIME_CACHE_TTL = 300  # Fix E5: only recompute every 5min, not every 15s
+        self._regime_cache_invalidated = False  # FIX L2
+
+        while self._running:
+            now = time.time()
+
+            # Fix E5: cache regime stats, don't read the whole file every cycle
+            # FIX L2: also refresh if regime change was detected externally
+            if now - _regime_stats_last > _REGIME_CACHE_TTL or self._regime_cache_invalidated:
+                self._regime_cache_invalidated = False
+                try:
+                    _regime_stats_cache = compute_regime_stats()
+                    _regime_stats_last = now
+                    if _regime_stats_cache:
+                        logger.debug(f"[REGIME_STATS] {_regime_stats_cache}")
+                except Exception:
+                    pass
+
+            await asyncio.sleep(self._check_interval)
+            self._check_interval = _resolve_check_interval(self._tracked)
+
+            for sig in list(self._tracked.values()):
+                await self._check(sig, _regime_stats_cache)
+
+    async def _check(self, sig: TrackedExecution, regime_stats: dict = None):
+        """Fix E3: market_state computed once here and passed down to _check_triggers"""
+        # BUG-B FIX: `now` must be defined at the top of _check.
+        # The B1 timeout logic (WATCHING/ALMOST expiry) uses `now` but the original
+        # code only defined `now` in `_loop`, not here. This caused NameError on
+        # every signal that entered WATCHING or ALMOST state.
+        now = time.time()
+        try:
+            from signals.signal_decay import apply_decay
+            decayed_confidence = apply_decay(sig.confidence, sig.created_at, now)
+        except Exception:
+            decayed_confidence = sig.confidence
+
+        price = price_cache.get(sig.symbol)
+        if price is None:
+            return  # Cache miss — skip this cycle, try next
+
+        sig.last_price = price
+
+        old_state = sig.state
+
+        try:
+            from analyzers.btc_news_intelligence import btc_news_intelligence
+            _btc_block_reason = btc_news_intelligence.get_signal_block_reason(sig.direction)
+            if _btc_block_reason:
+                sig.state = SignalState.INVALIDATED
+                logger.info(
+                    f"ExecutionEngine: #{sig.signal_id} {sig.symbol} invalidated by BTC news "
+                    f"block — {_btc_block_reason}"
+                )
+                return
+        except Exception:
+            pass
+
+        # Guard against a corrupted signal record where entry_mid is zero, negative,
+        # NaN, or Inf — which would cause ZeroDivisionError or NaN propagation.
+        if not (sig.entry_mid > 0):  # catches NaN, Inf, 0, and negatives
+            logger.error(
+                f"ExecutionEngine: signal #{sig.signal_id} {sig.symbol} has "
+                f"entry_mid={sig.entry_mid} — corrupted record, invalidating"
+            )
+            sig.state = SignalState.INVALIDATED
+            return
+
+        distance = abs(price - sig.entry_mid) / sig.entry_mid
+
+        in_zone = sig.entry_low <= price <= sig.entry_high
+
+        # Fix E3: build market_state once for this check cycle (not twice)
+        profile = {}
+        market_state = {}
+        try:
+            market_state = await build_market_state(sig.symbol, sig.direction)
+            profile = build_market_profile(market_state) if market_state else {}
+        except Exception:
+            pass
+
+        # Fix E4: compute confidence_score and risk_adj BEFORE the state machine uses them
+        try:
+            confidence_score = compute_confidence(market_state, profile)
+            profile["confidence_score"] = confidence_score
+            sig._confidence_score = confidence_score  # expose for logging
+        except Exception:
+            confidence_score = 50
+
+        try:
+            risk_adj = get_risk_adjustment(profile.get("regime"))
+            profile["risk_multiplier"] = profile.get("risk_multiplier", 1.0) * risk_adj
+            sig._risk_adj = risk_adj  # expose for logging
+        except Exception:
+            risk_adj = 1.0
+
+        # --- STATE MACHINE ---
+        # B1: Expire signals that have been WATCHING or ALMOST too long without firing
+        if sig.state == SignalState.WATCHING:
+            if sig.watching_since is None:
+                sig.watching_since = now
+            elif now - sig.watching_since > _get_watching_timeout(sig):
+                sig.state = SignalState.EXPIRED
+                _timeout_h = _get_watching_timeout(sig) / 3600
+                logger.info(
+                    f"ExecutionEngine: #{sig.signal_id} {sig.symbol} EXPIRED "
+                    f"(in WATCHING for {(now - sig.watching_since)/3600:.1f}h, "
+                    f"timeout={_timeout_h:.1f}h setup_class={getattr(sig,'setup_class','?')})"
+                )
+        if sig.state == SignalState.ALMOST:
+            if sig.almost_since is None:
+                sig.almost_since = now
+            elif now - sig.almost_since > EXECUTION_ALMOST_TIMEOUT:
+                sig.state = SignalState.EXPIRED
+                logger.info(
+                    f"ExecutionEngine: #{sig.signal_id} {sig.symbol} EXPIRED "
+                    f"(in ALMOST for {(now - sig.almost_since)/3600:.1f}h)"
+                )
+
+        if (
+            decayed_confidence <= 50.0
+            and sig.state in (SignalState.APPROVED, SignalState.PREPARING, SignalState.WATCHING)
+            and now - sig.created_at > 900
+        ):
+            sig.state = SignalState.EXPIRED
+            logger.info(
+                f"ExecutionEngine: #{sig.signal_id} {sig.symbol} EXPIRED "
+                f"(signal decay {sig.confidence:.1f}→{decayed_confidence:.1f})"
+            )
+
+        # Extended-zone kill: price blew past the entry zone boundary without ever
+        # entering it (e.g. LONG waiting for pullback but price ran +2% above entry_high).
+        # The optimal entry window is gone — further holding risks a bad fill.
+        if sig.state in (SignalState.APPROVED, SignalState.PREPARING, SignalState.WATCHING):
+            _ext_pct = 0.0
+            if sig.direction == "LONG" and price > sig.entry_high:
+                _ext_pct = (price - sig.entry_high) / sig.entry_high * 100
+            elif sig.direction == "SHORT" and price < sig.entry_low:
+                _ext_pct = (sig.entry_low - price) / sig.entry_low * 100
+            if _ext_pct > 2.0:
+                sig.state = SignalState.INVALIDATED
+                logger.info(
+                    f"Extended kill: #{sig.signal_id} {sig.symbol} {sig.direction} "
+                    f"price {price:.6g} is {_ext_pct:.1f}% beyond entry zone — invalidated"
+                )
+
+        if sig.state == SignalState.APPROVED and distance < 0.02:
+            sig.state = SignalState.PREPARING
+
+        elif sig.state == SignalState.PREPARING and distance < 0.01:
+            sig.state = SignalState.WATCHING
+            sig.watching_since = now  # B1: record when we entered WATCHING
+
+        elif sig.state == SignalState.WATCHING and in_zone:
+            sig.state = SignalState.ENTRY_ZONE
+            # FIX 3B: Record that price reached the entry zone.
+            # Enables AI to distinguish "zone never reached" (execution miss)
+            # from "zone reached but trigger failed" (trigger quality issue).
+            try:
+                from data.database import db
+                asyncio.create_task(db.write_zone_reached(sig.signal_id))
+            except Exception:
+                pass
+
+        elif sig.state in (SignalState.ENTRY_ZONE, SignalState.ALMOST):
+            await self._check_triggers(sig, price, market_state)  # Fix E3: pass pre-computed state
+
+            # V11: Grade-aware trigger requirements (replaces hardcoded 2)
+            _required_triggers = sig.min_triggers
+
+            # STRATEGIST FIX B: Dynamic timing filter
+            # "If HTF = bearish: LONG requires ≥ 4 score"
+            # Prevents AAVE-style entries on single liquidity reaction (score=1.3 old / 1.0 new)
+            try:
+                from analyzers.htf_guardrail import htf_guardrail as _ee_htf2
+                _htf_bear_long = (
+                    sig.direction == "LONG" and
+                    _ee_htf2._weekly_bias == "BEARISH" and
+                    _ee_htf2._weekly_adx >= 25
+                )
+                if _htf_bear_long:
+                    _required_triggers = max(_required_triggers, 4)  # Need structure+momentum BOTH
+            except Exception:
+                pass
+
+            # Low-confidence upgrade: need 1 extra trigger if confidence is poor.
+            # compute_confidence() returns 0-100, not 0-1.
+            if confidence_score < 40 and _required_triggers < 3:
+                _required_triggers += 1
+            if decayed_confidence <= sig.confidence - DECAY_TRIGGER_INCREMENT_THRESHOLD and _required_triggers < 4:
+                _required_triggers += 1
+
+            if sig.triggers_met >= _required_triggers:
+                # BUG-13: Pre-fill staleness validation.
+                # The signal was analysed hours ago. Before executing, verify
+                # the market hasn't genuinely reversed while waiting for the pullback.
+                # Three checks in order of severity:
+                _stale_reason = await self._check_staleness(sig, price)
+                if _stale_reason:
+                    sig.state = SignalState.INVALIDATED
+                    logger.info(
+                        f"🚫 Staleness block | #{sig.signal_id} {sig.symbol} {sig.direction} "
+                        f"| Triggers met but setup invalidated: {_stale_reason}"
+                    )
+                    if self.on_stage_change:
+                        _sent_set = self._stage_msg_sent.setdefault(sig.signal_id, set())
+                        if "STALENESS_INVALIDATED" not in _sent_set:
+                            _sent_set.add("STALENESS_INVALIDATED")
+                            # Notify via existing stage_change callback so Telegram gets updated
+                            await self.on_stage_change(sig, SignalState.ALMOST, SignalState.INVALIDATED)
+                else:
+                    sig.state = SignalState.EXECUTE
+
+                # --- Execution Journal Logging ---
+                # FIX: only log if we actually reached EXECUTE state (not INVALIDATED)
+                if sig.state == SignalState.EXECUTE:
+                    try:
+                        journal_entry = {
+                            "symbol": sig.symbol,
+                            "direction": sig.direction,
+                            "state": "EXECUTE",
+                            "triggers_met": sig.triggers_met,
+                            "regime": profile.get("regime"),
+                            "confirmation_required": profile.get("confirmation_required"),
+                            "risk_multiplier": profile.get("risk_multiplier"),
+                            "last_price": price,
+                        }
+                        log_execution(journal_entry)
+                    except Exception:
+                        pass
+
+            elif sig.triggers_met >= 1:
+                _was_already_almost = sig.state == SignalState.ALMOST
+                sig.state = SignalState.ALMOST
+                if sig.almost_since is None:
+                    sig.almost_since = now  # B1: record when almost ready
+                if _tl and not _was_already_almost:
+                    try:
+                        _tl.trigger(signal_id=sig.signal_id, symbol=sig.symbol, direction=sig.direction, structure_shift=sig.has_structure_shift, momentum=sig.has_momentum_expansion, liquidity=sig.has_liquidity_reaction, rejection=sig.has_rejection_candle, triggers_score=sig.triggers_met, min_triggers=sig.min_triggers, new_state="ALMOST")
+                    except Exception:
+                        pass
+
+        try:
+            regime = profile.get("regime", "UNKNOWN")
+            logger.debug(
+                f"[EXEC_ENGINE] {sig.symbol} | State={sig.state.value} "
+                f"| Triggers={sig.triggers_met} | Conf={confidence_score:.2f} "
+                f"| RiskAdj={risk_adj:.2f} | Regime={regime}"
+            )
+        except Exception:
+            pass
+    
+        if sig.state != old_state:
+            # Persist exec_state to DB so dashboard reflects correct state after restart
+            try:
+                from data.database import db as _exec_db
+                _safe_ensure_future(
+                    _exec_db.update_signal_exec_state(sig.signal_id, sig.state.value),
+                    context=f"exec_state {sig.state.value} #{sig.signal_id}",
+                )
+                # Also persist full signal state to tracked_signals_v1 so trigger
+                # flags and state survive restarts (pre-fill states only — post-fill
+                # states are managed by OutcomeMonitor).
+                _non_terminal = sig.state not in (
+                    SignalState.EXPIRED, SignalState.INVALIDATED,
+                    SignalState.FILLED, SignalState.EXECUTE,
+                )
+                if _non_terminal:
+                    _safe_ensure_future(
+                        _exec_db.save_tracked_signal(
+                            signal_id=sig.signal_id,
+                            symbol=sig.symbol,
+                            direction=sig.direction,
+                            strategy=sig.strategy,
+                            state=sig.state.value,
+                            entry_low=sig.entry_low,
+                            entry_high=sig.entry_high,
+                            stop_loss=sig.stop_loss,
+                            confidence=sig.confidence,
+                            grade=sig.grade,
+                            message_id=sig.message_id,
+                            created_at=sig.created_at,
+                            tp1=sig.tp1,
+                            tp2=sig.tp2,
+                            tp3=sig.tp3,
+                            rr_ratio=sig.rr_ratio,
+                            min_triggers=sig.min_triggers,
+                            setup_class=sig.setup_class,
+                            has_rejection_candle=sig.has_rejection_candle,
+                            has_structure_shift=sig.has_structure_shift,
+                            has_momentum_expansion=sig.has_momentum_expansion,
+                            has_liquidity_reaction=sig.has_liquidity_reaction,
+                        ),
+                        context=f"save_tracked {sig.state.value} #{sig.signal_id}",
+                    )
+            except Exception:
+                pass
+            if self.on_stage_change:
+                # V10: Dedup — only send each state transition message once
+                _sent_set = self._stage_msg_sent.setdefault(sig.signal_id, set())
+                if sig.state.value not in _sent_set:
+                    _sent_set.add(sig.state.value)
+                    await self.on_stage_change(sig, old_state, sig.state)
+
+        # FIX L1 / BUG-D FIX: Auto-remove from _tracked when signal reaches terminal state.
+        # BUG-D: EXECUTE and FILLED were excluded from _tracked.pop(), causing them to
+        # loop forever in the check cycle, wasting API calls indefinitely after every
+        # confirmed execution. All four terminal states must be fully cleaned up.
+        # B10: Also clean up _stage_msg_sent to prevent unbounded memory growth.
+        if sig.state in (SignalState.EXPIRED, SignalState.INVALIDATED, SignalState.FILLED, SignalState.EXECUTE):
+            self._tracked.pop(sig.signal_id, None)      # BUG-D: was only removing EXPIRED/INVALIDATED
+            self._stage_msg_sent.pop(sig.signal_id, None)  # B10: cleanup dedup dict
+            logger.debug(f"ExecutionEngine: auto-removed #{sig.signal_id} ({sig.state.value})")
+            # Remove from tracked_signals_v1 — OutcomeMonitor will re-insert if it
+            # transitions to ACTIVE, so no gap in coverage.
+            try:
+                from data.database import db as _exec_db_term
+                _safe_ensure_future(
+                    _exec_db_term.delete_tracked_signal(sig.signal_id),
+                    context=f"delete_tracked terminal #{sig.signal_id}",
+                )
+            except Exception:
+                pass
+
+    async def _check_staleness(self, sig: TrackedExecution, price: float) -> Optional[str]:
+        """
+        BUG-13: Pre-fill staleness validation.
+
+        Called when all entry triggers are met but the signal was created hours ago.
+        Returns a reason string if the setup has been invalidated by market changes,
+        or None if the setup is still valid and execution should proceed.
+
+        Three checks in order of impact:
+
+        1. REGIME FLIP: If the regime at fill time has flipped against the direction
+           (e.g. was BULL_TREND at signal creation, now BEAR_TREND at fill time),
+           the structural basis for the signal has changed fundamentally.
+
+        2. VOLUME CHARACTER: A healthy retracement to the entry zone has DECLINING
+           volume as price approaches (sellers exhausting). A reversal has EXPANDING
+           volume on the approach (new sellers entering). Check the last 3 bars on 5m.
+
+        3. CHOCH SINCE SIGNAL: If a Change of Character has formed on the 1h chart
+           since the signal was created, the market structure has flipped. A CHoCH
+           on the timeframe the signal was analysed on invalidates the entire setup.
+        """
+        try:
+            baseline = sig.staleness_data or {}
+            signal_age_hours = (time.time() - sig.created_at) / 3600
+
+            # Only run staleness checks if signal is old enough to have meaningful drift
+            # (less than 1 hour old = regime/structure haven't had time to change)
+            if signal_age_hours < 1.0:
+                return None
+
+            # ── Check 1: Regime flip ──────────────────────────────────
+            try:
+                from analyzers.regime import regime_analyzer
+                current_regime = getattr(regime_analyzer.regime, 'value', 'UNKNOWN')
+                original_regime = baseline.get('regime', current_regime)
+                current_chop = regime_analyzer.chop_strength
+
+                # A flip from trending to CHOPPY or opposite trend is a structural change
+                _was_trending = original_regime in ("BULL_TREND", "BEAR_TREND")
+                _now_trending = current_regime in ("BULL_TREND", "BEAR_TREND")
+                _trend_flipped = (
+                    _was_trending and _now_trending and original_regime != current_regime
+                )
+                _went_risk_off = current_regime == "VOLATILE" and original_regime != "VOLATILE"
+
+                if _trend_flipped:
+                    return (
+                        f"Regime flipped {original_regime}→{current_regime} since signal "
+                        f"({signal_age_hours:.1f}h ago) — structural basis changed"
+                    )
+                if _went_risk_off:
+                    return (
+                        f"Market entered VOLATILE since signal ({signal_age_hours:.1f}h ago) "
+                        f"— panic conditions, not a healthy retracement"
+                    )
+
+                # Chop surge: went from low chop (trending) to high chop (range)
+                original_chop = baseline.get('chop', 0.5)
+                if original_chop < 0.25 and current_chop > 0.55:
+                    return (
+                        f"Chop surge {original_chop:.2f}→{current_chop:.2f} since signal "
+                        f"— trending setup, now ranging market"
+                    )
+            except Exception:
+                pass
+
+            # ── Check 2: Volume character on approach ────────────────
+            # Contracting volume on pullback = healthy retracement (sellers exhausting)
+            # Expanding volume on pullback = reversal (new sellers entering aggressively)
+            try:
+                import numpy as np
+                ohlcv_5m = await api.fetch_ohlcv(sig.symbol, "5m", limit=12)
+                if ohlcv_5m and len(ohlcv_5m) >= 6:
+                    closes_5m = np.array([float(b[4]) for b in ohlcv_5m])
+                    vols_5m   = np.array([float(b[5]) for b in ohlcv_5m])
+
+                    # Identify last 4 bars where price was moving toward the zone
+                    # (falling for LONG entry, rising for SHORT entry)
+                    _approach_bars = []
+                    for i in range(-4, 0):
+                        _moving_toward_zone = (
+                            (sig.direction == "LONG" and closes_5m[i] < closes_5m[i-1]) or
+                            (sig.direction == "SHORT" and closes_5m[i] > closes_5m[i-1])
+                        )
+                        if _moving_toward_zone:
+                            _approach_bars.append(vols_5m[i])
+
+                    if len(_approach_bars) >= 3:
+                        avg_vol_recent = np.mean(vols_5m[-12:])
+                        avg_approach_vol = np.mean(_approach_bars)
+                        # Expanding volume: approach volume > 1.5× recent average
+                        # and each approach bar is larger than the last
+                        vol_expanding = avg_approach_vol > avg_vol_recent * 1.5
+                        vol_accelerating = (
+                            len(_approach_bars) >= 3 and
+                            _approach_bars[-1] > _approach_bars[-2] > _approach_bars[-3]
+                        )
+
+                        if vol_expanding and vol_accelerating:
+                            return (
+                                f"Reversal volume pattern on approach: "
+                                f"avg approach vol {avg_approach_vol:.0f} > 1.5× recent avg {avg_vol_recent:.0f}, "
+                                f"accelerating — new sellers entering, not exhaustion"
+                            )
+            except Exception:
+                pass
+
+            # ── Check 3: CHoCH on 1h since signal was created ────────
+            # A CHoCH (Change of Character) means the trend direction has flipped
+            # on the analysis timeframe. If a LONG setup had bullish structure,
+            # and a bearish CHoCH has formed since then, the setup is void.
+            try:
+                ohlcv_1h = await api.fetch_ohlcv(sig.symbol, "1h", limit=20)
+                if ohlcv_1h and len(ohlcv_1h) >= 6:
+                    import numpy as np
+                    closes_1h = np.array([float(b[4]) for b in ohlcv_1h])
+                    highs_1h  = np.array([float(b[2]) for b in ohlcv_1h])
+                    lows_1h   = np.array([float(b[3]) for b in ohlcv_1h])
+
+                    # Simple CHoCH: look at the last N bars since signal creation
+                    # N bars = signal_age_hours (roughly)
+                    n_bars = max(3, min(int(signal_age_hours) + 1, len(closes_1h) - 2))
+                    recent_closes = closes_1h[-n_bars:]
+                    recent_highs  = highs_1h[-n_bars:]
+                    recent_lows   = lows_1h[-n_bars:]
+
+                    if sig.direction == "LONG":
+                        # Bearish CHoCH: a prior swing high was broken lower
+                        # (lower high formed after the signal was bullish)
+                        prior_high = float(np.max(highs_1h[-(n_bars+3):-n_bars]))
+                        current_high = float(np.max(recent_highs))
+                        if current_high < prior_high * 0.97:  # Lower high by >3%
+                            # Also confirm lower low (not just a pullback)
+                            prior_low = float(np.min(lows_1h[-(n_bars+3):-n_bars]))
+                            current_low = float(np.min(recent_lows))
+                            if current_low < prior_low * 0.98:
+                                return (
+                                    f"Bearish CHoCH since signal: "
+                                    f"lower high ({current_high:.5f} < {prior_high:.5f}) "
+                                    f"+ lower low ({current_low:.5f} < {prior_low:.5f}) "
+                                    f"on 1h in last {n_bars}h"
+                                )
+                    else:  # SHORT
+                        # Bullish CHoCH: higher low + higher high formed since signal
+                        prior_low = float(np.min(lows_1h[-(n_bars+3):-n_bars]))
+                        current_low = float(np.min(recent_lows))
+                        if current_low > prior_low * 1.03:
+                            prior_high = float(np.max(highs_1h[-(n_bars+3):-n_bars]))
+                            current_high = float(np.max(recent_highs))
+                            if current_high > prior_high * 1.02:
+                                return (
+                                    f"Bullish CHoCH since signal: "
+                                    f"higher low ({current_low:.5f} > {prior_low:.5f}) "
+                                    f"+ higher high ({current_high:.5f} > {prior_high:.5f}) "
+                                    f"on 1h in last {n_bars}h"
+                                )
+            except Exception:
+                pass
+
+        except Exception as _stale_outer:
+            logger.debug(f"Staleness check error (non-fatal): {_stale_outer}")
+
+        return None  # All checks passed — setup still valid
+
+    async def _check_triggers(self, sig: TrackedExecution, price: float, market_state: dict = None):
+        """
+        Fix E1: structure_shift now actually detects BOS (break of structure).
+        Fix E2: momentum_expansion requires real volume + body expansion, not any green candle.
+        Fix E3: accepts pre-computed market_state instead of fetching again.
+        FIX STICKY-TRIGGERS: trigger flags now expire after TRIGGER_WINDOW_SECS.
+          Triggers accumulate within a rolling 20-minute window.  If the window
+          expires without reaching min_triggers, all flags reset and a new window
+          starts.  This prevents a rejection candle from hour 1 combining with a
+          structure shift from hour 3 to produce a false EXECUTE.
+        """
+        import numpy as np
+        now = time.time()
+
+        # ── Stale-trigger reset ────────────────────────────────────────────────
+        if sig.trigger_window_since is None:
+            sig.trigger_window_since = now
+        elif now - sig.trigger_window_since > sig.TRIGGER_WINDOW_SECS:
+            # Window expired — were we close enough to fire?  If so, extend rather
+            # than wipe (avoids punishing slow momentum setups on illiquid alts).
+            # Only reset if triggers_met is still well below the threshold.
+            _gap = sig.min_triggers - sig.triggers_met
+            if _gap > 1.0:  # More than 1 point away — definitely stale, reset
+                _was = (sig.has_rejection_candle, sig.has_structure_shift,
+                        sig.has_momentum_expansion, sig.has_liquidity_reaction)
+                sig.has_rejection_candle   = False
+                sig.has_structure_shift    = False
+                sig.has_momentum_expansion = False
+                sig.has_liquidity_reaction = False
+                sig.trigger_window_since   = now
+                if any(_was):
+                    logger.info(
+                        f"🔄 Trigger reset | #{sig.signal_id} {sig.symbol} "
+                        f"| window={sig.TRIGGER_WINDOW_SECS//60}min expired "
+                        f"| gap={_gap:.1f} pts | rej={_was[0]} struct={_was[1]} "
+                        f"mom={_was[2]} liq={_was[3]}"
+                    )
+            else:
+                # Close to threshold — extend the window rather than resetting
+                sig.trigger_window_since = now
+
+        from strategies.base import SETUP_CLASS_CONFIRM_TF as _SC_TF
+        _confirm_tf = _SC_TF.get(getattr(sig, 'setup_class', 'intraday'), '15m')
+        ohlcv = await api.fetch_ohlcv(sig.symbol, _confirm_tf, limit=20)
+        if not ohlcv or len(ohlcv) < 5:
+            return
+
+        last = ohlcv[-1]
+        o, h, l, c = float(last[1]), float(last[2]), float(last[3]), float(last[4])
+
+        highs  = np.array([float(x[2]) for x in ohlcv])
+        lows   = np.array([float(x[3]) for x in ohlcv])
+        closes = np.array([float(x[4]) for x in ohlcv])
+        vols   = np.array([float(x[5]) for x in ohlcv])
+
+        body = abs(c - o)
+        rng  = h - l if (h - l) > 0 else 1e-9
+
+        # Compute ATR-14 early — used by both rejection candle and momentum checks
+        atr_14 = float(np.mean(np.abs(closes[1:] - closes[:-1])[-14:])) if len(closes) >= 15 else (rng * 0.5)
+        avg_vol = float(np.mean(vols[-10:])) if len(vols) >= 10 else float(vols[-1])
+
+        # Trigger 1: rejection candle — wick-heavy candle with meaningful size
+        #
+        # OLD: body/rng < 0.4 AND body > 0
+        #   Problem: a 1-tick body on a 3-tick doji qualifies. On thin alts with
+        #   a 0.0001 spread this fires on almost every candle in the entry zone.
+        #
+        # NEW: body/rng < 0.4 AND total range >= 0.5 × ATR14
+        #   The ATR floor ensures the candle is large enough to represent real
+        #   rejection.  A micro-doji with rng=0.00002 on a coin trading at $0.03
+        #   is noise — it should not count as rejection evidence worth +1pt.
+        _wick_meaningful = rng >= atr_14 * 0.5
+        if body / rng < 0.4 and body > 0 and _wick_meaningful:
+            if sig.direction == "LONG" and c > o:
+                sig.has_rejection_candle = True
+            elif sig.direction == "SHORT" and c < o:
+                sig.has_rejection_candle = True
+
+        # Fix E2: momentum expansion — requires volume spike AND large body
+        vol_spike = float(vols[-1]) > avg_vol * 1.3
+        body_expanded = body > atr_14 * 0.6
+
+        if vol_spike and body_expanded:
+            if sig.direction == "LONG" and c > o:
+                sig.has_momentum_expansion = True
+            elif sig.direction == "SHORT" and c < o:
+                sig.has_momentum_expansion = True
+
+        # STRATEGIST FIX E: structure shift with volume validation
+        # "Structure shift = break of structure (real demand/supply)" → score=2
+        #
+        # QUALITY UPGRADE (3 changes):
+        #   1. Lookback: 6 bars (30min) → 12 bars (60min).
+        #      A 30min high on a volatile 5m chart is just noise — price breaks it
+        #      constantly.  60min gives a meaningful swing high/low to break.
+        #   2. Volume threshold: 1.05× avg → 1.15× avg.
+        #      5% above average is trivially easy on most candles.  15% requires
+        #      genuine participation above the baseline.
+        #   3. Clearance: 0.1% → 0.2%.
+        #      Sub-tick clearances cause false breaks on spreads and micro-moves.
+        if len(closes) >= 13:
+            swing_lookback = closes[-13:-1]  # 12 bars = 60min of 5m structure
+            _vol_confirms_structure = (
+                float(vols[-1]) >= float(np.mean(vols[-15:-1])) * 1.15
+                if len(vols) >= 15 else True
+            )
+            if sig.direction == "LONG":
+                recent_swing_high = float(np.max(swing_lookback))
+                if c > recent_swing_high * 1.002 and _vol_confirms_structure:
+                    sig.has_structure_shift = True
+            elif sig.direction == "SHORT":
+                recent_swing_low = float(np.min(swing_lookback))
+                if c < recent_swing_low * 0.998 and _vol_confirms_structure:
+                    sig.has_structure_shift = True
+
+        # Trigger 4: liquidity reaction — use pre-computed market_state (Fix E3: no double fetch)
+        if market_state is None:
+            market_state = await build_market_state(sig.symbol, sig.direction)
+
+        if detect_liquidity_reaction({"direction": sig.direction}, market_state):
+            sig.has_liquidity_reaction = True
+
+        # Persist trigger flags whenever any of them is now set.
+        # This is a cheap UPDATE (only touched if at least one flag is True) so
+        # we don't spam the DB — no flags means nothing to save.
+        if (sig.has_rejection_candle or sig.has_structure_shift
+                or sig.has_momentum_expansion or sig.has_liquidity_reaction):
+            try:
+                from data.database import db as _trig_db
+                _safe_ensure_future(
+                    _trig_db.update_tracked_signal(
+                        sig.signal_id,
+                        has_rejection_candle=1 if sig.has_rejection_candle else 0,
+                        has_structure_shift=1 if sig.has_structure_shift else 0,
+                        has_momentum_expansion=1 if sig.has_momentum_expansion else 0,
+                        has_liquidity_reaction=1 if sig.has_liquidity_reaction else 0,
+                    ),
+                    context=f"trigger_flags #{sig.signal_id}",
+                )
+            except Exception:
+                pass
+
+
+# ── Singleton ──────────────────────────────────────────────
+execution_engine = ExecutionEngine()
