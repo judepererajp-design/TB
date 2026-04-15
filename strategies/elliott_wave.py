@@ -334,10 +334,15 @@ class ElliottWave(BaseStrategy):
             tp2 = min(tp2, tp1 - atr * 0.3)
             tp3 = min(tp3, tp2 - atr * 0.3)
 
-        risk = (entry_low - stop_loss) if direction == "LONG" else (stop_loss - entry_high)
-        if risk <= 0:
+        rr_ratio = self.calculate_effective_rr(
+            direction=direction,
+            entry_low=entry_low,
+            entry_high=entry_high,
+            stop_loss=stop_loss,
+            tp2=tp2,
+        )
+        if rr_ratio <= 0:
             return None
-        rr_ratio = abs(tp2 - entry_level) / risk
 
         raw_data["elliott_invalidation_level"] = sl_level
         raw_data.update({"target_wave": target_wave, "tp_proj": tp_proj, "atr": atr, "regime": regime})

@@ -58,10 +58,25 @@ class SmartMoneyConcepts(BaseStrategy):
         "CHOPPY":      -10,
         "UNKNOWN":     0,
     }
+    _COUNTER_TREND_REVERSAL_SETUPS = {"LiquiditySweep"}
 
     def __init__(self):
         super().__init__()
         self._cfg = cfg.strategies.smc
+
+    @classmethod
+    def _allows_counter_trend_setup(
+        cls,
+        setup_type: str,
+        has_choch: bool,
+        choch_direction: str,
+        direction: str,
+    ) -> bool:
+        """Allow only genuine reversal-style counter-trend SMC setups upstream."""
+        if setup_type in cls._COUNTER_TREND_REVERSAL_SETUPS:
+            return True
+        expected_choch = "BULLISH" if direction == "LONG" else "BEARISH"
+        return has_choch and choch_direction == expected_choch
 
     async def analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:
         try:
@@ -336,6 +351,8 @@ class SmartMoneyConcepts(BaseStrategy):
         if _is_with_trend or regime not in ("BULL_TREND", "BEAR_TREND"):
             regime_bonus = self._REGIME_CONF_WITH_TREND.get(regime, 0)
         else:
+            if not self._allows_counter_trend_setup(setup_type, has_choch, choch_direction, direction):
+                return None
             regime_bonus = self._REGIME_CONF_COUNTER_TREND.get(regime, 0)
         confidence += regime_bonus
 
@@ -381,7 +398,13 @@ class SmartMoneyConcepts(BaseStrategy):
         if risk <= 0:
             return None
 
-        rr_ratio = abs(tp2 - entry_ref) / risk if risk > 0 else 0.0
+        rr_ratio = self.calculate_effective_rr(
+            direction=direction,
+            entry_low=entry_low,
+            entry_high=entry_high,
+            stop_loss=stop_loss,
+            tp2=tp2,
+        )
 
         # Confluence additions
         confluence.append(f"📊 Setup: {setup_type} | TF: {tf}")
