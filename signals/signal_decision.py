@@ -5,6 +5,7 @@ Builds a richer, per-signal context payload for the dashboard and asks the LLM
 for a human-in-the-loop verdict: TAKE, WAIT, or AVOID.
 """
 
+import asyncio
 import logging
 from typing import Any, Dict
 
@@ -15,6 +16,7 @@ from utils.free_llm import (
 )
 
 logger = logging.getLogger(__name__)
+_AI_DECISION_TIMEOUT_S = 12
 
 
 async def review_signal(signal: Dict[str, Any], detail: Dict[str, Any], openrouter_api_key: str = "") -> Dict[str, Any]:
@@ -22,7 +24,10 @@ async def review_signal(signal: Dict[str, Any], detail: Dict[str, Any], openrout
     prompt = _build_prompt(detail, ctx)
     verdict = None
     try:
-        verdict = await _call_ai(prompt, openrouter_api_key)
+        verdict = await asyncio.wait_for(
+            _call_ai(prompt, openrouter_api_key),
+            timeout=_AI_DECISION_TIMEOUT_S,
+        )
     except Exception as exc:
         logger.warning("signal_decision LLM failed for %s: %s", detail.get("symbol"), exc)
     if not isinstance(verdict, dict):
