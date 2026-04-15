@@ -708,11 +708,12 @@ class SignalAggregator:
                 _vr = await signal_validator.validate(_val_data, run_llm=_run_llm)
 
                 if _ff_state == "live":
-                    if _vr.status == "ERROR":
+                    if _vr.status == "ERROR" or _vr.kill_switch:
                         logger.warning(
-                            "🛑 Signal rejected by validator | %s %s %s | %s",
+                            "🛑 Signal rejected by validator | %s %s %s | %s%s",
                             signal.symbol, _dir_str_v, signal.strategy,
                             "; ".join(_vr.issues),
+                            " [KILL SWITCH]" if _vr.kill_switch else "",
                         )
                         if _tl:
                             _tl.signal(
@@ -725,9 +726,9 @@ class SignalAggregator:
                                 result=f"REJECTED(VALIDATOR_ERROR {_vr.issues[0][:60]})",
                             )
                         return None
-                    elif _vr.status == "WARNING" and _vr.data_quality == "LOW":
-                        # Penalise confidence for low-quality data
-                        _penalty = 8
+                    elif _vr.status == "WARNING" and _vr.data_quality in ("LOW", "MEDIUM"):
+                        # Dynamic penalty: scales with LLM distrust level
+                        _penalty = _vr.dynamic_penalty if _vr.dynamic_penalty > 0 else 4
                         signal.confidence = max(40, signal.confidence - _penalty)
                         signal.confluence.append(
                             f"⚠️ Data validator: {_vr.issues[0][:80]} (confidence -{_penalty})"

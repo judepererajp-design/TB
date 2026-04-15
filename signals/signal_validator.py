@@ -6,19 +6,33 @@ Dual-layer defense against bad calculations and wired-incorrectly logic:
   Layer A: Programmatic Validation (STRICT)
     Hard constraints that catch impossible values — RSI out of range,
     negative prices, inverted entry zones, direction/indicator conflicts.
+    Also includes cross-field consistency checks (trend+ADX coherence,
+    breakout+volume confirmation).
     These run every cycle, are zero-cost, and never miss.
 
   Layer B: LLM Anomaly Detection (FLEXIBLE)
     Pattern-aware checks for *suspicious* combinations that pass Layer A
     but still smell wrong — e.g. BUY in overbought, trend/signal conflict,
     conflicting indicators.  Uses the FAST model (1 call, ~2-3 s).
+    Priority-based cooldown bypass: high-risk or low-confidence signals
+    always get LLM validation regardless of cooldown.
+
+  Risk Gate: Kill-switch + dynamic penalty
+    - data_confidence < 20 → hard reject (kill switch)
+    - multiple critical violations → hard reject
+    - otherwise: dynamic penalty = (100 - data_confidence) * 0.1
+
+  Drift Detection:
+    Tracks % of signals flagged over a rolling window.  If >30% of the
+    last 50 signals are flagged, emits a DRIFT_ALERT warning.
 
 Design:
   1. Layer A runs first (instant, free).
   2. If Layer A flags ERROR → signal is killed immediately, no LLM call.
   3. If Layer A passes → Layer B runs (LLM anomaly check).
   4. Layer B returns a data_quality score and optional warnings.
-  5. Caller decides: ERROR → reject; WARNING with low quality → penalise.
+  5. Risk gate: kill-switch or dynamic penalty applied.
+  6. Drift detection: rolling flag rate tracked.
 
 Integration point: called inside aggregator.process() BEFORE scoring.
 The validator NEVER blocks on its own — it returns a ValidationResult
@@ -32,6 +46,7 @@ Feature flag: SIGNAL_VALIDATOR (off | shadow | live)
 
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -51,6 +66,9 @@ class ValidationResult:
     # Layer B details (LLM)
     llm_warnings: List[str] = field(default_factory=list)
     llm_confidence_in_data: int = 100  # 0-100: how much the LLM trusts the input
+    # Risk gate
+    kill_switch: bool = False      # True → hard reject regardless of status
+    dynamic_penalty: int = 0       # Adaptive confidence penalty (0-10)
     # Timing
     layer_a_ms: float = 0.0
     layer_b_ms: float = 0.0
@@ -66,6 +84,25 @@ HARD_RULES: Dict[str, dict] = {
     "confidence": {"min": 0, "max": 100, "label": "Confidence"},
 }
 
+# Strategy classification — used for cross-field consistency checks.
+# Trend-following strategies require established trend (ADX > ~20).
+TREND_STRATEGIES = frozenset({
+    "Momentum", "Ichimoku", "ElliottWave", "InstitutionalBreakout",
+    "SmartMoneyConcepts", "PriceAction",
+})
+# Reversal strategies are EXPECTED to trade against indicators.
+REVERSAL_STRATEGIES = frozenset({
+    "ExtremeReversal", "MeanReversion",
+})
+
+# Kill-switch thresholds
+KILL_SWITCH_DATA_CONFIDENCE = 20     # Hard reject if LLM confidence < this
+KILL_SWITCH_CRITICAL_ISSUES = 3      # Hard reject if ≥ this many critical issues
+
+# Drift detection
+DRIFT_WINDOW_SIZE = 50               # Rolling window for flag rate
+DRIFT_ALERT_THRESHOLD = 0.30         # Alert if >30% flagged
+
 
 class SignalValidator:
     """
@@ -73,7 +110,9 @@ class SignalValidator:
 
     Layer A: instant programmatic checks (always runs).
     Layer B: LLM anomaly detection (runs only when AI mode is active
-             and Layer A passes).
+             and Layer A passes).  Priority signals bypass cooldown.
+    Risk Gate: kill-switch + dynamic penalty.
+    Drift Detection: rolling flag rate tracking.
     """
 
     # LLM validation throttle — avoid burning calls on every signal.
@@ -87,7 +126,11 @@ class SignalValidator:
             "hard_errors": 0,
             "llm_warnings": 0,
             "passed_clean": 0,
+            "kill_switches": 0,
+            "drift_alerts": 0,
         }
+        # Drift detection: rolling window of (flagged: bool) for last N signals
+        self._flag_history: deque = deque(maxlen=DRIFT_WINDOW_SIZE)
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -121,15 +164,21 @@ class SignalValidator:
             result.data_quality = "LOW"
             result.issues = list(result.hard_errors)
             self._stats["hard_errors"] += 1
+            self._flag_history.append(True)
+            # Kill-switch: multiple critical violations → hard reject
+            if len(result.hard_errors) >= KILL_SWITCH_CRITICAL_ISSUES:
+                result.kill_switch = True
+                self._stats["kill_switches"] += 1
             logger.warning(
                 "🛑 VALIDATOR Layer A ERROR: %s | data=%s",
                 "; ".join(result.hard_errors),
                 _summarise_data(signal_data),
             )
+            self._check_drift()
             return result
 
         # ── Layer B: LLM anomaly detection ────────────────────────
-        if run_llm and self._should_run_llm():
+        if run_llm and self._should_run_llm(signal_data):
             t1 = time.time()
             await self._run_llm_check(signal_data, result)
             result.layer_b_ms = (time.time() - t1) * 1000
@@ -145,20 +194,66 @@ class SignalValidator:
                 result.data_quality = "LOW"
             elif result.llm_confidence_in_data < 70:
                 result.data_quality = "MEDIUM"
+
+            # ── Risk gate: kill-switch + dynamic penalty ──────────
+            if result.llm_confidence_in_data < KILL_SWITCH_DATA_CONFIDENCE:
+                result.kill_switch = True
+                result.status = "ERROR"
+                result.data_quality = "LOW"
+                self._stats["kill_switches"] += 1
+                logger.warning(
+                    "🛑 VALIDATOR kill-switch: data_confidence=%d < %d | %s",
+                    result.llm_confidence_in_data, KILL_SWITCH_DATA_CONFIDENCE,
+                    _summarise_data(signal_data),
+                )
+            else:
+                # Dynamic penalty: scales with how distrustful the LLM is
+                result.dynamic_penalty = _calc_dynamic_penalty(
+                    result.llm_confidence_in_data
+                )
+
+            self._flag_history.append(True)
         else:
             self._stats["passed_clean"] += 1
+            self._flag_history.append(False)
+
+        # ── Drift detection ───────────────────────────────────────
+        self._check_drift()
 
         return result
 
     def get_stats(self) -> dict:
         """Return validation statistics for monitoring."""
-        return dict(self._stats)
+        stats = dict(self._stats)
+        stats["drift_flag_rate"] = self.get_drift_rate()
+        return stats
+
+    def get_drift_rate(self) -> float:
+        """Return the rolling flag rate (0.0 - 1.0)."""
+        if not self._flag_history:
+            return 0.0
+        return sum(self._flag_history) / len(self._flag_history)
+
+    def _check_drift(self) -> None:
+        """Check if the flag rate exceeds drift threshold."""
+        if len(self._flag_history) >= DRIFT_WINDOW_SIZE:
+            rate = self.get_drift_rate()
+            if rate > DRIFT_ALERT_THRESHOLD:
+                self._stats["drift_alerts"] += 1
+                logger.error(
+                    "🚨 VALIDATOR DRIFT ALERT: %.0f%% of last %d signals "
+                    "flagged (threshold %.0f%%). Possible logic bug or "
+                    "market regime shift.",
+                    rate * 100, DRIFT_WINDOW_SIZE,
+                    DRIFT_ALERT_THRESHOLD * 100,
+                )
 
     # ── Layer A: Programmatic hard checks ─────────────────────────
 
     def _run_hard_checks(self, data: dict, result: ValidationResult) -> None:
         """
-        Check for mathematically impossible values.
+        Check for mathematically impossible values AND cross-field
+        consistency violations.
         These are bugs in the calculation engine — not market conditions.
         """
         # 1. Range checks for known indicators
@@ -263,10 +358,98 @@ class SignalValidator:
             except (TypeError, ValueError):
                 pass
 
+        # ── Cross-field consistency checks ────────────────────────
+        self._run_cross_field_checks(data, result)
+
+    # ── Cross-field consistency checks (Layer A extension) ──────────
+
+    @staticmethod
+    def _run_cross_field_checks(data: dict, result: ValidationResult) -> None:
+        """
+        Validate relationships between fields — catches contradictions
+        that individual range checks miss.
+
+        These are soft errors (added to hard_errors) because they indicate
+        real logic bugs in the strategy wiring, not market conditions.
+        """
+        strategy = data.get("strategy", "")
+        regime = (data.get("regime") or "").upper()
+        direction = (data.get("direction") or "").upper()
+
+        # Skip cross-field checks for reversal strategies — they
+        # intentionally trade against indicators.
+        if strategy in REVERSAL_STRATEGIES:
+            return
+
+        # 7a. Trend-following strategy with no trend (ADX < 20)
+        adx = data.get("adx")
+        if adx is not None and strategy in TREND_STRATEGIES:
+            try:
+                adx_val = float(adx)
+                if adx_val < 20:
+                    result.hard_errors.append(
+                        f"Trend strategy '{strategy}' fired with ADX={adx_val:.1f} "
+                        f"(< 20 = no trend). Strategy may be misconfigured."
+                    )
+            except (TypeError, ValueError):
+                pass
+
+        # 7b. Strong trend regime contradicts signal direction
+        # (hard check only for extreme cases — LLM handles subtler ones)
+        _bullish_regimes = ("BULL_TREND", "STRONG_BULL", "BULL_BREAKOUT")
+        _bearish_regimes = ("BEAR_TREND", "STRONG_BEAR", "BEAR_BREAKOUT")
+        if regime in _bullish_regimes and direction == "SHORT":
+            result.hard_errors.append(
+                f"SHORT signal in {regime} regime from '{strategy}'. "
+                f"Non-reversal strategy should not short in a strong uptrend."
+            )
+        elif regime in _bearish_regimes and direction == "LONG":
+            result.hard_errors.append(
+                f"LONG signal in {regime} regime from '{strategy}'. "
+                f"Non-reversal strategy should not long in a strong downtrend."
+            )
+
+        # 7c. Breakout strategy without volume confirmation
+        volume_ratio = data.get("volume_ratio")
+        if strategy == "InstitutionalBreakout" and volume_ratio is not None:
+            try:
+                vr = float(volume_ratio)
+                if vr < 0.8:
+                    result.hard_errors.append(
+                        f"InstitutionalBreakout signal with volume_ratio={vr:.2f} "
+                        f"(< 0.8). Breakout without volume is suspect."
+                    )
+            except (TypeError, ValueError):
+                pass
+
     # ── Layer B: LLM anomaly detection ────────────────────────────
 
-    def _should_run_llm(self) -> bool:
-        """Throttle LLM calls to avoid burning the daily budget."""
+    def _should_run_llm(self, signal_data: Optional[dict] = None) -> bool:
+        """
+        Throttle LLM calls, but bypass cooldown for priority signals.
+
+        Priority signals (always get LLM validation):
+          - Low raw confidence (< 60) — uncertain signals need extra scrutiny
+          - High R:R (> 5.0) — suspicious risk/reward ratio
+        """
+        # Priority bypass: always validate high-risk / low-confidence signals
+        if signal_data:
+            conf = signal_data.get("confidence")
+            rr = signal_data.get("rr_ratio")
+            if conf is not None:
+                try:
+                    if float(conf) < 60:
+                        return True
+                except (TypeError, ValueError):
+                    pass
+            if rr is not None:
+                try:
+                    if float(rr) > 5.0:
+                        return True
+                except (TypeError, ValueError):
+                    pass
+
+        # Standard cooldown check
         return time.time() - self._last_llm_validation >= self._LLM_COOLDOWN_SECS
 
     async def _run_llm_check(self, data: dict, result: ValidationResult) -> None:
@@ -372,7 +555,23 @@ Return ONLY valid JSON:
 - issues: list of specific problems found (empty if OK)"""
 
 
-# ── Helper ────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────
+
+def _calc_dynamic_penalty(data_confidence: int) -> int:
+    """
+    Dynamic confidence penalty that scales with how distrustful the LLM is.
+
+    Formula: penalty = (100 - data_confidence) * 0.1, clamped to [0, 10]
+
+    Examples:
+      data_confidence=30 → penalty=7
+      data_confidence=10 → penalty=9
+      data_confidence=60 → penalty=4
+      data_confidence=85 → penalty=1 (rounded)
+    """
+    raw = (100 - max(0, min(100, data_confidence))) * 0.1
+    return max(0, min(10, round(raw)))
+
 
 def _summarise_data(data: dict) -> str:
     """Short summary of signal data for log messages."""
