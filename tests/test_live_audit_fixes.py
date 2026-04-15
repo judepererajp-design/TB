@@ -69,8 +69,9 @@ def test_smc_allows_counter_trend_choch_reversal():
 
 
 def test_smc_and_elliott_use_effective_rr_helper():
-    smc_source = Path("/home/runner/work/TB/TB/strategies/smc.py").read_text()
-    elliott_source = Path("/home/runner/work/TB/TB/strategies/elliott_wave.py").read_text()
+    repo_root = Path(__file__).resolve().parents[1]
+    smc_source = repo_root.joinpath("strategies", "smc.py").read_text()
+    elliott_source = repo_root.joinpath("strategies", "elliott_wave.py").read_text()
 
     assert "calculate_effective_rr(" in smc_source
     assert "calculate_effective_rr(" in elliott_source
