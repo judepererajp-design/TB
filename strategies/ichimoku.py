@@ -1,0 +1,262 @@
+"""
+TitanBot Pro — Ichimoku Cloud Strategy
+========================================
+Detects high-probability Ichimoku setups requiring all three conditions:
+  1. TK Cross — Tenkan (9) crosses Kijun (26)
+  2. Price above/below the Kumo (cloud)
+  3. Chikou clear — lagging span confirms direction
+
+Entry around the TK cross level, SL at Kijun ± ATR buffer.
+"""
+
+import logging
+from typing import Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+
+from config.loader import cfg
+from strategies.base import BaseStrategy, SignalResult, SignalDirection, cfg_min_rr
+from utils.formatting import fmt_price
+from utils.risk_params import rp, compute_vol_percentile
+
+logger = logging.getLogger(__name__)
+
+
+def _period_midline(highs: np.ndarray, lows: np.ndarray, period: int) -> np.ndarray:
+    """(highest high + lowest low) / 2 over rolling period."""
+    result = np.zeros(len(highs))
+    for i in range(len(highs)):
+        if i < period - 1:
+            result[i] = (highs[: i + 1].max() + lows[: i + 1].min()) / 2
+        else:
+            result[i] = (highs[i - period + 1: i + 1].max() + lows[i - period + 1: i + 1].min()) / 2
+    return result
+
+
+class Ichimoku(BaseStrategy):
+
+    name = "Ichimoku"
+    description = "Full Ichimoku cloud strategy: TK cross + Kumo + Chikou"
+
+    VALID_REGIMES = {"BULL_TREND", "BEAR_TREND", "VOLATILE"}
+
+    # Direction-aware regime confidence: Ichimoku is a trend-following indicator.
+    # Counter-trend signals (LONG in BEAR, SHORT in BULL) get penalized.
+    _REGIME_CONF_WITH_TREND = {
+        "BULL_TREND":  +6,
+        "BEAR_TREND":  +6,
+        "VOLATILE":    0,
+    }
+    _REGIME_CONF_COUNTER_TREND = {
+        "BULL_TREND":  -10,   # SHORT in bull
+        "BEAR_TREND":  -10,   # LONG in bear
+        "VOLATILE":    0,
+    }
+
+    def __init__(self):
+        super().__init__()
+        self._cfg = cfg.strategies.ichimoku
+
+    async def analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:
+        try:
+            return await self._analyze(symbol, ohlcv_dict)
+        except Exception as e:
+            logger.debug(f"Ichimoku.analyze {symbol}: {e}")
+            return None
+
+    async def _analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:
+        # ── Regime gate ───────────────────────────────────────────────────
+        try:
+            from analyzers.regime import regime_analyzer
+            regime = getattr(regime_analyzer.regime, 'value', 'UNKNOWN')
+        except Exception:
+            regime = "UNKNOWN"
+
+        if regime not in self.VALID_REGIMES:
+            return None
+
+        tf = getattr(self._cfg, "timeframe", "4h")
+        if tf not in ohlcv_dict or len(ohlcv_dict[tf]) < 100:
+            return None
+
+        ohlcv = ohlcv_dict[tf]
+        df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
+        df = df.astype({"open": float, "high": float, "low": float, "close": float, "volume": float})
+
+        highs   = df["high"].values
+        lows    = df["low"].values
+        closes  = df["close"].values
+
+        atr = self.calculate_atr(highs, lows, closes, period=14)
+        if atr == 0:
+            return None
+
+        tenkan_period  = getattr(self._cfg, "tenkan", 9)
+        kijun_period   = getattr(self._cfg, "kijun", 26)
+        senkou_b_period = getattr(self._cfg, "senkou_b", 52)
+        displacement   = getattr(self._cfg, "displacement", 26)
+        confidence_base = getattr(self._cfg, "confidence_base", 73)
+
+        # ── Calculate Ichimoku components ──────────────────────────────────
+        tenkan  = _period_midline(highs, lows, tenkan_period)
+        kijun   = _period_midline(highs, lows, kijun_period)
+
+        # Senkou Span A = (Tenkan + Kijun) / 2, shifted forward 26
+        senkou_a_raw = (tenkan + kijun) / 2
+        # We access the value from `displacement` bars ago as the current cloud value
+        senkou_a_current = senkou_a_raw[-displacement] if len(senkou_a_raw) > displacement else senkou_a_raw[0]
+
+        # Senkou Span B = (52-period H+L) / 2, shifted forward 26
+        senkou_b_raw = _period_midline(highs, lows, senkou_b_period)
+        senkou_b_current = senkou_b_raw[-displacement] if len(senkou_b_raw) > displacement else senkou_b_raw[0]
+
+        kumo_top    = max(senkou_a_current, senkou_b_current)
+        kumo_bottom = min(senkou_a_current, senkou_b_current)
+
+        # Chikou span = close shifted back `displacement` bars
+        chikou_current_price = closes[-1]
+        chikou_compare_price = closes[-displacement - 1] if len(closes) > displacement + 1 else closes[0]
+
+        current_price  = closes[-1]
+        current_tenkan = tenkan[-1]
+        current_kijun  = kijun[-1]
+        prev_tenkan    = tenkan[-2]
+        prev_kijun     = kijun[-2]
+
+        # ── Condition 1: TK Cross ─────────────────────────────────────────
+        bullish_tk_cross = (prev_tenkan <= prev_kijun) and (current_tenkan > current_kijun)
+        bearish_tk_cross = (prev_tenkan >= prev_kijun) and (current_tenkan < current_kijun)
+
+        require_tk_cross = getattr(self._cfg, "require_tk_cross", True)
+        if require_tk_cross and not bullish_tk_cross and not bearish_tk_cross:
+            return None
+
+        if bullish_tk_cross:
+            direction = "LONG"
+        elif bearish_tk_cross:
+            direction = "SHORT"
+        else:
+            direction = "LONG" if current_tenkan > current_kijun else "SHORT"
+
+        # ── Condition 2: Price vs Kumo ────────────────────────────────────
+        require_cloud = getattr(self._cfg, "require_above_cloud", True)
+        if require_cloud:
+            if direction == "LONG" and current_price <= kumo_top:
+                return None
+            if direction == "SHORT" and current_price >= kumo_bottom:
+                return None
+
+        # ── Condition 3: Chikou clear ──────────────────────────────────────
+        require_chikou = getattr(self._cfg, "require_chikou_clear", True)
+        chikou_long_clear  = chikou_current_price > chikou_compare_price
+        chikou_short_clear = chikou_current_price < chikou_compare_price
+
+        if require_chikou:
+            if direction == "LONG" and not chikou_long_clear:
+                return None
+            if direction == "SHORT" and not chikou_short_clear:
+                return None
+
+        # ── Confidence ────────────────────────────────────────────────────
+        # Direction-aware regime bonus
+        _is_with_trend = (
+            (direction == "LONG" and regime == "BULL_TREND") or
+            (direction == "SHORT" and regime == "BEAR_TREND")
+        )
+        if _is_with_trend or regime not in ("BULL_TREND", "BEAR_TREND"):
+            _regime_bonus = self._REGIME_CONF_WITH_TREND.get(regime, 0)
+        else:
+            _regime_bonus = self._REGIME_CONF_COUNTER_TREND.get(regime, 0)
+
+        confidence = float(confidence_base) + _regime_bonus
+
+        # TK cross in same direction as cloud
+        if direction == "LONG" and current_price > kumo_top:
+            confidence += 8
+        elif direction == "SHORT" and current_price < kumo_bottom:
+            confidence += 8
+
+        # Price clearance from cloud
+        cloud_distance = abs(current_price - (kumo_top if direction == "LONG" else kumo_bottom))
+        if cloud_distance > atr * 2:
+            confidence += 5
+
+        # Chikou strength
+        chikou_margin = abs(chikou_current_price - chikou_compare_price)
+        if chikou_margin > atr:
+            confidence += 5
+
+        # ── Entry around TK cross level ────────────────────────────────────
+        tk_cross_level = (current_tenkan + current_kijun) / 2
+
+        vp = compute_vol_percentile(highs, lows, closes)
+        if direction == "LONG":
+            entry_low   = tk_cross_level - atr * 0.3
+            entry_high  = tk_cross_level + atr * 0.3
+            # SL: Kijun level - ATR buffer
+            stop_loss   = current_kijun - atr * rp.sl_atr_mult
+            tp1         = kumo_top + atr * 0.5 * rp.atr_scale(tf) if kumo_top > entry_high else entry_high + atr * rp.volatility_scaled_tp1(tf, vp)
+            # Wire timeframe+volatility-scaled TPs
+            tp2         = entry_high + atr * rp.volatility_scaled_tp2(tf, vp)
+            tp3         = entry_high + atr * rp.volatility_scaled_tp3(tf, vp)
+        else:
+            entry_high  = tk_cross_level + atr * 0.3
+            entry_low   = tk_cross_level - atr * 0.3
+            stop_loss   = current_kijun + atr * rp.sl_atr_mult
+            tp1         = kumo_bottom - atr * 0.5 * rp.atr_scale(tf) if kumo_bottom < entry_low else entry_low - atr * rp.volatility_scaled_tp1(tf, vp)
+            tp2         = entry_low - atr * rp.volatility_scaled_tp2(tf, vp)
+            tp3         = entry_low - atr * rp.volatility_scaled_tp3(tf, vp)
+
+        risk = (entry_low - stop_loss) if direction == "LONG" else (stop_loss - entry_high)
+        if risk <= 0:
+            return None
+        rr_ratio = abs(tp2 - tk_cross_level) / risk
+
+        kumo_size = kumo_top - kumo_bottom
+
+        confluence: List[str] = [
+            f"✅ {'Bullish' if direction == 'LONG' else 'Bearish'} TK cross",
+            f"   Tenkan: {fmt_price(current_tenkan)} | Kijun: {fmt_price(current_kijun)}",
+            f"✅ Price {'above' if direction == 'LONG' else 'below'} Kumo: {fmt_price(kumo_bottom)}-{fmt_price(kumo_top)}",
+            f"   Cloud thickness: {fmt_price(kumo_size)} ({kumo_size / atr:.1f}x ATR)",
+        ]
+        if (direction == "LONG" and chikou_long_clear) or (direction == "SHORT" and chikou_short_clear):
+            confluence.append(f"✅ Chikou clear — lagging span confirms direction")
+        confluence.append(f"📊 Regime: {regime} | TF: {tf}")
+        confluence.append(f"🎯 R:R {rr_ratio:.2f} | ATR: {fmt_price(atr)}")
+
+        confidence = min(94, max(40, confidence))
+
+        candidate = SignalResult(
+            symbol=symbol,
+            direction=SignalDirection.LONG if direction == "LONG" else SignalDirection.SHORT,
+            strategy=self.name,
+            confidence=confidence,
+            entry_low=entry_low,
+            entry_high=entry_high,
+            stop_loss=stop_loss,
+            tp1=tp1, tp2=tp2, tp3=tp3,
+            rr_ratio=rr_ratio,
+            atr=atr,
+            setup_class="swing",
+            timeframe=tf,
+            analysis_timeframes=[tf],
+            confluence=confluence,
+            raw_data={
+                "tenkan": float(current_tenkan),
+                "kijun": float(current_kijun),
+                "kumo_top": float(kumo_top),
+                "kumo_bottom": float(kumo_bottom),
+                "senkou_a": float(senkou_a_current),
+                "senkou_b": float(senkou_b_current),
+                "chikou_compare_price": float(chikou_compare_price),
+                "atr": atr,
+                "regime": regime,
+            },
+            regime=regime,
+        )
+        if not self.validate_signal(candidate):
+            return None
+        return candidate
+IchimokuStrategy = Ichimoku
