@@ -161,7 +161,7 @@ class DerivativesAnalyzer:
             return 0.0
         return (oi_level - baseline_oi) / baseline_oi * 100.0
 
-
+    def _classify_funding_trend(self, rate: float) -> str:
         """Classify funding rate"""
         threshold = self._funding_threshold
         if rate > threshold * 2:

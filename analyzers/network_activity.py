@@ -132,6 +132,15 @@ class NetworkActivityAnalyzer:
         if self._session:
             await self._session.close()
 
+    async def _poll_loop(self):
+        while self._running:
+            try:
+                await self._update_all()
+                self._snapshot.last_update = time.time()
+            except Exception as e:
+                logger.warning(f"Network activity poll error: {e}")
+            await asyncio.sleep(_ACTIVITY_REFRESH)
+
     async def _update_all(self):
         await asyncio.gather(
             self._fetch_active_addresses(),
