@@ -295,6 +295,217 @@ class BaseStrategy(ABC):
             return 0.0
         return round(reward / risk, 2)
 
+    # ── Compression / Squeeze Detection ──────────────────────────────
+
+    @staticmethod
+    def detect_bb_squeeze(closes: np.ndarray, period: int = 20,
+                          lookback: int = 100) -> Dict[str, Any]:
+        """
+        Detect Bollinger Band squeeze (compression).
+
+        Returns dict with:
+          - is_squeeze: bool — current BB width is below 20th percentile
+          - bandwidth_pctile: float 0-1 — where current width sits historically
+          - compression_bars: int — consecutive bars below 30th pctile
+          - bandwidth: float — current BB width as percentage of mid
+        """
+        closes = np.asarray(closes, dtype=float)
+        result = {
+            "is_squeeze": False,
+            "bandwidth_pctile": 0.5,
+            "compression_bars": 0,
+            "bandwidth": 0.0,
+        }
+        if len(closes) < max(period, 30):
+            return result
+
+        # Calculate BB width series for the lookback
+        n = min(lookback, len(closes) - period)
+        widths = []
+        for i in range(n):
+            idx = len(closes) - n + i
+            window = closes[idx - period + 1:idx + 1]
+            if len(window) < period:
+                continue
+            mid = float(np.mean(window))
+            std = float(np.std(window, ddof=1))
+            bw = (2 * std * 2.0) / mid if mid > 0 else 0  # 2-sigma width / mid
+            widths.append(bw)
+
+        if len(widths) < 10:
+            return result
+
+        current_bw = widths[-1]
+        sorted_bw = sorted(widths)
+        pctile = float(np.searchsorted(sorted_bw, current_bw)) / len(sorted_bw)
+
+        # Count consecutive compression bars (below 30th percentile)
+        threshold_30 = sorted_bw[int(len(sorted_bw) * 0.30)]
+        comp_bars = 0
+        for bw in reversed(widths):
+            if bw <= threshold_30:
+                comp_bars += 1
+            else:
+                break
+
+        result["is_squeeze"] = pctile < 0.20
+        result["bandwidth_pctile"] = round(pctile, 3)
+        result["compression_bars"] = comp_bars
+        result["bandwidth"] = round(current_bw, 6)
+        return result
+
+    # ── Parabolic / Acceleration Detection ───────────────────────────
+
+    @staticmethod
+    def detect_parabolic(closes: np.ndarray, period: int = 10) -> Dict[str, Any]:
+        """
+        Detect parabolic price acceleration using ROC-of-ROC (second derivative).
+
+        Returns dict with:
+          - is_parabolic: bool — acceleration exceeds threshold
+          - acceleration: float — rate of change of ROC (positive = accelerating up)
+          - roc: float — current rate of change
+          - direction: str — "UP", "DOWN", or "FLAT"
+        """
+        closes = np.asarray(closes, dtype=float)
+        result = {
+            "is_parabolic": False,
+            "acceleration": 0.0,
+            "roc": 0.0,
+            "direction": "FLAT",
+        }
+        if len(closes) < period * 2 + 2:
+            return result
+
+        # ROC series: % change over `period` bars
+        roc_series = []
+        for i in range(period, len(closes)):
+            prev = closes[i - period]
+            if prev == 0:
+                roc_series.append(0.0)
+            else:
+                roc_series.append((closes[i] - prev) / prev)
+
+        if len(roc_series) < period + 1:
+            return result
+
+        current_roc = roc_series[-1]
+
+        # ROC of ROC (acceleration)
+        roc_of_roc = []
+        for i in range(1, len(roc_series)):
+            roc_of_roc.append(roc_series[i] - roc_series[i - 1])
+
+        if not roc_of_roc:
+            return result
+
+        acceleration = roc_of_roc[-1]
+
+        # Determine direction and parabolic threshold
+        # Parabolic = acceleration consistently in one direction and exceeding 0.5% per bar
+        _recent_accel = roc_of_roc[-3:] if len(roc_of_roc) >= 3 else roc_of_roc
+        _avg_accel = float(np.mean(_recent_accel))
+        _all_same_sign = all(a > 0 for a in _recent_accel) or all(a < 0 for a in _recent_accel)
+
+        is_parabolic = _all_same_sign and abs(_avg_accel) > 0.005  # 0.5% acceleration per bar
+
+        if current_roc > 0.01:
+            direction = "UP"
+        elif current_roc < -0.01:
+            direction = "DOWN"
+        else:
+            direction = "FLAT"
+
+        result["is_parabolic"] = is_parabolic
+        result["acceleration"] = round(acceleration, 6)
+        result["roc"] = round(current_roc, 6)
+        result["direction"] = direction
+        return result
+
+    # ── Exhaustion Detection ─────────────────────────────────────────
+
+    @staticmethod
+    def detect_exhaustion(
+        opens: np.ndarray,
+        highs: np.ndarray,
+        lows: np.ndarray,
+        closes: np.ndarray,
+        volumes: np.ndarray,
+        histogram: Optional[np.ndarray] = None,
+    ) -> Dict[str, Any]:
+        """
+        Detect momentum exhaustion signals:
+          - Histogram deceleration (MACD histogram shrinking)
+          - Candle range contraction (consecutive smaller candles)
+          - Volume climax (spike volume at extreme = capitulation)
+
+        Returns dict with:
+          - is_exhausted: bool — 2+ exhaustion signals present
+          - signals: list of detected exhaustion signals
+          - score: float 0-1 — exhaustion intensity
+        """
+        opens   = np.asarray(opens,   dtype=float)
+        highs   = np.asarray(highs,   dtype=float)
+        lows    = np.asarray(lows,    dtype=float)
+        closes  = np.asarray(closes,  dtype=float)
+        volumes = np.asarray(volumes, dtype=float)
+
+        signals = []
+        score = 0.0
+
+        if len(closes) < 10:
+            return {"is_exhausted": False, "signals": [], "score": 0.0}
+
+        # 1. Histogram deceleration
+        if histogram is not None and len(histogram) >= 4:
+            h = np.asarray(histogram, dtype=float)
+            # Check if absolute histogram is shrinking for 3+ bars
+            if (abs(h[-1]) < abs(h[-2]) < abs(h[-3])):
+                signals.append("histogram_deceleration")
+                score += 0.3
+
+        # 2. Candle range contraction
+        ranges = highs - lows
+        if len(ranges) >= 5:
+            # 3 consecutive shrinking candle ranges
+            if ranges[-1] < ranges[-2] < ranges[-3]:
+                signals.append("range_contraction")
+                score += 0.25
+            # Tiny candles relative to recent average
+            avg_range = float(np.mean(ranges[-20:]))
+            if avg_range > 0 and ranges[-1] < avg_range * 0.4:
+                signals.append("doji_exhaustion")
+                score += 0.15
+
+        # 3. Volume climax (spike volume at extreme)
+        if len(volumes) >= 20:
+            avg_vol = float(np.mean(volumes[-20:]))
+            if avg_vol > 0:
+                vol_ratio = volumes[-1] / avg_vol
+                if vol_ratio > 3.0:
+                    signals.append("volume_climax")
+                    score += 0.35
+                elif vol_ratio > 2.0:
+                    signals.append("volume_spike")
+                    score += 0.15
+
+        # 4. Waning momentum: smaller bodies with bigger wicks
+        if len(closes) >= 3:
+            bodies = [abs(closes[-i] - opens[-i]) for i in range(1, 4)]
+            total_ranges = [highs[-i] - lows[-i] for i in range(1, 4)]
+            # Body shrinking while range stays same = indecision
+            if (total_ranges[0] > 0 and total_ranges[1] > 0
+                    and bodies[0] < bodies[1] * 0.6
+                    and total_ranges[0] >= total_ranges[1] * 0.7):
+                signals.append("waning_momentum")
+                score += 0.2
+
+        return {
+            "is_exhausted": len(signals) >= 2,
+            "signals": signals,
+            "score": min(1.0, round(score, 3)),
+        }
+
     # ── Signal validation ──────────────────────────────────────────────
     def validate_signal(self, sig: SignalResult) -> bool:
         """
