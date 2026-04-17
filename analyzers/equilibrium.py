@@ -241,6 +241,18 @@ class EquilibriumAnalyzer:
         reason = ""
         confidence_mult = 1.0
 
+        # AUDIT FIX: VWAP-anchored EQ can sit ABOVE price in a downtrend,
+        # making the current price look "deep in discount" and awarding a
+        # LONG boost for catching a falling knife.  Gate the confidence
+        # boost on a non-negative 1h slope for LONG-in-discount, and
+        # symmetric for SHORT-in-premium.  The should_block rules are
+        # unchanged — only the boost magnitude is gated.
+        try:
+            from analyzers.regime import regime_analyzer as _ra
+            _slope_1h = float(getattr(_ra, "ema_slope_1h", 0.0) or 0.0)
+        except Exception:
+            _slope_1h = 0.0
+
         if zone == 'premium' and direction == "LONG":
             should_block = True
             reason = f"❌ LONG rejected in premium zone ({position:+.2f}) — buying at premium"
@@ -248,10 +260,18 @@ class EquilibriumAnalyzer:
             should_block = True
             reason = f"❌ SHORT rejected in discount zone ({position:+.2f}) — selling at discount"
         elif zone == 'premium' and direction == "SHORT":
-            confidence_mult = 1.0 + zone_depth * 0.10  # Up to +10%
+            if _slope_1h <= 0:
+                confidence_mult = 1.0 + zone_depth * 0.10  # Up to +10%
+            else:
+                # Premium + uptrend: don't add boost to a counter-trend short
+                confidence_mult = 1.0
             reason = f"✅ SHORT in premium zone ({position:+.2f}) — selling at premium"
         elif zone == 'discount' and direction == "LONG":
-            confidence_mult = 1.0 + zone_depth * 0.10
+            if _slope_1h >= 0:
+                confidence_mult = 1.0 + zone_depth * 0.10
+            else:
+                # Discount + downtrend: don't boost a falling-knife LONG
+                confidence_mult = 1.0
             reason = f"✅ LONG in discount zone ({position:+.2f}) — buying at discount"
 
         return EQAssessment(
@@ -266,18 +286,31 @@ class EquilibriumAnalyzer:
             reason=reason,
         )
 
-    def get_zone_label(self, price: float) -> str:
-        """Quick label for display"""
-        from analyzers.regime import regime_analyzer
-        eq = regime_analyzer.range_eq
-        if eq <= 0:
-            return ""
-        if price > eq * 1.02:
-            return "PREMIUM"
-        elif price < eq * 0.98:
-            return "DISCOUNT"
-        else:
+    def get_zone_label(
+        self,
+        price: float,
+        symbol_range_high: float = 0.0,
+        symbol_range_low: float = 0.0,
+    ) -> str:
+        """
+        Quick label for display.
+
+        AUDIT FIX (BUG-6 completeness): prefer the caller-supplied symbol
+        range (same inputs as ``assess()``).  Only fall back to the
+        BTC-derived ``regime_analyzer.range_eq`` when the caller can't
+        provide a symbol range — and return "" in that case rather than
+        a misleading "PREMIUM"/"DISCOUNT" for an altcoin vs BTC's USD range.
+        """
+        if symbol_range_high > symbol_range_low > 0:
+            eq = (symbol_range_high + symbol_range_low) / 2
+            if eq <= 0:
+                return ""
+            if price > eq * 1.02:
+                return "PREMIUM"
+            elif price < eq * 0.98:
+                return "DISCOUNT"
             return "EQ"
+        return ""
 
 
 # ── Singleton ──────────────────────────────────────────────

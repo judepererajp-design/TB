@@ -263,16 +263,21 @@ class AIAnalyst:
     def get_audit_status(self) -> dict:
         """Returns current audit state for Telegram /audit status display."""
         now = time.time()
-        fast_age = now - self._last_structural_audit
-        deep_age = now - self._last_deep_audit
-        fast_next = max(0, self._structural_audit_interval - fast_age)
-        deep_next = max(0, self._deep_audit_interval - deep_age)
+        # AUDIT FIX: when the audit hasn't run yet (_last_* == 0.0), report
+        # age as None instead of ~epoch-seconds so dashboards don't render
+        # "ran 55 years ago".  Next-in durations are unchanged because the
+        # max(0, ...) guard already floors them appropriately once the first
+        # run lands.
+        fast_age_raw = now - self._last_structural_audit if self._last_structural_audit else None
+        deep_age_raw = now - self._last_deep_audit if self._last_deep_audit else None
+        fast_next = max(0, self._structural_audit_interval - (fast_age_raw or 0))
+        deep_next = max(0, self._deep_audit_interval - (deep_age_raw or 0))
         return {
-            "fast_last_ran": int(fast_age),             # seconds ago (0 = never)
-            "fast_next_in": int(fast_next),             # seconds until next auto run
-            "deep_last_ran": int(deep_age),             # seconds ago
-            "deep_next_in": int(deep_next),             # seconds until next deep allowed
-            "session_stats": dict(self._session_stats), # current accumulation
+            "fast_last_ran": int(fast_age_raw) if fast_age_raw is not None else None,
+            "fast_next_in": int(fast_next),
+            "deep_last_ran": int(deep_age_raw) if deep_age_raw is not None else None,
+            "deep_next_in": int(deep_next),
+            "session_stats": dict(self._session_stats),
         }
 
     def get_decision_history(self) -> list:
@@ -441,28 +446,45 @@ class AIAnalyst:
             })
             return None
 
+    # Patterns that should only match on word boundaries so benign market
+    # text ("Binance executes buyback", "important upgrade", "SEC imports…")
+    # isn't scrubbed.  Everything else is still matched as a substring
+    # (e.g. the ``import os`` / ``eval(`` code-exec tells).
+    _WORD_BOUNDARY_INJECTION_PATTERNS = frozenset({
+        "execute", "override", "bypass", "sudo", "admin",
+        "forget", "disregard", "jailbreak",
+    })
+
     def _sanitise_input(self, text: str) -> str:
         """
-        Strip prompt injection patterns from market-data-derived text.
-        Patterns are lowercased for matching but original casing is preserved
-        for legitimate content — only the matching segments are removed.
+        Strip prompt-injection patterns from market-data-derived text.
+
+        AUDIT FIX: previously a single keyword anywhere on a line nuked the
+        entire line, silently dropping legitimate analyst content that
+        happened to share a substring with an injection keyword.  We now
+        redact only the matched span (plus minimal context), and use
+        word-boundary matching for common English roots so headlines like
+        "Binance executes buyback" no longer vanish.
         """
         if not text:
             return text
-        lower = text.lower()
+
+        import re as _re
+
+        def _sub_with_log(pattern: str, replacement: str, source: str) -> str:
+            if pattern in self._WORD_BOUNDARY_INJECTION_PATTERNS:
+                rx = _re.compile(rf"\b{_re.escape(pattern)}\b", _re.IGNORECASE)
+            else:
+                rx = _re.compile(_re.escape(pattern), _re.IGNORECASE)
+            new, count = rx.subn(replacement, source)
+            if count:
+                _ai_log.warning(
+                    f"Prompt injection pattern '{pattern}' redacted ({count}× occurrence)"
+                )
+            return new
+
         for pattern in self._INJECTION_PATTERNS:
-            if pattern in lower:
-                # Find and redact the offending line/segment
-                lines = text.split("\n")
-                cleaned = []
-                for line in lines:
-                    if pattern in line.lower():
-                        cleaned.append(f"[REDACTED — injection pattern: '{pattern}']")
-                        _ai_log.warning(f"Prompt injection pattern '{pattern}' detected and redacted")
-                    else:
-                        cleaned.append(line)
-                text = "\n".join(cleaned)
-                lower = text.lower()  # recompute after edit
+            text = _sub_with_log(pattern, "[redacted]", text)
         return text
 
     def _check_error_cb(self, call_label: str):

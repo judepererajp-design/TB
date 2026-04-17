@@ -86,7 +86,13 @@ class BTCDominanceTracker:
         self._running = False
         if self._task:
             self._task.cancel()
-        if self._session:
+            # AUDIT FIX: await the cancelled task so the session close below
+            # doesn't race with an in-flight request.
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if self._session and not self._session.closed:
             await self._session.close()
 
     def get_state(self) -> BTCDominanceState:
@@ -183,24 +189,34 @@ class BTCDominanceTracker:
                             (t, v) for t, v in self._history if t > cutoff
                         ]
 
-                        # Calculate 24h change
+                        # Calculate change vs the closest pre-target sample.
+                        # AUDIT FIX: until we actually have a sample ≥24h old
+                        # we don't have a real 24h change — surface that by
+                        # keeping data_available=False until the window fills.
                         target_time = now - 86400
+                        oldest_ts = self._history[0][0] if self._history else now
+                        have_24h = oldest_ts <= target_time
                         btcd_24h_ago = btcd  # Default
                         for t, v in self._history:
                             if t <= target_time:
                                 btcd_24h_ago = v
 
-                        change = btcd - btcd_24h_ago
+                        change = btcd - btcd_24h_ago if have_24h else 0.0
 
                         # Update state
                         self._state.current_btcd = btcd
                         self._state.btcd_24h_ago = btcd_24h_ago
                         self._state.btcd_change_24h = change
                         self._state.last_update = now
-                        self._state.data_available = True
+                        # Only advertise data as available once we have a true
+                        # 24h window; otherwise get_confidence_adj would apply
+                        # zero adjustment while claiming we have real data.
+                        self._state.data_available = have_24h
 
                         # Determine trend
-                        if change >= BTCD_SHARP_RISE_PCT:
+                        if not have_24h:
+                            self._state.trend = "NEUTRAL"
+                        elif change >= BTCD_SHARP_RISE_PCT:
                             self._state.trend = "RISING_SHARP"
                         elif change >= BTCD_MODERATE_RISE_PCT:
                             self._state.trend = "RISING"
@@ -213,7 +229,7 @@ class BTCDominanceTracker:
 
                         logger.debug(
                             f"BTC.D: {btcd:.2f}% (24h: {change:+.2f}%, "
-                            f"trend: {self._state.trend})"
+                            f"trend: {self._state.trend}, have_24h={have_24h})"
                         )
                 else:
                     logger.debug(f"CoinGecko BTC.D request failed: {resp.status}")
@@ -239,10 +255,43 @@ class BTCDominanceTracker:
                     if btcd > 0:
                         now = time.time()
                         self._history.append((now, btcd))
+                        # AUDIT FIX: also recompute change / trend / have_24h
+                        # so a prolonged primary outage doesn't leave stale
+                        # fields from yesterday's fetch driving live trading.
+                        cutoff = now - 172800
+                        self._history = [
+                            (t, v) for t, v in self._history if t > cutoff
+                        ]
+                        target_time = now - 86400
+                        oldest_ts = self._history[0][0] if self._history else now
+                        have_24h = oldest_ts <= target_time
+                        btcd_24h_ago = btcd
+                        for t, v in self._history:
+                            if t <= target_time:
+                                btcd_24h_ago = v
+                        change = btcd - btcd_24h_ago if have_24h else 0.0
+
                         self._state.current_btcd = btcd
+                        self._state.btcd_24h_ago = btcd_24h_ago
+                        self._state.btcd_change_24h = change
                         self._state.last_update = now
-                        self._state.data_available = True
-                        logger.debug(f"BTC.D (fallback): {btcd:.2f}%")
+                        self._state.data_available = have_24h
+                        if not have_24h:
+                            self._state.trend = "NEUTRAL"
+                        elif change >= BTCD_SHARP_RISE_PCT:
+                            self._state.trend = "RISING_SHARP"
+                        elif change >= BTCD_MODERATE_RISE_PCT:
+                            self._state.trend = "RISING"
+                        elif change <= BTCD_SHARP_FALL_PCT:
+                            self._state.trend = "FALLING_SHARP"
+                        elif change <= BTCD_MODERATE_FALL_PCT:
+                            self._state.trend = "FALLING"
+                        else:
+                            self._state.trend = "NEUTRAL"
+                        logger.debug(
+                            f"BTC.D (fallback): {btcd:.2f}% "
+                            f"(24h: {change:+.2f}%, have_24h={have_24h})"
+                        )
         except Exception as e:
             logger.debug(f"CoinPaprika BTC.D fallback error: {e}")
 

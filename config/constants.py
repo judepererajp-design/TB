@@ -1091,6 +1091,14 @@ class NewsIntelligence:
     REACTION_NEUTRAL_MULT: float = 0.85      # Slight reduction if market shrugs
     REACTION_MIN_MOVE_PCT: float = 0.5       # Price must move ≥ this % to count
 
+    # Event replacement ratio — when a new classification has a DIFFERENT
+    # event type from the currently active context, require that its confidence
+    # is at least this fraction of the active context's confidence before
+    # replacing.  Prevents a weak BTC_TECHNICAL headline from clobbering an
+    # active EXCHANGE_EVENT / MACRO_RISK_OFF block simply because the type
+    # changed.  Same-type updates still replace when conf >= current.conf.
+    EVENT_REPLACE_CONF_RATIO: float = 0.85
+
     # ── Feature 14: Multi-news conflict resolver ───────────────
     # Aggregate all recent headlines into a single net_news_score.
     # score_per_headline = direction_sign × confidence × decay × source_weight

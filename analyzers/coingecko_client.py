@@ -71,6 +71,12 @@ class CoinGeckoClient:
         self._running = False
         if self._task:
             self._task.cancel()
+            # AUDIT FIX: await the cancelled task so the session close below
+            # doesn't race with an in-flight request.
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
         if self._session and not self._session.closed:
             await self._session.close()
 
@@ -133,7 +139,10 @@ class CoinGeckoClient:
 
     def is_trending(self, symbol: str) -> bool:
         """Returns True if symbol is currently trending on CoinGecko."""
-        ticker = symbol.replace("/USDT", "").replace("/BUSD", "").upper()
+        # AUDIT FIX: use split('/') so perpetual-future suffixes like
+        # "SOL/USDT:USDT" don't leave trailing ":USDT" on the ticker and
+        # silently miss every lookup.
+        ticker = symbol.split("/")[0].upper()
         return ticker in self._trending
 
     def get_trending_boost(self, symbol: str) -> tuple[int, str]:
@@ -142,7 +151,7 @@ class CoinGeckoClient:
         Boost = +6 if trending, 0 otherwise.
         """
         if self.is_trending(symbol):
-            ticker = symbol.replace("/USDT", "").upper()
+            ticker = symbol.split("/")[0].upper()
             name = self._trending_names.get(ticker, ticker)
             return 6, f"📈 Trending on CoinGecko: {name}"
         return 0, ""

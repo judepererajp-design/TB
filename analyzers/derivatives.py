@@ -14,7 +14,8 @@ edge in perpetual futures trading.
 import asyncio
 import logging
 import time
-from typing import Dict, Optional, Tuple
+from collections import deque
+from typing import Deque, Dict, Optional, Tuple
 from dataclasses import dataclass
 
 from config.loader import cfg
@@ -56,6 +57,14 @@ class DerivativesAnalyzer:
         self._oi_threshold = self._der_cfg.get('oi_change_threshold', 10)
         self._ls_extreme_high = self._der_cfg.get('ls_extreme_high', 2.0)
         self._ls_extreme_low = self._der_cfg.get('ls_extreme_low', 0.7)
+        # AUDIT FIX: maintain per-symbol OI history to compute a real
+        # 24h % change.  Previously `oi_change_24h` was populated from
+        # ccxt's `openInterestAmount` (base-unit OI level), which is NOT
+        # a 24h change and permanently left `oi_trend=NEUTRAL`, dropping
+        # the OI contribution to score/validity.
+        self._oi_history: Dict[str, Deque[Tuple[float, float]]] = {}
+        # Retain ~26h of samples to survive a stale fetch or two.
+        self._oi_history_max = 60
 
     async def analyze(self, symbol: str) -> DerivativesData:
         """
@@ -82,9 +91,22 @@ class DerivativesAnalyzer:
             data.funding_trend = self._classify_funding_trend(data.funding_rate)
 
         # Parse open interest
+        # AUDIT FIX: compute a real 24h % change from in-memory OI history
+        # instead of storing ccxt's `openInterestAmount` (base-unit OI level),
+        # which made `oi_change_24h` static and disabled the OI trend logic.
         if isinstance(oi, dict) and oi:
-            data.open_interest = float(oi.get('openInterestValue') or 0)
-            data.oi_change_24h = float(oi.get('openInterestAmount') or 0)
+            _raw_value = float(oi.get('openInterestValue') or 0)
+            _raw_amount = float(oi.get('openInterestAmount') or 0)
+            # Prefer USD notional (openInterestValue).  Some venues expose only
+            # `openInterestAmount` in base units; fall back to that so we still
+            # have a series.  Units only need to be consistent within a symbol
+            # since we compute a ratio.
+            _oi_level = _raw_value if _raw_value > 0 else _raw_amount
+            data.open_interest = _raw_value if _raw_value > 0 else _raw_amount
+            if _oi_level > 0:
+                data.oi_change_24h = self._update_oi_history(symbol, _oi_level)
+            else:
+                data.oi_change_24h = 0.0
             data.oi_trend = self._classify_oi_trend(data.oi_change_24h)
 
         # Parse long/short ratio
@@ -105,7 +127,41 @@ class DerivativesAnalyzer:
 
         return data
 
-    def _classify_funding_trend(self, rate: float) -> str:
+    def _update_oi_history(self, symbol: str, oi_level: float) -> float:
+        """
+        Append a new OI sample and return the % change vs the sample closest
+        to 24 h ago.  Returns 0.0 until enough history has accumulated.
+
+        Values are kept in whatever unit the exchange supplies; because we
+        compute a ratio the unit cancels as long as it's consistent per symbol.
+        """
+        now = time.time()
+        history = self._oi_history.setdefault(symbol, deque(maxlen=self._oi_history_max))
+        history.append((now, oi_level))
+        if len(history) < 2:
+            return 0.0
+
+        target_age = 24 * 3600
+        cutoff = now - target_age
+        # Find the sample with timestamp closest to (now - 24h), preferring
+        # ones from BEFORE the cutoff so we're measuring an actual 24h window
+        # rather than a shorter one.
+        older = [s for s in history if s[0] <= cutoff]
+        if older:
+            baseline_ts, baseline_oi = older[-1]
+        else:
+            # Not yet 24h of history — use the oldest available sample, but
+            # only report a change if the window is at least ~4h long to
+            # avoid reacting to intraday noise as if it were 24h.
+            baseline_ts, baseline_oi = history[0]
+            if now - baseline_ts < 4 * 3600:
+                return 0.0
+
+        if baseline_oi <= 0:
+            return 0.0
+        return (oi_level - baseline_oi) / baseline_oi * 100.0
+
+
         """Classify funding rate"""
         threshold = self._funding_threshold
         if rate > threshold * 2:
@@ -171,8 +227,17 @@ class DerivativesAnalyzer:
             return "BEARISH"
 
         # Negative funding = someone paying to short = shorts think it goes lower
-        # But negative funding can be a squeeze setup for smart money
+        # But negative funding can be a squeeze setup for smart money.
+        # AUDIT FIX: don't classify negative funding as BULLISH during an OI
+        # collapse (likely capitulation with both sides exiting) — require
+        # OI to be holding or rising, or L/S to not be extreme-long.
         if funding_trend == "NEGATIVE":
+            if oi in ("DECREASE", "STRONG_DECREASE") and lsr != "EXTREME_SHORT":
+                data.notes.append(
+                    "⚠️ Negative funding during OI decline — capitulation, "
+                    "not squeeze fuel"
+                )
+                return "NEUTRAL"
             data.notes.append("💡 Negative funding — longs earning, squeeze potential")
             return "BULLISH"
 
@@ -318,6 +383,15 @@ class DerivativesAnalyzer:
             elif data.funding_trend == "HIGH":
                 notes.append("✅ High funding supports short")
                 conf_adj += 5
+
+            # AUDIT FIX (symmetry): OI rising while funding is neutral means
+            # new longs are entering — that's a headwind for a fresh short.
+            # LONG side gets +5 for the same condition, so apply a matching
+            # penalty here.
+            if data.oi_trend in ("INCREASE", "STRONG_INCREASE") and \
+               data.funding_trend == "NEUTRAL":
+                notes.append("⚠️ OI rising with neutral funding — longs entering")
+                conf_adj -= 5
 
             # Liquidation risk = extra edge for shorts
             if data.liquidation_risk == "HIGH":
