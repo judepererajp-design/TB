@@ -849,7 +849,7 @@ Return ONLY valid JSON (array):
             symbol_news = {}
             for sym in symbols:
                 base = sym.split("/")[0]
-                headlines = news_scraper.get_headlines_for_symbol(sym)
+                headlines = news_scraper.get_news_for_symbol(sym)
                 if headlines:
                     symbol_news[base] = [h.get("title", "") for h in headlines[:3]]
 

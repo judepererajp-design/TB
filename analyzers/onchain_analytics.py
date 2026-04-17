@@ -191,8 +191,16 @@ class OnChainAnalytics:
     async def stop(self):
         """Graceful shutdown."""
         self._running = False
+        # AUDIT FIX: await the cancelled task before closing the aiohttp
+        # session so pending on-chain fetches unwind without tripping
+        # "Session is closed" warnings on bot shutdown.
         if self._task:
             self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._task = None
         if self._session:
             await self._session.close()
 

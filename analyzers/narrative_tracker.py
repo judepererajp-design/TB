@@ -148,10 +148,20 @@ class NarrativeTracker:
 
             velocity = (
                 articles_24h / articles_7d_avg
-                if articles_7d_avg > 0 else float(articles_24h)
+                if articles_7d_avg > 0 else 0.0
             )
 
-            if velocity >= NewsIntelligence.NARRATIVE_VELOCITY_RISING_THRESHOLD:
+            # AUDIT FIX: require a real 7-day baseline before crowning a
+            # narrative "rising" — previously a brand-new narrative with
+            # ``articles_7d_avg==0`` fell into the ``float(articles_24h)``
+            # branch and was classified rising on day one (velocity would
+            # match e.g. 5 > RISING_THRESHOLD=2.0), inviting coordinated
+            # pump narratives straight into the ±5% confidence multiplier.
+            # Treat cold-start narratives as "peaked" (neutral) until a
+            # 7-day average exists.
+            if articles_7d_avg <= 0:
+                momentum = "peaked"
+            elif velocity >= NewsIntelligence.NARRATIVE_VELOCITY_RISING_THRESHOLD:
                 momentum = "rising"
             elif velocity <= NewsIntelligence.NARRATIVE_VELOCITY_FADING_THRESHOLD:
                 momentum = "fading"

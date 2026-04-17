@@ -849,8 +849,13 @@ class NewsScraper:
             "representative": title,
         }
         self._dedup_clusters.append(cluster)
-        # Prune old clusters (>2 hours)
-        cutoff = time.time() - 7200
+        # AUDIT FIX: dedup clusters previously pruned after 2 h while the
+        # news cache itself keeps items for 6 h (see _merge cutoff=21600).
+        # A headline dropped from the cluster store would reappear from
+        # the still-live cache and be treated as a unique new article,
+        # double-counting it in sentiment weighting.  Align the prune
+        # window with the news-cache TTL so the two stores agree.
+        cutoff = time.time() - 21600
         self._dedup_clusters = [
             c for c in self._dedup_clusters if c["first_seen"] > cutoff
         ]
