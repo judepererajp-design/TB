@@ -95,6 +95,22 @@ class SmartMoneyConcepts(BaseStrategy):
 
         regime_bonus = 0  # deferred — computed after direction is known
 
+        # ── Multi-Timeframe Analysis: 4h structure → 1h zones → 15m trigger ──
+        _htf_bias = self.mtf_get_bias(ohlcv_dict, tf="4h")
+        _mtf_zone = None
+        _mtf_trigger = {"triggered": False, "trigger_type": "none", "quality": 0.0}
+        _mtf_bonus = 0
+
+        if _htf_bias["bias"] != "NEUTRAL" and _htf_bias["confidence"] > 55:
+            _mtf_zone = self.mtf_find_zone(ohlcv_dict, tf="1h", bias=_htf_bias["bias"])
+            if _mtf_zone:
+                _trigger_dir = "LONG" if _htf_bias["bias"] == "BULLISH" else "SHORT"
+                _mtf_trigger = self.mtf_check_trigger(
+                    ohlcv_dict, tf="15m", direction=_trigger_dir, zone=_mtf_zone
+                )
+                if _mtf_trigger["triggered"]:
+                    _mtf_bonus = int(_mtf_trigger["quality"] * 12)  # Up to +12
+
         # Primary timeframe for structure analysis
         tf = "4h"
         for candidate_tf in ("4h", "1h", "15m"):
@@ -190,7 +206,7 @@ class SmartMoneyConcepts(BaseStrategy):
 
         direction:  Optional[str] = None
         setup_type: str = ""
-        confidence: float = confidence_base + regime_bonus + killzone_bonus
+        confidence: float = confidence_base + regime_bonus + killzone_bonus + _mtf_bonus
         entry_ref:  float = current_close
         sl_level:   float = 0.0
         confluence: List[str] = []
@@ -516,6 +532,14 @@ class SmartMoneyConcepts(BaseStrategy):
         if killzone_bonus:
             confluence.append(f"⏰ Killzone active (UTC {current_hour}h): +{killzone_bonus} confidence")
         confluence.append(f"📈 Regime: {regime} ({'+' if regime_bonus >= 0 else ''}{regime_bonus})")
+        if _mtf_bonus > 0:
+            confluence.append(
+                f"🔄 MTF confirmed: 4h {_htf_bias['bias']} → "
+                f"1h {_mtf_zone['zone_type'] if _mtf_zone else 'N/A'} zone → "
+                f"15m {_mtf_trigger['trigger_type']} (+{_mtf_bonus})"
+            )
+        elif _htf_bias["bias"] != "NEUTRAL":
+            confluence.append(f"🔄 HTF bias: {_htf_bias['bias']} (ADX {_htf_bias['adx']:.1f})")
         confluence.append(f"🎯 R:R {rr_ratio:.2f} | ATR: {fmt_price(atr)}")
 
         raw_data.update({
@@ -532,6 +556,10 @@ class SmartMoneyConcepts(BaseStrategy):
             "has_ob": setup_type == "OrderBlock",
             "has_fvg": setup_type == "FairValueGap",
             "has_sweep": setup_type == "LiquiditySweep",
+            "mtf_htf_bias": _htf_bias["bias"],
+            "mtf_zone": _mtf_zone["zone_type"] if _mtf_zone else None,
+            "mtf_trigger": _mtf_trigger["trigger_type"],
+            "mtf_bonus": _mtf_bonus,
         })
 
         confidence = min(95, max(40, confidence))

@@ -95,6 +95,22 @@ class PriceAction(BaseStrategy):
 
         regime_bonus = 0  # deferred — computed after direction is known
 
+        # ── Multi-Timeframe Analysis: 4h bias → 1h zone → 15m trigger ────
+        _htf_bias = self.mtf_get_bias(ohlcv_dict, tf="4h")
+        _mtf_zone = None
+        _mtf_trigger = {"triggered": False, "trigger_type": "none", "quality": 0.0}
+        _mtf_bonus = 0
+
+        if _htf_bias["bias"] != "NEUTRAL" and _htf_bias["confidence"] > 55:
+            _mtf_zone = self.mtf_find_zone(ohlcv_dict, tf="1h", bias=_htf_bias["bias"])
+            if _mtf_zone:
+                _trigger_dir = "LONG" if _htf_bias["bias"] == "BULLISH" else "SHORT"
+                _mtf_trigger = self.mtf_check_trigger(
+                    ohlcv_dict, tf="15m", direction=_trigger_dir, zone=_mtf_zone
+                )
+                if _mtf_trigger["triggered"]:
+                    _mtf_bonus = int(_mtf_trigger["quality"] * 10)  # Up to +10
+
         tf = "4h"
         for candidate_tf in ("4h", "1h"):
             if candidate_tf in ohlcv_dict and len(ohlcv_dict[candidate_tf]) >= 55:
@@ -234,7 +250,7 @@ class PriceAction(BaseStrategy):
         vol_confirmed = vol_ratio >= 1.5
 
         # ── Confidence ────────────────────────────────────────────────────
-        confidence = float(confidence_base) + regime_bonus
+        confidence = float(confidence_base) + regime_bonus + _mtf_bonus
         confidence += primary_pattern["strength"] * 15
         if at_key_level:
             confidence += 12
@@ -302,6 +318,12 @@ class PriceAction(BaseStrategy):
         if vol_confirmed:
             confluence.append(f"✅ Volume: {vol_ratio:.1f}x average")
         confluence.append(f"📊 Regime: {regime} | TF: {tf}")
+        if _mtf_bonus > 0:
+            confluence.append(
+                f"🔄 MTF confirmed: 4h {_htf_bias['bias']} → "
+                f"1h {_mtf_zone['zone_type'] if _mtf_zone else 'N/A'} → "
+                f"15m {_mtf_trigger['trigger_type']} (+{_mtf_bonus})"
+            )
         confluence.append(f"🎯 R:R {rr_ratio:.2f} | ATR: {fmt_price(atr)}")
 
         confidence = min(93, max(40, confidence))
