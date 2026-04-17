@@ -213,7 +213,7 @@ class BreakoutStrategy(BaseStrategy):
             return None
 
         if _market_state:
-            confluence.append(f"🧠 Market State: {_market_state.value} ({'+' if _ms_bonus >= 0 else ''}{_ms_bonus})")
+            confluence.append(f"🧠 Market State: {_market_state.value} ({_ms_bonus:+d})")
 
         confidence = min(95, max(40, confidence))
 
