@@ -101,8 +101,17 @@ class WhaleDepositMonitor:
     async def stop(self):
         """Stop monitoring"""
         self._running = False
+        # AUDIT FIX: await the cancelled task before closing the aiohttp
+        # session so pending CryptoQuant fetches unwind cleanly on
+        # shutdown (prevents "Session is closed" errors and "Task was
+        # destroyed but it is pending" warnings).
         if self._task:
             self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._task = None
         if self._session:
             await self._session.close()
 
@@ -167,7 +176,14 @@ class WhaleDepositMonitor:
             try:
                 from analyzers.wallet_behavior import wallet_profiler
                 wallet_profiler.record_event(
-                    side="buy",  # Exchange inflows signal potential selling
+                    # AUDIT FIX: exchange inflows signal SELLING intent
+                    # (whales move coins to the exchange to dump), as the
+                    # adjacent comment states.  Previously we passed
+                    # ``side="buy"`` which caused _analyze_phase() to count
+                    # every deposit toward the bullish ACCUMULATION phase —
+                    # the exact inverse of the real signal, flipping whale
+                    # confidence adjustments against the trade direction.
+                    side="sell",
                     size_usd=event.amount_usd,
                     symbol=f"{event.asset}USDT",
                     source="deposit",

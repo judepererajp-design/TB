@@ -160,8 +160,15 @@ class SmartMoneyClient:
 
     async def stop(self):
         self._running = False
+        # AUDIT FIX: await the cancelled task before closing the aiohttp
+        # session so pending Hyperliquid API calls unwind cleanly.
         if self._task:
             self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._task = None
         if self._session and not self._session.closed:
             await self._session.close()
 

@@ -782,6 +782,15 @@ Return ONLY valid JSON (array):
                 # Recent window correlation (last 6h)
                 recent_corr = float(np.corrcoef(btc_r[-6:], sym_r[-6:])[0, 1]) if min_len >= 6 else baseline_corr
 
+                # AUDIT FIX: ``np.corrcoef`` returns NaN when either series
+                # has zero variance (e.g. stuck OHLCV, illiquid micro-caps,
+                # or a data-feed outage).  ``NaN >= threshold`` silently
+                # evaluates to False, so the correlation-break alert — a
+                # primary independent-move detector — disappears exactly
+                # when the data is garbage.  Skip the symbol instead.
+                if np.isnan(baseline_corr) or np.isnan(recent_corr):
+                    continue
+
                 # Use cached baseline if available (more stable reference)
                 cached = self._corr_baseline.get(symbol)
                 if cached and (now - cached[1]) < 14400:   # 4h cache
