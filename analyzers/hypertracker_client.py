@@ -324,15 +324,16 @@ class HyperTrackerClient:
                 # AUDIT FIX: previous boundaries (±0.2, ±0.5) produced label/score
                 # mismatches — e.g. perp_bias=-0.2 → "Neutral" label but score=40,
                 # which format_signal_intel() later flagged as "against LONG"
-                # (its threshold is <45).  New boundaries keep the "Neutral"
-                # band strictly inside [45, 55] so a Neutral cohort never
-                # triggers a directional penalty.
+                # (its threshold is bias_score<45 for LONG / >55 for SHORT).
+                # New boundaries keep the "Neutral" band at scores 45..55 so a
+                # Neutral cohort never trips a directional penalty:
+                #   perp_bias ∈ (-0.10, +0.10)  →  score ∈ (45, 55)
                 bias_score = int((perp_bias + 1) / 2 * 100)
                 if perp_bias >= 0.5:
                     bias_raw = "Very Bullish"
                 elif perp_bias >= 0.10:        # score ≥ 55 → Bullish
                     bias_raw = "Bullish"
-                elif perp_bias > -0.10:        # -55 < score < 55 → Neutral (exclusive bounds)
+                elif perp_bias > -0.10:        # score in (45, 55) → Neutral
                     bias_raw = "Neutral"
                 elif perp_bias > -0.5:         # score ≤ 45 → Bearish
                     bias_raw = "Bearish"
