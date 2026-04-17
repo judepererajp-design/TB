@@ -1247,6 +1247,37 @@ class SignalAggregator:
         except Exception:
             pass
 
+        # ── 7d. Sector correlation filter ────────────────────
+        # Block signals when too many same-sector positions are open.
+        try:
+            from risk.drawdown_guard import drawdown_guard
+            _open_positions = []
+            try:
+                from core.position_tracker import position_tracker as _pt
+                _open_positions = _pt.get_open_positions() if hasattr(_pt, 'get_open_positions') else []
+            except Exception:
+                pass
+            if _open_positions:
+                _blocked, _block_reason = drawdown_guard.should_block_correlated(
+                    signal.symbol, _open_positions
+                )
+                if _blocked:
+                    logger.info(
+                        f"❌ Signal died (agg) | {signal.symbol} {direction_str} "
+                        f"| reason=SECTOR_CONCENTRATION | {_block_reason}"
+                    )
+                    return None
+                # Apply sector sizing penalty to confidence
+                _sector_mult = drawdown_guard.get_sector_sizing_penalty(
+                    signal.symbol, _open_positions
+                )
+                if _sector_mult < 1.0:
+                    signal.confluence.append(
+                        f"⚠️ Sector concentration penalty: {_sector_mult:.0%} sizing"
+                    )
+        except Exception:
+            pass
+
         # ── 8. Get regime-adjusted weights ────────────────────
         weights = self._get_adjusted_weights()
 
