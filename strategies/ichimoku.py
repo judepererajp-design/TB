@@ -158,6 +158,22 @@ class Ichimoku(BaseStrategy):
             if direction == "SHORT" and not chikou_short_clear:
                 return None
 
+        # ── Condition 4: Kijun pullback detection ────────────────────────
+        # After TK cross, best entry is on a pullback to flat Kijun.
+        # Kijun is "flat" when it hasn't moved for 3+ bars (acting as S/R).
+        _kijun_flat = False
+        _kijun_pullback = False
+        _kijun_pullback_bonus = 0
+        if len(kijun) >= 5:
+            _kijun_range = abs(kijun[-1] - kijun[-4])
+            _kijun_flat = _kijun_range < atr * 0.15  # Kijun barely moved in 4 bars
+            if _kijun_flat:
+                # Check if price is near Kijun (pullback in progress)
+                _dist_to_kijun = abs(current_price - current_kijun) / atr
+                if _dist_to_kijun < 0.8:
+                    _kijun_pullback = True
+                    _kijun_pullback_bonus = 8  # High-probability pullback entry
+
         # ── Confidence ────────────────────────────────────────────────────
         # Direction-aware regime bonus
         _is_with_trend = (
@@ -169,7 +185,7 @@ class Ichimoku(BaseStrategy):
         else:
             _regime_bonus = self._REGIME_CONF_COUNTER_TREND.get(regime, 0)
 
-        confidence = float(confidence_base) + _regime_bonus
+        confidence = float(confidence_base) + _regime_bonus + _kijun_pullback_bonus
 
         # TK cross in same direction as cloud
         if direction == "LONG" and current_price > kumo_top:
@@ -187,8 +203,13 @@ class Ichimoku(BaseStrategy):
         if chikou_margin > atr:
             confidence += 5
 
-        # ── Entry around TK cross level ────────────────────────────────────
-        tk_cross_level = (current_tenkan + current_kijun) / 2
+        # ── Entry around TK cross level (or Kijun on pullback) ──────────
+        # When flat-Kijun pullback is detected, enter near Kijun level
+        # for a tighter stop and better R:R.
+        if _kijun_pullback:
+            tk_cross_level = current_kijun  # Use Kijun as entry anchor
+        else:
+            tk_cross_level = (current_tenkan + current_kijun) / 2
 
         vp = compute_vol_percentile(highs, lows, closes)
         if direction == "LONG":
@@ -223,6 +244,10 @@ class Ichimoku(BaseStrategy):
         ]
         if (direction == "LONG" and chikou_long_clear) or (direction == "SHORT" and chikou_short_clear):
             confluence.append(f"✅ Chikou clear — lagging span confirms direction")
+        if _kijun_pullback:
+            confluence.append(f"✅ Flat Kijun pullback — high-probability entry at {fmt_price(current_kijun)}")
+        elif _kijun_flat:
+            confluence.append(f"📊 Kijun flat — awaiting pullback for optimal entry")
         confluence.append(f"📊 Regime: {regime} | TF: {tf}")
         confluence.append(f"🎯 R:R {rr_ratio:.2f} | ATR: {fmt_price(atr)}")
 

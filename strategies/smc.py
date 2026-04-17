@@ -322,26 +322,124 @@ class SmartMoneyConcepts(BaseStrategy):
                         break
 
         # ─────────────────────────────────────────────────────────────────
-        # Priority 4: Break of Structure
+        # Priority 4: Break of Structure (with pullback confirmation)
         # ─────────────────────────────────────────────────────────────────
+        # Classic BOS enters at the break level. Improved BOS waits for a
+        # pullback to the OB/FVG that caused the break, then enters on the
+        # retest — dramatically higher win rate.
         if direction is None:
             if (current_close > key_swing_high
                     and (current_close - key_swing_high) / key_swing_high >= min_break_pct):
-                direction  = "LONG"
-                setup_type = "BreakOfStructure"
-                entry_ref  = current_close
-                sl_level   = key_swing_low_near - atr * 0.3
-                confluence.append(f"✅ BOS: Price broke above swing high {fmt_price(key_swing_high)}")
-                raw_data["bos_level"] = key_swing_high
+                # Bullish BOS detected — look for pullback to OB/FVG below
+                _pullback_entry = None
+                _pullback_sl = None
+                _pullback_note = ""
+
+                # Check for bullish OB below the breakout level (pullback target)
+                for i in range(2, min(ob_max_age, len(closes) - 3)):
+                    _bull_ob_body = opens[-i] - closes[-i]
+                    if (_bull_ob_body > 0
+                            and closes[-i + 1] > opens[-i + 1]
+                            and (closes[-i + 1] - opens[-i + 1]) / _bull_ob_body >= ob_min_impulse):
+                        ob_high = opens[-i]
+                        ob_low = closes[-i]
+                        # OB must be between current price and the BOS level
+                        if ob_low <= key_swing_high and ob_high >= current_close - atr * 1.5:
+                            # Price has pulled back to or near this OB
+                            if current_close <= ob_high + atr * 0.5:
+                                _pullback_entry = (ob_high + ob_low) / 2
+                                _pullback_sl = ob_low - atr * 0.3
+                                _pullback_note = f"✅ BOS pullback to OB at {fmt_price(ob_low)}-{fmt_price(ob_high)}"
+                                break
+
+                # Check for bullish FVG below breakout level
+                if _pullback_entry is None and len(closes) >= 5:
+                    for i in range(3, min(15, len(closes) - 2)):
+                        c1h, c3l = highs[-i], lows[-i + 2]
+                        if c1h < c3l:  # bullish FVG exists
+                            fvg_mid = (c1h + c3l) / 2
+                            if c1h <= key_swing_high and current_close <= c3l + atr * 0.3:
+                                _pullback_entry = fvg_mid
+                                _pullback_sl = c1h - atr * 0.3
+                                _pullback_note = f"✅ BOS pullback to FVG at {fmt_price(c1h)}-{fmt_price(c3l)}"
+                                break
+
+                if _pullback_entry is not None:
+                    direction  = "LONG"
+                    setup_type = "BreakOfStructure"
+                    entry_ref  = _pullback_entry
+                    sl_level   = _pullback_sl
+                    confidence += 8  # Pullback confirmation bonus
+                    confluence.append(f"✅ BOS: Price broke above swing high {fmt_price(key_swing_high)}")
+                    confluence.append(_pullback_note)
+                    confluence.append("✅ Pullback confirmation — higher win-rate BOS entry")
+                    raw_data["bos_level"] = key_swing_high
+                    raw_data["bos_pullback"] = True
+                else:
+                    # No pullback found — use standard BOS entry (lower confidence)
+                    direction  = "LONG"
+                    setup_type = "BreakOfStructure"
+                    entry_ref  = current_close
+                    sl_level   = key_swing_low_near - atr * 0.3
+                    confidence -= 5  # Penalty for chasing the break without pullback
+                    confluence.append(f"✅ BOS: Price broke above swing high {fmt_price(key_swing_high)}")
+                    confluence.append("⚠️ No pullback to OB/FVG — chase entry")
+                    raw_data["bos_level"] = key_swing_high
+                    raw_data["bos_pullback"] = False
 
             elif (current_close < key_swing_low
                     and (key_swing_low - current_close) / key_swing_low >= min_break_pct):
-                direction  = "SHORT"
-                setup_type = "BreakOfStructure"
-                entry_ref  = current_close
-                sl_level   = key_swing_high + atr * 0.3
-                confluence.append(f"✅ BOS: Price broke below swing low {fmt_price(key_swing_low)}")
-                raw_data["bos_level"] = key_swing_low
+                # Bearish BOS — look for pullback to bearish OB/FVG above
+                _pullback_entry = None
+                _pullback_sl = None
+                _pullback_note = ""
+
+                for i in range(2, min(ob_max_age, len(closes) - 3)):
+                    _bear_ob_body = closes[-i] - opens[-i]
+                    if (_bear_ob_body > 0
+                            and closes[-i + 1] < opens[-i + 1]
+                            and (opens[-i + 1] - closes[-i + 1]) / _bear_ob_body >= ob_min_impulse):
+                        ob_high = closes[-i]
+                        ob_low = opens[-i]
+                        if ob_high >= key_swing_low and ob_low <= current_close + atr * 1.5:
+                            if current_close >= ob_low - atr * 0.5:
+                                _pullback_entry = (ob_high + ob_low) / 2
+                                _pullback_sl = ob_high + atr * 0.3
+                                _pullback_note = f"✅ BOS pullback to OB at {fmt_price(ob_low)}-{fmt_price(ob_high)}"
+                                break
+
+                if _pullback_entry is None and len(closes) >= 5:
+                    for i in range(3, min(15, len(closes) - 2)):
+                        c1l, c3h = lows[-i], highs[-i + 2]
+                        if c1l > c3h:  # bearish FVG exists
+                            fvg_mid = (c1l + c3h) / 2
+                            if c1l >= key_swing_low and current_close >= c3h - atr * 0.3:
+                                _pullback_entry = fvg_mid
+                                _pullback_sl = c1l + atr * 0.3
+                                _pullback_note = f"✅ BOS pullback to FVG at {fmt_price(c3h)}-{fmt_price(c1l)}"
+                                break
+
+                if _pullback_entry is not None:
+                    direction  = "SHORT"
+                    setup_type = "BreakOfStructure"
+                    entry_ref  = _pullback_entry
+                    sl_level   = _pullback_sl
+                    confidence += 8
+                    confluence.append(f"✅ BOS: Price broke below swing low {fmt_price(key_swing_low)}")
+                    confluence.append(_pullback_note)
+                    confluence.append("✅ Pullback confirmation — higher win-rate BOS entry")
+                    raw_data["bos_level"] = key_swing_low
+                    raw_data["bos_pullback"] = True
+                else:
+                    direction  = "SHORT"
+                    setup_type = "BreakOfStructure"
+                    entry_ref  = current_close
+                    sl_level   = key_swing_high + atr * 0.3
+                    confidence -= 5
+                    confluence.append(f"✅ BOS: Price broke below swing low {fmt_price(key_swing_low)}")
+                    confluence.append("⚠️ No pullback to OB/FVG — chase entry")
+                    raw_data["bos_level"] = key_swing_low
+                    raw_data["bos_pullback"] = False
 
         if direction is None:
             return None

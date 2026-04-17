@@ -167,9 +167,34 @@ class Momentum(BaseStrategy):
         if vol_ratio < vol_surge:
             return None
 
+        # ── EMA pullback confirmation ─────────────────────────────────────
+        # After MACD cross, best entry is on a pullback to 9 or 21 EMA.
+        # Price at or near EMA = supportive entry. Price far from EMA = chase.
+        ema_9  = _ema(closes, 9)
+        ema_21 = _ema(closes, 21)
+        _ema_pullback_bonus = 0
+        _near_ema = False
+        _ema_ref = None
+
+        # Check proximity to 9 EMA first (faster, tighter entries)
+        _dist_9  = abs(closes[-1] - ema_9[-1]) / atr if atr > 0 else 99
+        _dist_21 = abs(closes[-1] - ema_21[-1]) / atr if atr > 0 else 99
+
+        if _dist_9 < 0.6:
+            _near_ema = True
+            _ema_pullback_bonus = 6
+            _ema_ref = ema_9[-1]
+        elif _dist_21 < 0.8:
+            _near_ema = True
+            _ema_pullback_bonus = 4
+            _ema_ref = ema_21[-1]
+        elif _dist_9 > 2.0 and _dist_21 > 2.0:
+            _ema_pullback_bonus = -5  # Too extended — chasing
+
         # ── Confidence ────────────────────────────────────────────────────
         confidence = float(confidence_base)
         confidence += _ms_bonus
+        confidence += _ema_pullback_bonus
         confidence += 5   # MACD crossover
         if histogram_expanding:
             confidence += 5
@@ -218,6 +243,10 @@ class Momentum(BaseStrategy):
             confluence.append(f"✅ Histogram expanding: {histogram[-1]:.4f} > {histogram[-2]:.4f}")
         confluence.append(f"✅ ADX: {adx:.1f} > {min_adx} — trend established")
         confluence.append(f"✅ Volume surge: {vol_ratio:.1f}x average")
+        if _near_ema and _ema_ref is not None:
+            confluence.append(f"✅ EMA pullback entry near {fmt_price(_ema_ref)} (+{_ema_pullback_bonus})")
+        elif _ema_pullback_bonus < 0:
+            confluence.append(f"⚠️ Extended from EMAs — chase risk ({_ema_pullback_bonus})")
         confluence.append(f"📊 Regime: {regime} | TF: {tf}")
         confluence.append(f"🎯 R:R {rr_ratio:.2f} | ATR: {fmt_price(atr)}")
 
