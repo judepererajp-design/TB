@@ -86,6 +86,23 @@ class Momentum(BaseStrategy):
 
         regime_dir = self._REGIME_DIR_CONSTRAINT.get(regime)
 
+        # ── Market state awareness ──────────────────────────────────
+        _ms_bonus = 0
+        try:
+            from analyzers.market_state_engine import market_state_engine, MarketState
+            _ms_result = await market_state_engine.get_state()
+            _ms_state = _ms_result.state
+            if _ms_state == MarketState.EXPANSION:
+                _ms_bonus = 10  # Momentum thrives in expanding volatility
+            elif _ms_state == MarketState.TRENDING:
+                _ms_bonus = 6   # Confirmed trend environment
+            elif _ms_state == MarketState.COMPRESSION:
+                _ms_bonus = -15  # Momentum signals in compression are noise
+            elif _ms_state == MarketState.LIQUIDITY_HUNT:
+                _ms_bonus = -10  # Stop hunts create false momentum readings
+        except Exception:
+            _ms_state = None
+
         tf = getattr(self._cfg, "timeframe", "1h")
         if tf not in ohlcv_dict or len(ohlcv_dict[tf]) < 60:
             return None
@@ -152,6 +169,7 @@ class Momentum(BaseStrategy):
 
         # ── Confidence ────────────────────────────────────────────────────
         confidence = float(confidence_base)
+        confidence += _ms_bonus
         confidence += 5   # MACD crossover
         if histogram_expanding:
             confidence += 5
@@ -203,6 +221,9 @@ class Momentum(BaseStrategy):
         confluence.append(f"📊 Regime: {regime} | TF: {tf}")
         confluence.append(f"🎯 R:R {rr_ratio:.2f} | ATR: {fmt_price(atr)}")
 
+        if _ms_bonus != 0:
+            confluence.append(f"🧠 Market State: {getattr(_ms_state, 'value', 'N/A')} ({'+' if _ms_bonus >= 0 else ''}{_ms_bonus})")
+
         confidence = min(93, max(40, confidence))
 
         candidate = SignalResult(
@@ -227,6 +248,7 @@ class Momentum(BaseStrategy):
                 "adx": adx,
                 "vol_ratio": vol_ratio,
                 "regime": regime,
+                "market_state": getattr(_ms_state, 'value', None),
             },
             regime=regime,
         )
