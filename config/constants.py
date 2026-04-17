@@ -122,6 +122,15 @@ class Timing:
     # Engine
     WARMUP_SECS: int = 60                         # Initial regime observation period
     STRATEGY_HEALTH_ALERT_SECS: int = 3600 * 6    # 6h silence before alert
+
+    # Post-startup extension filter
+    # After warmup completes, block signals for POST_STARTUP_FILTER_SECS where the
+    # recent 4-bar 1h move is ≥ POST_STARTUP_EXT_ATR_MULT × ATR (or ≥ the floor %)
+    # in the signal direction.  Prevents "catch-up" signals fired at already-extended
+    # prices when the bot restarts mid-move.
+    POST_STARTUP_FILTER_SECS:    int   = 900   # 15 minutes post-warmup filter window
+    POST_STARTUP_EXT_ATR_MULT:   float = 4.0   # ATR multiplier threshold
+    POST_STARTUP_EXT_FLOOR_PCT:  float = 6.0   # Minimum extension % to trigger filter
     REGIME_MAX_AGE_SECS: int = 600                 # 10min → recompute regime
     REGIME_STALE_PENALTY_WINDOW_SECS: int = 3600   # Penalty ramp window
 

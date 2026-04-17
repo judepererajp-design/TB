@@ -2060,6 +2060,7 @@ class DashboardApp:
             "regime": sig.get("regime"),
             "sector": sig.get("sector"),
             "setup_class": sig.get("setup_class", "intraday"),
+            "entry_timeframe": sig.get("entry_timeframe") or sig.get("timeframe") or "1h",
             "confluence": confluence,
             "technical_score": _score("technical_score", "technical", 50),
             "volume_score": _score("volume_score", "volume", 50),

@@ -28,6 +28,21 @@ TF_MINUTES = {
     '1h': 60, '2h': 120, '4h': 240, '6h': 360, '12h': 720, '1d': 1440,
 }
 
+# Maps setup_class → recommended entry timeframe and confirmation timeframe.
+# Kept in sync with strategies/base.py SETUP_CLASS_ENTRY_TF / SETUP_CLASS_CONFIRM_TF.
+_SC_ENTRY_TF: Dict[str, str] = {
+    'scalp':      '15m',
+    'intraday':   '1h',
+    'swing':      '4h',
+    'positional': '1d',
+}
+_SC_CONFIRM_TF: Dict[str, str] = {
+    'scalp':      '5m',
+    'intraday':   '15m',
+    'swing':      '1h',
+    'positional': '4h',
+}
+
 STRATEGY_EXPIRY_CANDLES = {
     'SmartMoneyConcepts':    6,
     'WyckoffAccDist':        8,
@@ -406,6 +421,9 @@ class TelegramFormatter:
             msg += f"Potential {pressure} pressure developing.\n\n"
             msg += f"Confidence: {conf_label} ({conf:.0f})\n"
             msg += f"Strategy: <i>{strategy}</i>\n"
+            _sc_c = getattr(sig, 'setup_class', 'intraday')
+            _etf_c = getattr(sig, 'entry_timeframe', None) or _SC_ENTRY_TF.get(_sc_c, '1h')
+            msg += f"Chart: {_etf_c} entry  ·  {_SC_CONFIRM_TF.get(_sc_c, '15m')} confirm\n"
             msg += f"Regime: {regime_readable}\n\n"
             msg += f"⏳ Monitoring for {candles} candles ({duration_str})"
             if warning_lines:
@@ -438,6 +456,10 @@ class TelegramFormatter:
         msg += f"<i>{grade_action}</i>\n\n"
         msg += f"{dir_emoji} <b>{dir_label}  {sig.symbol}  ·  {_sc_label}</b>{kz_line}\n\n"
         msg += f"Strategy: <i>{strategy}</i>\n"
+        _sc = getattr(sig, 'setup_class', 'intraday')
+        _entry_tf   = getattr(sig, 'entry_timeframe', None) or _SC_ENTRY_TF.get(_sc, '1h')
+        _confirm_tf = _SC_CONFIRM_TF.get(_sc, '15m')
+        msg += f"Chart:    {_entry_tf} entry  ·  {_confirm_tf} confirm\n"
 
         if grade == "A+":
             # A+ — FULL LEVELS (execute immediately)

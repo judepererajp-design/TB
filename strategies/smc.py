@@ -95,6 +95,22 @@ class SmartMoneyConcepts(BaseStrategy):
 
         regime_bonus = 0  # deferred — computed after direction is known
 
+        # ── Multi-Timeframe Analysis: 4h structure → 1h zones → 15m trigger ──
+        _htf_bias = self.mtf_get_bias(ohlcv_dict, tf="4h")
+        _mtf_zone = None
+        _mtf_trigger = {"triggered": False, "trigger_type": "none", "quality": 0.0}
+        _mtf_bonus = 0
+
+        if _htf_bias["bias"] != "NEUTRAL" and _htf_bias["confidence"] > 55:
+            _mtf_zone = self.mtf_find_zone(ohlcv_dict, tf="1h", bias=_htf_bias["bias"])
+            if _mtf_zone:
+                _trigger_dir = "LONG" if _htf_bias["bias"] == "BULLISH" else "SHORT"
+                _mtf_trigger = self.mtf_check_trigger(
+                    ohlcv_dict, tf="15m", direction=_trigger_dir, zone=_mtf_zone
+                )
+                if _mtf_trigger["triggered"]:
+                    _mtf_bonus = int(_mtf_trigger["quality"] * 12)  # Up to +12
+
         # Primary timeframe for structure analysis
         tf = "4h"
         for candidate_tf in ("4h", "1h", "15m"):
@@ -190,7 +206,7 @@ class SmartMoneyConcepts(BaseStrategy):
 
         direction:  Optional[str] = None
         setup_type: str = ""
-        confidence: float = confidence_base + regime_bonus + killzone_bonus
+        confidence: float = confidence_base + regime_bonus + killzone_bonus + _mtf_bonus
         entry_ref:  float = current_close
         sl_level:   float = 0.0
         confluence: List[str] = []
@@ -322,26 +338,124 @@ class SmartMoneyConcepts(BaseStrategy):
                         break
 
         # ─────────────────────────────────────────────────────────────────
-        # Priority 4: Break of Structure
+        # Priority 4: Break of Structure (with pullback confirmation)
         # ─────────────────────────────────────────────────────────────────
+        # Classic BOS enters at the break level. Improved BOS waits for a
+        # pullback to the OB/FVG that caused the break, then enters on the
+        # retest — dramatically higher win rate.
         if direction is None:
             if (current_close > key_swing_high
                     and (current_close - key_swing_high) / key_swing_high >= min_break_pct):
-                direction  = "LONG"
-                setup_type = "BreakOfStructure"
-                entry_ref  = current_close
-                sl_level   = key_swing_low_near - atr * 0.3
-                confluence.append(f"✅ BOS: Price broke above swing high {fmt_price(key_swing_high)}")
-                raw_data["bos_level"] = key_swing_high
+                # Bullish BOS detected — look for pullback to OB/FVG below
+                _pullback_entry = None
+                _pullback_sl = None
+                _pullback_note = ""
+
+                # Check for bullish OB below the breakout level (pullback target)
+                for i in range(2, min(ob_max_age, len(closes) - 3)):
+                    _bull_ob_body = opens[-i] - closes[-i]
+                    if (_bull_ob_body > 0
+                            and closes[-i + 1] > opens[-i + 1]
+                            and (closes[-i + 1] - opens[-i + 1]) / _bull_ob_body >= ob_min_impulse):
+                        ob_high = opens[-i]
+                        ob_low = closes[-i]
+                        # OB must be between current price and the BOS level
+                        if ob_low <= key_swing_high and ob_high >= current_close - atr * 1.5:
+                            # Price has pulled back to or near this OB
+                            if current_close <= ob_high + atr * 0.5:
+                                _pullback_entry = (ob_high + ob_low) / 2
+                                _pullback_sl = ob_low - atr * 0.3
+                                _pullback_note = f"✅ BOS pullback to OB at {fmt_price(ob_low)}-{fmt_price(ob_high)}"
+                                break
+
+                # Check for bullish FVG below breakout level
+                if _pullback_entry is None and len(closes) >= 5:
+                    for i in range(3, min(15, len(closes) - 2)):
+                        c1h, c3l = highs[-i], lows[-i + 2]
+                        if c1h < c3l:  # bullish FVG exists
+                            fvg_mid = (c1h + c3l) / 2
+                            if c1h <= key_swing_high and current_close <= c3l + atr * 0.3:
+                                _pullback_entry = fvg_mid
+                                _pullback_sl = c1h - atr * 0.3
+                                _pullback_note = f"✅ BOS pullback to FVG at {fmt_price(c1h)}-{fmt_price(c3l)}"
+                                break
+
+                if _pullback_entry is not None:
+                    direction  = "LONG"
+                    setup_type = "BreakOfStructure"
+                    entry_ref  = _pullback_entry
+                    sl_level   = _pullback_sl
+                    confidence += 8  # Pullback confirmation bonus
+                    confluence.append(f"✅ BOS: Price broke above swing high {fmt_price(key_swing_high)}")
+                    confluence.append(_pullback_note)
+                    confluence.append("✅ Pullback confirmation — higher win-rate BOS entry")
+                    raw_data["bos_level"] = key_swing_high
+                    raw_data["bos_pullback"] = True
+                else:
+                    # No pullback found — use standard BOS entry (lower confidence)
+                    direction  = "LONG"
+                    setup_type = "BreakOfStructure"
+                    entry_ref  = current_close
+                    sl_level   = key_swing_low_near - atr * 0.3
+                    confidence -= 5  # Penalty for chasing the break without pullback
+                    confluence.append(f"✅ BOS: Price broke above swing high {fmt_price(key_swing_high)}")
+                    confluence.append("⚠️ No pullback to OB/FVG — chase entry")
+                    raw_data["bos_level"] = key_swing_high
+                    raw_data["bos_pullback"] = False
 
             elif (current_close < key_swing_low
                     and (key_swing_low - current_close) / key_swing_low >= min_break_pct):
-                direction  = "SHORT"
-                setup_type = "BreakOfStructure"
-                entry_ref  = current_close
-                sl_level   = key_swing_high + atr * 0.3
-                confluence.append(f"✅ BOS: Price broke below swing low {fmt_price(key_swing_low)}")
-                raw_data["bos_level"] = key_swing_low
+                # Bearish BOS — look for pullback to bearish OB/FVG above
+                _pullback_entry = None
+                _pullback_sl = None
+                _pullback_note = ""
+
+                for i in range(2, min(ob_max_age, len(closes) - 3)):
+                    _bear_ob_body = closes[-i] - opens[-i]
+                    if (_bear_ob_body > 0
+                            and closes[-i + 1] < opens[-i + 1]
+                            and (opens[-i + 1] - closes[-i + 1]) / _bear_ob_body >= ob_min_impulse):
+                        ob_high = closes[-i]
+                        ob_low = opens[-i]
+                        if ob_high >= key_swing_low and ob_low <= current_close + atr * 1.5:
+                            if current_close >= ob_low - atr * 0.5:
+                                _pullback_entry = (ob_high + ob_low) / 2
+                                _pullback_sl = ob_high + atr * 0.3
+                                _pullback_note = f"✅ BOS pullback to OB at {fmt_price(ob_low)}-{fmt_price(ob_high)}"
+                                break
+
+                if _pullback_entry is None and len(closes) >= 5:
+                    for i in range(3, min(15, len(closes) - 2)):
+                        c1l, c3h = lows[-i], highs[-i + 2]
+                        if c1l > c3h:  # bearish FVG exists
+                            fvg_mid = (c1l + c3h) / 2
+                            if c1l >= key_swing_low and current_close >= c3h - atr * 0.3:
+                                _pullback_entry = fvg_mid
+                                _pullback_sl = c1l + atr * 0.3
+                                _pullback_note = f"✅ BOS pullback to FVG at {fmt_price(c3h)}-{fmt_price(c1l)}"
+                                break
+
+                if _pullback_entry is not None:
+                    direction  = "SHORT"
+                    setup_type = "BreakOfStructure"
+                    entry_ref  = _pullback_entry
+                    sl_level   = _pullback_sl
+                    confidence += 8
+                    confluence.append(f"✅ BOS: Price broke below swing low {fmt_price(key_swing_low)}")
+                    confluence.append(_pullback_note)
+                    confluence.append("✅ Pullback confirmation — higher win-rate BOS entry")
+                    raw_data["bos_level"] = key_swing_low
+                    raw_data["bos_pullback"] = True
+                else:
+                    direction  = "SHORT"
+                    setup_type = "BreakOfStructure"
+                    entry_ref  = current_close
+                    sl_level   = key_swing_high + atr * 0.3
+                    confidence -= 5
+                    confluence.append(f"✅ BOS: Price broke below swing low {fmt_price(key_swing_low)}")
+                    confluence.append("⚠️ No pullback to OB/FVG — chase entry")
+                    raw_data["bos_level"] = key_swing_low
+                    raw_data["bos_pullback"] = False
 
         if direction is None:
             return None
@@ -418,6 +532,14 @@ class SmartMoneyConcepts(BaseStrategy):
         if killzone_bonus:
             confluence.append(f"⏰ Killzone active (UTC {current_hour}h): +{killzone_bonus} confidence")
         confluence.append(f"📈 Regime: {regime} ({'+' if regime_bonus >= 0 else ''}{regime_bonus})")
+        if _mtf_bonus > 0:
+            confluence.append(
+                f"🔄 MTF confirmed: 4h {_htf_bias['bias']} → "
+                f"1h {_mtf_zone['zone_type'] if _mtf_zone else 'N/A'} zone → "
+                f"15m {_mtf_trigger['trigger_type']} (+{_mtf_bonus})"
+            )
+        elif _htf_bias["bias"] != "NEUTRAL":
+            confluence.append(f"🔄 HTF bias: {_htf_bias['bias']} (ADX {_htf_bias['adx']:.1f})")
         confluence.append(f"🎯 R:R {rr_ratio:.2f} | ATR: {fmt_price(atr)}")
 
         raw_data.update({
@@ -434,6 +556,10 @@ class SmartMoneyConcepts(BaseStrategy):
             "has_ob": setup_type == "OrderBlock",
             "has_fvg": setup_type == "FairValueGap",
             "has_sweep": setup_type == "LiquiditySweep",
+            "mtf_htf_bias": _htf_bias["bias"],
+            "mtf_zone": _mtf_zone["zone_type"] if _mtf_zone else None,
+            "mtf_trigger": _mtf_trigger["trigger_type"],
+            "mtf_bonus": _mtf_bonus,
         })
 
         confidence = min(95, max(40, confidence))

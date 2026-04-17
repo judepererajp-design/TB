@@ -86,6 +86,23 @@ class Momentum(BaseStrategy):
 
         regime_dir = self._REGIME_DIR_CONSTRAINT.get(regime)
 
+        # ── Market state awareness ──────────────────────────────────
+        _ms_bonus = 0
+        try:
+            from analyzers.market_state_engine import market_state_engine, MarketState
+            _ms_result = await market_state_engine.get_state()
+            _ms_state = _ms_result.state
+            if _ms_state == MarketState.EXPANSION:
+                _ms_bonus = 10  # Momentum thrives in expanding volatility
+            elif _ms_state == MarketState.TRENDING:
+                _ms_bonus = 6   # Confirmed trend environment
+            elif _ms_state == MarketState.COMPRESSION:
+                _ms_bonus = -15  # Momentum signals in compression are noise
+            elif _ms_state == MarketState.LIQUIDITY_HUNT:
+                _ms_bonus = -10  # Stop hunts create false momentum readings
+        except Exception:
+            _ms_state = None
+
         tf = getattr(self._cfg, "timeframe", "1h")
         if tf not in ohlcv_dict or len(ohlcv_dict[tf]) < 60:
             return None
@@ -150,8 +167,34 @@ class Momentum(BaseStrategy):
         if vol_ratio < vol_surge:
             return None
 
+        # ── EMA pullback confirmation ─────────────────────────────────────
+        # After MACD cross, best entry is on a pullback to 9 or 21 EMA.
+        # Price at or near EMA = supportive entry. Price far from EMA = chase.
+        ema_9  = _ema(closes, 9)
+        ema_21 = _ema(closes, 21)
+        _ema_pullback_bonus = 0
+        _near_ema = False
+        _ema_ref = None
+
+        # Check proximity to 9 EMA first (faster, tighter entries)
+        _dist_9  = abs(closes[-1] - ema_9[-1]) / atr if atr > 0 else 99
+        _dist_21 = abs(closes[-1] - ema_21[-1]) / atr if atr > 0 else 99
+
+        if _dist_9 < 0.6:
+            _near_ema = True
+            _ema_pullback_bonus = 6
+            _ema_ref = ema_9[-1]
+        elif _dist_21 < 0.8:
+            _near_ema = True
+            _ema_pullback_bonus = 4
+            _ema_ref = ema_21[-1]
+        elif _dist_9 > 2.0 and _dist_21 > 2.0:
+            _ema_pullback_bonus = -5  # Too extended — chasing
+
         # ── Confidence ────────────────────────────────────────────────────
         confidence = float(confidence_base)
+        confidence += _ms_bonus
+        confidence += _ema_pullback_bonus
         confidence += 5   # MACD crossover
         if histogram_expanding:
             confidence += 5
@@ -200,8 +243,15 @@ class Momentum(BaseStrategy):
             confluence.append(f"✅ Histogram expanding: {histogram[-1]:.4f} > {histogram[-2]:.4f}")
         confluence.append(f"✅ ADX: {adx:.1f} > {min_adx} — trend established")
         confluence.append(f"✅ Volume surge: {vol_ratio:.1f}x average")
+        if _near_ema and _ema_ref is not None:
+            confluence.append(f"✅ EMA pullback entry near {fmt_price(_ema_ref)} (+{_ema_pullback_bonus})")
+        elif _ema_pullback_bonus < 0:
+            confluence.append(f"⚠️ Extended from EMAs — chase risk ({_ema_pullback_bonus})")
         confluence.append(f"📊 Regime: {regime} | TF: {tf}")
         confluence.append(f"🎯 R:R {rr_ratio:.2f} | ATR: {fmt_price(atr)}")
+
+        if _ms_bonus != 0:
+            confluence.append(f"🧠 Market State: {getattr(_ms_state, 'value', 'N/A')} ({'+' if _ms_bonus >= 0 else ''}{_ms_bonus})")
 
         confidence = min(93, max(40, confidence))
 
@@ -227,6 +277,7 @@ class Momentum(BaseStrategy):
                 "adx": adx,
                 "vol_ratio": vol_ratio,
                 "regime": regime,
+                "market_state": getattr(_ms_state, 'value', None),
             },
             regime=regime,
         )

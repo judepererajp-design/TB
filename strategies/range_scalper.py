@@ -67,6 +67,23 @@ class RangeScalperStrategy(BaseStrategy):
         except Exception:
             return None
 
+        # ── Market state gate: compression warning ─────────────
+        _ms_state = None
+        _ms_compression_penalty = 0
+        try:
+            from analyzers.market_state_engine import market_state_engine, MarketState
+            _ms_result = await market_state_engine.get_state()
+            _ms_state = _ms_result.state
+            if _ms_state == MarketState.COMPRESSION:
+                if _ms_result.compression_bars >= 8:
+                    return None  # Range about to break — don't scalp
+                elif _ms_result.compression_bars >= 4:
+                    _ms_compression_penalty = -12  # Reduce confidence
+            elif _ms_state in (MarketState.EXPANSION, MarketState.TRENDING):
+                return None  # Market is trending/expanding — no range to scalp
+        except Exception:
+            pass
+
         # ── 1. Get candle data ────────────────────────────────────
         tf = '15m'  # Scalper uses 15m for entries
         if tf not in ohlcv_dict or len(ohlcv_dict[tf]) < 80:
@@ -136,7 +153,7 @@ class RangeScalperStrategy(BaseStrategy):
 
         # ── 5. Confluence checks ──────────────────────────────────
         confluence = []
-        confidence = conf_base
+        confidence = conf_base + _ms_compression_penalty
 
         # a) Zone position — deeper in zone = higher confidence
         if direction == "LONG":
@@ -285,6 +302,9 @@ class RangeScalperStrategy(BaseStrategy):
         confluence.append(f"⚖️ Equilibrium: {self._fmt_p(equilibrium)}")
         confluence.append(f"🎯 Chop strength: {chop:.2f}")
 
+        if _ms_compression_penalty:
+            confluence.append(f"⚠️ Compression detected: range tightening ({_ms_compression_penalty})")
+
         confidence = min(88, max(45, confidence))
 
         signal = SignalResult(
@@ -309,6 +329,7 @@ class RangeScalperStrategy(BaseStrategy):
                 'adx': adx,
                 'bounce_count': bounce_count,
                 'chop_strength': chop,
+                'market_state': getattr(_ms_state, 'value', None) if _ms_state else None,
             }
         )
 

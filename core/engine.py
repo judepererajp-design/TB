@@ -308,8 +308,9 @@ class Engine:
         # FIX: was 900s (15 min) which meant zero signals for 15 minutes after startup.
         # 120s is sufficient — regime_analyzer.force_update() and htf_guardrail.warm_up()
         # already run synchronously during startup, so the data is ready.
-        self._warmup_secs   = Timing.WARMUP_SECS    # 1 minute — regime data ready from startup
-        self._warmup_active = True  # Cleared once warmup_secs have elapsed
+        self._warmup_secs    = Timing.WARMUP_SECS    # 1 minute — regime data ready from startup
+        self._warmup_active  = True   # Cleared once warmup_secs have elapsed
+        self._warmup_end_time = 0.0   # Set when warmup completes; used by Gate 5
 
         # Stats
         self._scan_count   = 0
@@ -1548,6 +1549,7 @@ class Engine:
                     elapsed = time.time() - self._start_time
                     if elapsed >= self._warmup_secs:
                         self._warmup_active = False
+                        self._warmup_end_time = time.time()  # Gate 5 reference point
                         logger.info(
                             f"✅ Warmup complete ({self._warmup_secs//60}min) — "
                             f"signal publishing now ACTIVE"
@@ -4439,6 +4441,53 @@ class Engine:
                         )
                         signal_aggregator.unmark_signal(symbol, _dir_str)
                         return
+
+                    # Gate 5: Post-startup extension filter
+                    # After warmup ends, block signals for POST_STARTUP_FILTER_SECS where
+                    # the recent 4-bar 1h price move is already ≥ threshold in the signal
+                    # direction.  Prevents "catch-up" signals published at extended prices
+                    # when moves happened before the bot was running.
+                    # Only active during the post-startup window; no impact after that.
+                    # Note: falls back to 4h bars when 1h is unavailable, which widens the
+                    # measured window to ~16h — intentionally conservative for that case.
+                    _psfilt_active = (
+                        self._warmup_end_time > 0
+                        and time.time() - self._warmup_end_time < Timing.POST_STARTUP_FILTER_SECS
+                        and _current_p > 0
+                    )
+                    if _psfilt_active:
+                        try:
+                            _chk_bars = ohlcv_dict.get('1h') or ohlcv_dict.get('4h') or []
+                            if len(_chk_bars) >= 8:
+                                _c_now  = float(_chk_bars[-1][4])
+                                _c_4ago = float(_chk_bars[-5][4])
+                                _atr_period = 14
+                                _atr = (
+                                    sum(float(_chk_bars[i][2]) - float(_chk_bars[i][3])
+                                        for i in range(-_atr_period, 0)) / _atr_period
+                                ) if len(_chk_bars) >= _atr_period else 0.0
+                                if _c_4ago > 0 and _atr > 0 and _c_now > 0:
+                                    _4h_chg = (_c_now - _c_4ago) / _c_4ago * 100
+                                    _atr_pct = _atr / _c_now * 100
+                                    _ext_thresh = max(
+                                        _atr_pct * Timing.POST_STARTUP_EXT_ATR_MULT,
+                                        Timing.POST_STARTUP_EXT_FLOOR_PCT,
+                                    )
+                                    _is_extended = (
+                                        (_dir_str == "LONG"  and _4h_chg >  _ext_thresh) or
+                                        (_dir_str == "SHORT" and _4h_chg < -_ext_thresh)
+                                    )
+                                    if _is_extended:
+                                        logger.info(
+                                            f"⏳ {symbol}: {_dir_str} blocked by post-startup "
+                                            f"extension filter — 4h move {_4h_chg:+.1f}% "
+                                            f"exceeds ±{_ext_thresh:.1f}% threshold "
+                                            f"(ATR={_atr_pct:.2f}%)"
+                                        )
+                                        signal_aggregator.unmark_signal(symbol, _dir_str)
+                                        return
+                        except Exception:
+                            pass  # data issue — never silently block a signal
 
                     candidate = PreparedPublishCandidate(
                         symbol=symbol,
