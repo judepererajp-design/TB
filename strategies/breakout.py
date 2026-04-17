@@ -61,6 +61,26 @@ class BreakoutStrategy(BaseStrategy):
             _regime_dir_constraint = None
             regime = "UNKNOWN"
 
+        # ── Market state awareness ──────────────────────────────────────
+        _market_state = None
+        _ms_bonus = 0
+        try:
+            from analyzers.market_state_engine import market_state_engine, MarketState
+            _market_state_result = await market_state_engine.get_state()
+            _market_state = _market_state_result.state
+            if _market_state == MarketState.COMPRESSION:
+                # Breakout from compression = highest probability setup
+                if _market_state_result.compression_bars >= 6:
+                    _ms_bonus = 15
+                elif _market_state_result.compression_bars >= 4:
+                    _ms_bonus = 10
+            elif _market_state == MarketState.EXPANSION:
+                _ms_bonus = 8  # Already expanding — breakout confirmed by environment
+            elif _market_state == MarketState.LIQUIDITY_HUNT:
+                _ms_bonus = -10  # Breakouts during stop hunts are traps
+        except Exception:
+            pass
+
         tf = getattr(self._cfg, 'timeframe', '1h')
         if tf not in ohlcv_dict or len(ohlcv_dict[tf]) < 60:
             return None
@@ -110,7 +130,7 @@ class BreakoutStrategy(BaseStrategy):
 
         confluence = []
         direction = None
-        confidence = confidence_base + _regime_bonus
+        confidence = confidence_base + _regime_bonus + _ms_bonus
 
         # Bullish breakout
         if current_close > channel_high:
@@ -192,6 +212,9 @@ class BreakoutStrategy(BaseStrategy):
         if rr < min_rr:
             return None
 
+        if _market_state:
+            confluence.append(f"🧠 Market State: {_market_state.value} ({'+' if _ms_bonus >= 0 else ''}{_ms_bonus})")
+
         confidence = min(95, max(40, confidence))
 
         # FIX: validate geometry and minimum RR before returning.
@@ -208,7 +231,9 @@ class BreakoutStrategy(BaseStrategy):
             rr_ratio=rr, atr=atr,
             setup_class="intraday", analysis_timeframes=[tf],
             confluence=confluence,
-            raw_data={'adx': adx, 'vol_ratio': vol_ratio, 'channel_high': channel_high, 'channel_low': channel_low}
+            raw_data={'adx': adx, 'vol_ratio': vol_ratio, 'channel_high': channel_high, 'channel_low': channel_low,
+                      'market_state': _market_state.value if _market_state else None,
+                      'market_state_bonus': _ms_bonus}
         )
         if not self.validate_signal(_candidate):
             return None
