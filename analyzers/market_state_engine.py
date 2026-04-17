@@ -483,7 +483,12 @@ class MarketStateEngine:
             ranges = highs - lows
             avg_range = np.mean(ranges[-30:]) if len(ranges) >= 30 else np.mean(ranges)
             comp_bars = 0
-            for i in range(len(ranges) - 1, max(0, len(ranges) - 20), -1):
+            # AUDIT FIX: previously `max(0, len(ranges) - 20)` as the
+            # exclusive stop meant this loop inspected 19 bars, not 20
+            # (indices [len-1 … len-19]).  Use -1 as the stop so the last
+            # 20 bars are all examined when available.
+            _stop = max(-1, len(ranges) - 21)
+            for i in range(len(ranges) - 1, _stop, -1):
                 if ranges[i] < avg_range * 0.65:
                     comp_bars += 1
                 else:

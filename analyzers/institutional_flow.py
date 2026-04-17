@@ -1158,9 +1158,15 @@ class InstitutionalFlowEngine:
         if m and m.vix:
             fear = " (high fear)" if m.vix > 25 else (" (low fear)" if m.vix < 15 else "")
             parts.append(f"VIX {m.vix:.1f}{fear}")
-        if m and m.dxy_pct is not None:
-            if m.dxy_pct > 75 or m.dxy_pct < 25:
-                parts.append(f"DXY {m.dxy_pct:.0f}th pct")
+        # AUDIT FIX: ``MacroSnapshot`` has no ``dxy_pct`` field — the direct
+        # attribute access would raise AttributeError whenever a populated
+        # snapshot reached this code path.  Look up the DXY percentile in
+        # the flow-history DB instead and guard with ``getattr`` so older
+        # snapshots without the field stay safe.
+        _dxy_pct = getattr(m, "dxy_pct", None) if m else None
+        if _dxy_pct is not None:
+            if _dxy_pct > 75 or _dxy_pct < 25:
+                parts.append(f"DXY {_dxy_pct:.0f}th pct")
         if not parts:
             return ""
         regime = self.get_macro_regime()
