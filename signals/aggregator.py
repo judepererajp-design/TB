@@ -1232,6 +1232,21 @@ class SignalAggregator:
         except Exception:
             _candle_bonus = 0.0
 
+        # ── 7c. Market state transition bonus ─────────────────
+        # COMPRESSION→EXPANSION is a prime entry — give a scoring bonus.
+        _ms_bonus = 0.0
+        try:
+            from analyzers.market_state_engine import market_state_engine
+            _ms_transition = market_state_engine.get_transition_type()
+            if _ms_transition == "breakout":
+                _ms_bonus = 10.0
+                signal.confluence.append("🧠 Compression→Expansion breakout transition (+10)")
+            elif _ms_transition == "noise":
+                _ms_bonus = -5.0
+                signal.confluence.append("🧠 Noisy state transitions — caution (-5)")
+        except Exception:
+            pass
+
         # ── 8. Get regime-adjusted weights ────────────────────
         weights = self._get_adjusted_weights()
 
@@ -1249,7 +1264,7 @@ class SignalAggregator:
         # The weighted average will naturally be 0-100 since inputs are 0-100
 
         # Apply bonuses
-        final = base_score + scored.killzone_bonus + scored.sector_adjustment + _candle_bonus
+        final = base_score + scored.killzone_bonus + scored.sector_adjustment + _candle_bonus + _ms_bonus
         final = max(0.0, min(99.0, final))
 
         # BUG-7 FIX: Apply slippage penalty to confidence.
