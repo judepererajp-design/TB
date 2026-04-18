@@ -359,11 +359,14 @@ class Engine:
             Timing.OPPOSITE_SIGNAL_COOLDOWN_BY_SETUP.get("swing", 1800),
         ) * 4
 
+        loss_pruned = 0
         if self._loss_cooldown:
             stale = [k for k, ts in self._loss_cooldown.items() if now - ts > loss_ttl]
             for k in stale:
                 self._loss_cooldown.pop(k, None)
+            loss_pruned = len(stale)
 
+        recent_pruned = 0
         if self._recent_symbol_direction:
             stale_sym = [
                 s for s, d in self._recent_symbol_direction.items()
@@ -371,6 +374,17 @@ class Engine:
             ]
             for s in stale_sym:
                 self._recent_symbol_direction.pop(s, None)
+            recent_pruned = len(stale_sym)
+
+        # Surface prune activity so silent TTL expiry doesn't hide behaviour.
+        # Only log when we actually pruned something — avoids per-cycle noise.
+        if loss_pruned or recent_pruned:
+            logger.info(
+                f"⏱️  Cooldown TTL prune: loss_cooldown -{loss_pruned} "
+                f"(remaining={len(self._loss_cooldown)}), "
+                f"recent_symbol_direction -{recent_pruned} "
+                f"(remaining={len(self._recent_symbol_direction)})"
+            )
 
     @staticmethod
     def _rank_publish_candidates(
