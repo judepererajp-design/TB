@@ -627,11 +627,14 @@ class BacktestEngine:
         slip_pct = self.slippage_pct
 
         def _exit_price_long(intent: float, side: str) -> float:
-            """Long exits suffer downside slippage on both wins and losses."""
-            return intent * (1.0 - slip_pct) if side == "TP" else intent * (1.0 - slip_pct)
+            """Long exits sell into the market and suffer downside slippage
+            on both wins and losses (`side` kept for symmetry with shorts)."""
+            del side  # symmetric to short helper; kept for call-site clarity
+            return intent * (1.0 - slip_pct)
 
         def _exit_price_short(intent: float, side: str) -> float:
-            """Short exits suffer upside slippage."""
+            """Short exits buy back and suffer upside slippage."""
+            del side
             return intent * (1.0 + slip_pct)
 
         def _r_long(exit_px: float) -> float:
