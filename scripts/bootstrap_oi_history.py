@@ -299,7 +299,11 @@ def build_clusters(
       → Shorts were opened at P → will liquidate at P*(1+1/lev)
 
     We use a mix of 5x, 10x, 20x leverage assumptions weighted realistically.
+    OI deltas are age-weighted (exponential decay, τ=30 days) so stale data
+    contributes less than recent accumulation.
+
     Returns list of (price, usd_size, 'above'|'below') relative to current price.
+    Clusters with effective OI < $10M are filtered out.
     """
     if len(history) < 5 or current_price <= 0:
         return []
@@ -307,8 +311,14 @@ def build_clusters(
     # Sort by timestamp
     history = sorted(history, key=lambda x: x[0])
 
-    # Bucket price levels (1% wide buckets)
+    # Age-decay parameters
+    now_ts      = time.time()
+    tau_days    = 30.0                      # 30-day half-life
+    tau_secs    = tau_days * 24 * 3600.0
+
+    # Bucket price levels (1% wide log-space buckets)
     bucket_pct = 0.01
+    log_q      = math.log(1.0 + bucket_pct)   # ≈ 0.00995
     buckets: Dict[float, float] = defaultdict(float)
 
     prev_oi = history[0][1]
@@ -319,20 +329,22 @@ def build_clusters(
         if oi_delta < 2_000_000:  # ignore small OI changes < $2M
             continue
 
-        # Log-space 1% bucketing: groups prices within ~1% of each other
-        # into the same cluster regardless of the absolute price level.
-        # This works correctly across all price scales (e.g. BTC at $30k vs $70k).
-        log_q = math.log(1.0 + bucket_pct)           # ≈ 0.00995 for 1%
+        # Exponential age weight: recent data → weight ≈ 1.0,
+        # data 30 days old → weight ≈ 0.37, data 60 days old → weight ≈ 0.14.
+        age_secs = max(0.0, now_ts - ts)
+        weight   = math.exp(-age_secs / tau_secs)
+
+        # Log-space bucketing (price-scale invariant)
         bucket_idx = round(math.log(price) / log_q)
-        bucket = math.exp(bucket_idx * log_q)
-        buckets[bucket] += abs(oi_delta)
+        bucket     = math.exp(bucket_idx * log_q)
+        buckets[bucket] += abs(oi_delta) * weight
 
     if not buckets:
         return []
 
     clusters: List[Tuple[float, float, str]] = []
     for price_level, oi_accumulated in buckets.items():
-        if oi_accumulated < 10_000_000:  # need $10M+ to be significant
+        if oi_accumulated < 10_000_000:  # need $10M+ (age-weighted) to be significant
             continue
 
         # Leverage distribution: 20% at 5x, 50% at 10x, 30% at 20x

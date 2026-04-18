@@ -18,7 +18,7 @@ The scanner then elevates its scan frequency.
 import asyncio
 import logging
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -31,6 +31,15 @@ from strategies.base import BaseStrategy
 logger = logging.getLogger(__name__)
 
 
+def _get_regime() -> str:
+    """Return the current regime string, or 'UNKNOWN' if not yet initialised."""
+    try:
+        from analyzers.regime import regime_analyzer
+        return str(regime_analyzer.regime.value)
+    except Exception:
+        return "UNKNOWN"
+
+
 class StalkerEngine:
     """
     Monitors potential pre-breakout setups and populates the watchlist.
@@ -40,7 +49,7 @@ class StalkerEngine:
     def __init__(self):
         self._watched: Dict[str, float] = {}     # symbol -> last_alert_time
         self._alert_cooldown = 3600              # 1 hour between repeat alerts
-        self._min_watch_score = 55               # Min score to add to watchlist
+        self._min_watch_score = 55               # Min score to add to watchlist (base)
 
     async def scan_symbol(self, symbol: str, ohlcv_1h: List, ohlcv_15m: List) -> Optional[Dict]:
         """
@@ -54,6 +63,17 @@ class StalkerEngine:
         last_alert = self._watched.get(symbol, 0)
         if time.time() - last_alert < self._alert_cooldown:
             return None
+
+        # Dynamic threshold — mirrors scanner.stalker_scan logic
+        _regime = _get_regime()
+        if _regime == "CHOPPY":
+            min_score = self._min_watch_score + 8
+        elif _regime in ("VOLATILE", "VOLATILE_PANIC"):
+            min_score = self._min_watch_score + 5
+        elif _regime in ("BULL_TREND", "BEAR_TREND"):
+            min_score = self._min_watch_score - 5
+        else:
+            min_score = self._min_watch_score
 
         df = pd.DataFrame(ohlcv_1h, columns=['ts','open','high','low','close','volume'])
         df = df.astype({'open': float,'high': float,'low': float,'close': float,'volume': float})
@@ -105,13 +125,30 @@ class StalkerEngine:
                 score   += 15
                 reasons.append("⚡ 15m structure aligning with 1h")
 
-        if score < self._min_watch_score or not reasons:
+        if score < min_score or not reasons:
             return None
+
+        # Cross-path dedup: consult scanner singleton's shared dedup dict so
+        # that StalkerEngine and scanner.stalker_scan don't both fire for the
+        # same symbol within the dedup TTL window.
+        setup_type = "pre_breakout"
+        dedup_key  = (symbol, setup_type)
+        now        = time.time()
+        try:
+            from scanner.scanner import scanner as _scanner_singleton
+            dedup     = _scanner_singleton._signal_dedup
+            dedup_ttl = _scanner_singleton._signal_dedup_ttl
+            if now - dedup.get(dedup_key, 0) < dedup_ttl:
+                return None
+            dedup[dedup_key] = now
+        except Exception:
+            pass   # Dedup unavailable — allow through rather than block
 
         return {
             'symbol':  symbol,
             'score':   score,
             'reasons': reasons,
+            'regime':  _regime,
         }
 
     async def process_result(self, result: Dict, publisher):
