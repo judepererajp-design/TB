@@ -47,12 +47,16 @@ def _gather_context(signal: Dict[str, Any], detail: Dict[str, Any]) -> Dict[str,
         current_price = float(price_cache.get(detail.get("symbol", "")) or 0.0)
     except Exception:
         current_price = 0.0
-    if current_price <= 0:
-        current_price = float(detail.get("expected_fill_mid") or zone_mid or entry_low or entry_high or 0.0)
+    # FIX: do NOT fall back to entry_low/zone_mid for current_price — that
+    # silently makes distance-to-zone = 0 and in_entry_zone = True, which
+    # misleads the AI reviewer and the rule-based fallback into "TAKE" verdicts
+    # when the live price is actually unknown. Record the staleness explicitly
+    # and let downstream consumers see current_price == 0.
+    price_is_live = current_price > 0
 
     distance_pct = 0.0
     in_entry_zone = False
-    if current_price > 0 and entry_low > 0 and entry_high > 0:
+    if price_is_live and entry_low > 0 and entry_high > 0:
         in_entry_zone = entry_low <= current_price <= entry_high
         if current_price < entry_low:
             distance_pct = ((entry_low - current_price) / entry_low) * 100
@@ -87,6 +91,7 @@ def _gather_context(signal: Dict[str, Any], detail: Dict[str, Any]) -> Dict[str,
 
     return {
         "current_price": current_price,
+        "price_is_live": price_is_live,
         "in_entry_zone": in_entry_zone,
         "distance_to_zone_pct": round(distance_pct, 2),
         "regime_now": regime_now,
@@ -95,8 +100,8 @@ def _gather_context(signal: Dict[str, Any], detail: Dict[str, Any]) -> Dict[str,
         "btc_weekly_bearish": btc_weekly_bearish,
         "btc_4h_bouncing": btc_4h_bouncing,
         "state": detail.get("exec_state") or signal.get("exec_state") or "WATCHING",
-        "reward_to_tp1_pct": round(((tp1 - current_price) / current_price) * 100, 2) if current_price > 0 and tp1 > 0 else None,
-        "risk_to_sl_pct": round((abs(current_price - stop_loss) / current_price) * 100, 2) if current_price > 0 and stop_loss > 0 else None,
+        "reward_to_tp1_pct": round(((tp1 - current_price) / current_price) * 100, 2) if price_is_live and tp1 > 0 else None,
+        "risk_to_sl_pct": round((abs(current_price - stop_loss) / current_price) * 100, 2) if price_is_live and stop_loss > 0 else None,
     }
 
 
@@ -110,7 +115,9 @@ def _build_inputs_used(detail: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str,
     ]
     market_inputs = [
         f"regime at decision {ctx.get('regime_now', 'UNKNOWN')}",
-        f"live price {ctx.get('current_price') or '—'} · state {ctx.get('state', 'WATCHING')}",
+        f"live price {ctx.get('current_price') or '—'} "
+        f"({'live' if ctx.get('price_is_live') else 'unavailable'}) "
+        f"· state {ctx.get('state', 'WATCHING')}",
         f"price is {'inside' if ctx.get('in_entry_zone') else 'outside'} entry zone",
         f"distance to zone {ctx.get('distance_to_zone_pct', 0)}%",
     ]
@@ -170,7 +177,7 @@ Session warning: {detail.get('session_warning')}
 
 === LIVE DECISION CONTEXT ===
 Exec state: {ctx.get('state')}
-Current price: {ctx.get('current_price')}
+Current price: {ctx.get('current_price')} (live={ctx.get('price_is_live')})
 Current regime: {ctx.get('regime_now')}
 Regime changed: {ctx.get('regime_changed')}
 In entry zone: {ctx.get('in_entry_zone')}
@@ -257,6 +264,10 @@ def _rule_based_fallback(detail: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[st
     if ctx.get("in_entry_zone"):
         strengths.append("Price is already inside the entry zone")
         score += 2
+    elif not ctx.get("price_is_live"):
+        # FIX: Without a live price we cannot verify entry-zone proximity.
+        # Penalise rather than award the "already in zone" bonus.
+        risks.append("Live price unavailable — cannot verify entry-zone proximity")
     elif ctx.get("distance_to_zone_pct", 0) <= 1:
         risks.append(f"Price is still {ctx.get('distance_to_zone_pct')}% away from entry")
     else:

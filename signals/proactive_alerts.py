@@ -174,7 +174,13 @@ class ProactiveAlertEngine:
         try:
             from analyzers.regime import regime_analyzer
             current_regime = getattr(regime_analyzer.regime, 'value', '') if regime_analyzer.regime else ''
+            # FIX: _panic_alerted is a one-shot per signal, but if the regime
+            # leaves VOLATILE_PANIC and re-enters later, the same signal should
+            # be re-alerted on the new episode. Clear the set whenever the
+            # regime is NOT in panic so the next entry starts fresh.
             if "VOLATILE_PANIC" not in current_regime:
+                if self._panic_alerted:
+                    self._panic_alerted.clear()
                 return
 
             from signals.outcome_monitor import outcome_monitor
@@ -324,11 +330,14 @@ class ProactiveAlertEngine:
                                 f"⚠️  Macro pressure flag activated for {_MACRO_PRESSURE_TTL//60}min "
                                 f"(BTC dropped {btc_chg_pct:.1f}%)"
                             )
+                            # FIX: tracked.max_r may be None for signals that
+                            # haven't yet reached any profit — defensively coerce.
+                            _peak_r = getattr(tracked, 'max_r', None) or 0.0
                             text = (
                                 f"₿ <b>BTC MACRO PRESSURE — {tracked.symbol}</b>\n\n"
                                 f"BTC dropped <b>{btc_chg_pct:.1f}%</b> while you hold an alt long.\n\n"
                                 f"Alt-BTC correlation during sharp drops: ~0.80\n"
-                                f"Your position peak: <b>{(tracked.max_r):+.2f}R</b>\n\n"
+                                f"Your position peak: <b>{_peak_r:+.2f}R</b>\n\n"
                                 f"<b>⚡ Suggested action: Target TP1 (<code>{tracked.tp1:.6g}</code>) "
                                 f"rather than waiting for TP2.</b>\n"
                                 f"BTC drops drag alts hard in the first 30–60 min. "
