@@ -353,8 +353,11 @@ class NewsScraper:
                             return
                         exc = t.exception()
                         if exc is not None:
+                            # Include the exception traceback via exc_info so
+                            # log consumers get a full stack, not just str(exc).
                             logger.warning(
-                                "btc_news_intelligence.process_headlines failed: %s", exc
+                                "btc_news_intelligence.process_headlines failed",
+                                exc_info=exc,
                             )
 
                     _bni_task.add_done_callback(_bni_done)

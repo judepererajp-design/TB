@@ -715,7 +715,10 @@ class BaseStrategy(ABC):
                     result["direction"] = _full.direction
             except Exception:
                 # Enrichment is best-effort — fall back to base result on any error.
-                logger.debug("parabolic_detector enrichment skipped", exc_info=False)
+                # Include traceback at debug so regressions in parabolic_detector
+                # are visible when debug logging is on without impacting the
+                # hot path at higher log levels.
+                logger.debug("parabolic_detector enrichment skipped", exc_info=True)
 
         return result
 
