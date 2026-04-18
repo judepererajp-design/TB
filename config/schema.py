@@ -187,6 +187,7 @@ class SystemConfig:
     max_symbols: int = 200
     log_max_bytes: int = 10_485_760
     log_backup_count: int = 5
+    invalidation_check_interval: int = 15
 
     def validate(self) -> List[str]:
         errors: List[str] = []
@@ -237,6 +238,15 @@ class SystemConfig:
         errors.extend(
             _check_range(sec, "log_max_bytes", self.log_max_bytes, MIN_LOG_BYTES, MAX_LOG_BYTES)
         )
+
+        # Invalidation monitor sweep period (seconds)
+        errors.extend(
+            _check_type(sec, "invalidation_check_interval", self.invalidation_check_interval, int)
+        )
+        if isinstance(self.invalidation_check_interval, int):
+            errors.extend(
+                _check_range(sec, "invalidation_check_interval", self.invalidation_check_interval, 1, 3600)
+            )
 
         return errors
 
@@ -289,6 +299,7 @@ class TelegramConfig:
     max_signals_per_hour: int = 12
     parse_mode: str = "HTML"
     send_signals: bool = True
+    min_signal_interval: int = 0
 
     def validate(self) -> List[str]:
         errors: List[str] = []
@@ -308,6 +319,15 @@ class TelegramConfig:
             errors.append(
                 f"{sec}.parse_mode='{self.parse_mode}' is not valid; "
                 f"expected one of {sorted(VALID_PARSE_MODES)}"
+            )
+
+        # Per-symbol publish cooldown (seconds). 0 disables the gate.
+        errors.extend(
+            _check_type(sec, "min_signal_interval", self.min_signal_interval, int)
+        )
+        if isinstance(self.min_signal_interval, int):
+            errors.extend(
+                _check_range(sec, "min_signal_interval", self.min_signal_interval, 0, 86_400)
             )
 
         return errors

@@ -43,6 +43,39 @@ class SignalPublisher:
         self._published_count = 0
         self._recent_publish_times: list = []  # V14: timestamps of recent publishes
         self._bot = None  # optional bot reference (lazy import used in publish)
+        # Per-symbol publish timestamps for the telegram.min_signal_interval gate.
+        # Maps symbol -> last successful publish time (unix seconds).
+        self._last_symbol_publish: Dict[str, float] = {}
+
+    @staticmethod
+    def _per_symbol_cooldown_secs() -> int:
+        """Return telegram.min_signal_interval in seconds (0 disables the gate)."""
+        try:
+            from config.loader import cfg
+            raw = cfg.telegram.get("min_signal_interval", 0)
+            val = int(raw)
+            return val if val > 0 else 0
+        except Exception:
+            return 0
+
+    def _is_symbol_cooldown(self, symbol: str, grade: str) -> tuple:
+        """Check the per-symbol cooldown gate.
+
+        Returns (blocked: bool, remaining_secs: int). A+ signals bypass
+        the cooldown (same policy as the burst throttle) so high-conviction
+        setups are never dropped by a lower-tier alert that fired seconds earlier.
+        """
+        cooldown = self._per_symbol_cooldown_secs()
+        if cooldown <= 0 or grade == "A+":
+            return False, 0
+        import time as _t
+        last = self._last_symbol_publish.get(symbol, 0.0)
+        if last <= 0:
+            return False, 0
+        elapsed = _t.time() - last
+        if elapsed >= cooldown:
+            return False, 0
+        return True, int(cooldown - elapsed)
 
     def set_bot(self, bot) -> None:
         """Accept bot reference for API compatibility with publisher.py shim.
@@ -96,9 +129,23 @@ class SignalPublisher:
         import time as _pub_time
         _now = _pub_time.time()
         _grade = getattr(alpha_score, 'grade', None) or "?"
+        _dir_str = getattr(signal.direction, 'value', str(signal.direction))
+
+        # Per-symbol cooldown (telegram.min_signal_interval). Prevents two back-to-back
+        # alerts on the same symbol (e.g. from different strategies scoring the same
+        # setup within seconds). A+ signals bypass (see _is_symbol_cooldown).
+        _sym_blocked, _sym_remain = self._is_symbol_cooldown(signal.symbol, _grade)
+        if _sym_blocked:
+            logger.info(
+                f"⏸️ Signal throttled (per-symbol): {signal.symbol} {_dir_str} "
+                f"grade={_grade} — last publish {_sym_remain}s ago "
+                f"(min_signal_interval={self._per_symbol_cooldown_secs()}s)"
+            )
+            return None
+
         if self._is_throttled(_grade):
             logger.info(
-                f"⏸️ Signal throttled: {signal.symbol} {getattr(signal.direction, 'value', str(signal.direction))} "
+                f"⏸️ Signal throttled: {signal.symbol} {_dir_str} "
                 f"grade={_grade} — {len(self._recent_publish_times)} signals in "
                 f"last {self.WINDOW_SECONDS//60}min (max {self.MAX_SIGNALS_PER_WINDOW})"
             )
@@ -175,6 +222,8 @@ class SignalPublisher:
 
         # FIX: record throttle slot only after confirmed successful publish
         self._recent_publish_times.append(_now)
+        # Track per-symbol publish time for the min_signal_interval gate.
+        self._last_symbol_publish[signal.symbol] = _now
 
         # ── 2. Update DB with message ID ──────────────────────
         try:

@@ -37,9 +37,37 @@ from core.price_cache import price_cache
 logger = logging.getLogger(__name__)
 
 
-# How often to check each pending signal (seconds)
-# Faster = catch invalidations sooner, but more API calls
-CHECK_INTERVAL = 15  # Was 30 — halved for faster invalidation triggers
+# How often to check each pending signal (seconds).
+# Faster = catch invalidations sooner, but more API calls.
+#
+# Operator override via settings.yaml:
+#   system.invalidation_check_interval: <seconds>
+# Falls back to the 15s default below when unset/invalid.
+_DEFAULT_CHECK_INTERVAL = 15
+
+
+def _load_check_interval() -> int:
+    """Read system.invalidation_check_interval from config, with safe fallback."""
+    try:
+        from config.loader import cfg
+        raw = cfg.system.get("invalidation_check_interval", _DEFAULT_CHECK_INTERVAL)
+        val = int(raw)
+        if val < 1:
+            logger.warning(
+                "system.invalidation_check_interval=%s is below minimum (1s); "
+                "using default %ss", raw, _DEFAULT_CHECK_INTERVAL,
+            )
+            return _DEFAULT_CHECK_INTERVAL
+        return val
+    except Exception as exc:
+        logger.debug(
+            "Could not read system.invalidation_check_interval (%s); "
+            "using default %ss", exc, _DEFAULT_CHECK_INTERVAL,
+        )
+        return _DEFAULT_CHECK_INTERVAL
+
+
+CHECK_INTERVAL = _load_check_interval()
 
 # Default timeout before a pending signal expires (seconds)
 DEFAULT_PENDING_TIMEOUT = 4 * 3600  # 4 hours

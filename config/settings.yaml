@@ -97,6 +97,11 @@ system:
   log_max_bytes: 10485760      # 10 MB per file before rotation
   log_backup_count: 5          # keep 5 rotated copies of each log
   pending_signal_timeout: 14400
+  # How often the invalidation monitor re-checks each pending signal
+  # (signals/invalidation_monitor.py). Lower = catch stop-hits and
+  # entry-fills sooner, at the cost of slightly more price-cache lookups.
+  # Min 1s, default 15s.
+  invalidation_check_interval: 15
 
 # ============================================================
 # EXCHANGE — Binance Perpetual Futures
@@ -152,6 +157,10 @@ telegram:
   send_startup_message: true
   send_error_alerts: true
   daily_summary_hour: 8
+  # Per-symbol publish cooldown in seconds. Prevents two back-to-back alerts on
+  # the same symbol (e.g. different strategies scoring the same setup). A+
+  # signals bypass this gate. Set to 0 to disable.
+  min_signal_interval: 60
   max_signals_per_hour: 12  # Matched aggregator increase
 
 # ============================================================
