@@ -450,6 +450,77 @@ class SignalAggregator:
         """
         self._check_day_rollover()  # FIX M5: reset daily counts at midnight
 
+        # ── -1. Infrastructure gates (exchange + stablecoin) ──────
+        # Cheapest possible early gates — no analyzer work happens until
+        # we know the underlying market data is trustworthy. Both gates
+        # fail-open on missing data and only block on confirmed UNHEALTHY.
+        try:
+            from signals.exchange_health import exchange_health as _eh
+            _eh_snap = _eh.check_health()
+            if _eh_snap.should_block:
+                logger.info(
+                    f"❌ Signal died (agg) | {signal.symbol} "
+                    f"{getattr(signal.direction, 'value', str(signal.direction))} "
+                    f"| reason=EXCHANGE_UNHEALTHY | {_eh_snap.reason}"
+                )
+                if _tl:
+                    _dir = getattr(signal.direction, 'value', str(signal.direction))
+                    _tl.signal(symbol=signal.symbol, direction=_dir, grade="?",
+                               confidence=signal.confidence,
+                               entry_low=signal.entry_low, entry_high=signal.entry_high,
+                               stop_loss=signal.stop_loss, tp1=signal.tp1, tp2=signal.tp2,
+                               rr=signal.rr_ratio, strategy=signal.strategy,
+                               regime="UNKNOWN",
+                               result=f"REJECTED(EXCHANGE_UNHEALTHY {_eh_snap.reason})")
+                try:
+                    from core.diagnostic_engine import diagnostic_engine
+                    diagnostic_engine.record_signal_death(
+                        symbol=signal.symbol,
+                        direction=getattr(signal.direction, 'value', str(signal.direction)),
+                        strategy=signal.strategy, kill_reason="EXCHANGE_UNHEALTHY",
+                        rr=getattr(signal, 'rr_ratio', 0.0),
+                        confidence=signal.confidence, regime="UNKNOWN",
+                        setup_class=getattr(signal, 'setup_class', 'intraday'),
+                    )
+                except Exception:
+                    pass
+                return None
+        except Exception as _eh_err:
+            logger.debug(f"exchange_health gate skipped: {_eh_err}")
+
+        try:
+            from signals.stablecoin_depeg import stablecoin_depeg_guard as _sd
+            if await _sd.should_block_symbol(signal.symbol):
+                logger.info(
+                    f"❌ Signal died (agg) | {signal.symbol} "
+                    f"{getattr(signal.direction, 'value', str(signal.direction))} "
+                    f"| reason=STABLECOIN_DEPEG"
+                )
+                if _tl:
+                    _dir = getattr(signal.direction, 'value', str(signal.direction))
+                    _tl.signal(symbol=signal.symbol, direction=_dir, grade="?",
+                               confidence=signal.confidence,
+                               entry_low=signal.entry_low, entry_high=signal.entry_high,
+                               stop_loss=signal.stop_loss, tp1=signal.tp1, tp2=signal.tp2,
+                               rr=signal.rr_ratio, strategy=signal.strategy,
+                               regime="UNKNOWN",
+                               result="REJECTED(STABLECOIN_DEPEG)")
+                try:
+                    from core.diagnostic_engine import diagnostic_engine
+                    diagnostic_engine.record_signal_death(
+                        symbol=signal.symbol,
+                        direction=getattr(signal.direction, 'value', str(signal.direction)),
+                        strategy=signal.strategy, kill_reason="STABLECOIN_DEPEG",
+                        rr=getattr(signal, 'rr_ratio', 0.0),
+                        confidence=signal.confidence, regime="UNKNOWN",
+                        setup_class=getattr(signal, 'setup_class', 'intraday'),
+                    )
+                except Exception:
+                    pass
+                return None
+        except Exception as _sd_err:
+            logger.debug(f"stablecoin_depeg gate skipped: {_sd_err}")
+
         # ── 0. Validate signal geometry + recompute R:R ──────
         # Never trust strategy math — recompute centrally using TP2 (primary target)
         entry_mid = (signal.entry_low + signal.entry_high) / 2
@@ -1383,6 +1454,25 @@ class SignalAggregator:
         regime_override = regime_analyzer.get_min_confidence_override()
         if regime_override:
             min_conf = min(max(min_conf, regime_override), 65)
+
+        # ── Post-commit regime hysteresis ─────────────────────
+        # For TRANSITION_HYSTERESIS_SECS after a committed regime flip,
+        # raise the min-confidence floor by TRANSITION_CONF_FLOOR_BUMP.
+        # The 2-cycle pre-commit confirmation in RegimeAnalyzer prevents
+        # flapping at the regime boundary, but the first 5–15 min after
+        # the flip see the worst fakeouts as price retests prior
+        # structure. Demand stronger setups in that window.
+        try:
+            from config.constants import RegimeHysteresis as _RH
+            if regime_analyzer.is_recently_transitioned(_RH.TRANSITION_HYSTERESIS_SECS):
+                _bumped = min_conf + _RH.TRANSITION_CONF_FLOOR_BUMP
+                logger.info(
+                    f"🌀 Regime hysteresis: min_conf {min_conf:.1f}→{_bumped:.1f} "
+                    f"(within {_RH.TRANSITION_HYSTERESIS_SECS}s of last regime flip)"
+                )
+                min_conf = _bumped
+        except Exception as _rh_err:
+            logger.debug(f"regime hysteresis bump skipped: {_rh_err}")
 
         # BUG-2 FIX: Only record scores that passed the AGG_THRESHOLD gate.
         # Previously appended BEFORE the gate, poisoning the adaptive floor percentile

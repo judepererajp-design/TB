@@ -637,6 +637,99 @@ class FundingIntegration:
 
 
 # ════════════════════════════════════════════════════════════════
+# 16b. EXCHANGE HEALTH GATE
+# ════════════════════════════════════════════════════════════════
+
+class ExchangeHealth:
+    """
+    Early gate that suppresses new signals when the exchange API is
+    misbehaving. During outages, REST tickers freeze for several
+    minutes — strategies that key off "current price" then trip
+    breakout triggers that immediately invalidate when the feed
+    catches up. Suppressing publication during these windows avoids
+    catastrophic stop-outs at the moment connectivity returns.
+
+    Health is sampled from ``data.api_client.api.get_request_stats()``
+    plus a rolling consecutive-failure counter incremented by the
+    aggregator before publish.
+    """
+
+    # Latency: avg latency over recent calls (ms). Above this and the
+    # exchange is "DEGRADED"; double this and it is "UNHEALTHY".
+    DEGRADED_AVG_LATENCY_MS: float = 3000.0
+    UNHEALTHY_AVG_LATENCY_MS: float = 8000.0
+
+    # Error rate: total_errors / total_requests for the lifetime of
+    # the api client. Above this we consider the API unstable.
+    DEGRADED_ERROR_RATE: float = 0.05    # 5 %
+    UNHEALTHY_ERROR_RATE: float = 0.15   # 15 %
+
+    # Consecutive-failure counter (incremented by the gate when
+    # api.is_healthy is False, reset when True). When this trips we
+    # block regardless of latency/error-rate.
+    UNHEALTHY_CONSEC_FAILS: int = 3
+
+    # After a recovery (api.is_healthy flips back to True), keep the
+    # gate "DEGRADED" for this many seconds so a single ticker recovery
+    # doesn't immediately re-open the floodgate while feeds are still
+    # stabilising.
+    RECOVERY_GRACE_SECS: int = 60
+
+
+# ════════════════════════════════════════════════════════════════
+# 16c. STABLECOIN DEPEG GUARD
+# ════════════════════════════════════════════════════════════════
+
+class StablecoinDepeg:
+    """
+    Reject signals quoted in a depegged stablecoin. When USDT trades
+    at 0.985 instead of 1.000, every USDT-denominated chart is biased
+    by ~150 bps — entries, stops and targets are all systematically
+    wrong, and "breakouts" are often just stable-coin re-pegging.
+
+    Thresholds are absolute distance from $1.00 in fraction terms,
+    so 0.005 = 50 bps. Fail-open: if no quote is available the gate
+    treats it as healthy (we should not block trading on a missing
+    sanity check).
+    """
+
+    # 50 bps wobble from $1.00 → DEGRADED (allow but log)
+    # 200 bps wobble → UNHEALTHY (block new signals)
+    DEGRADED_DEVIATION: float = 0.005
+    UNHEALTHY_DEVIATION: float = 0.020
+
+    # How long a fetched stablecoin price is reused before re-fetching.
+    PRICE_CACHE_SECS: int = 60
+
+    # Stablecoins to monitor. The aggregator checks the *quote* asset
+    # of each signal against this map.
+    MONITORED_QUOTES: tuple = ("USDT", "USDC", "DAI", "FDUSD", "TUSD")
+
+
+# ════════════════════════════════════════════════════════════════
+# 16d. REGIME-TRANSITION HYSTERESIS
+# ════════════════════════════════════════════════════════════════
+
+class RegimeHysteresis:
+    """
+    The 2-cycle confirmation in ``RegimeAnalyzer._update_regime`` is
+    a *pre-commit* hysteresis (don't flip until the next regime is
+    confirmed). It does NOT cover the post-commit case where the
+    bot has already switched regimes but the market has not yet
+    settled — the first 5–15 min after a regime flip see the worst
+    fakeouts as price re-tests the prior regime's structures.
+
+    This adds a *post-commit* hysteresis: for ``TRANSITION_HYSTERESIS_SECS``
+    after the regime flip is committed, the aggregator's min-confidence
+    floor is bumped by ``TRANSITION_CONF_FLOOR_BUMP`` points so only
+    very-high-quality setups publish during the noisy window.
+    """
+
+    TRANSITION_HYSTERESIS_SECS: int = 600         # 10 min
+    TRANSITION_CONF_FLOOR_BUMP: int = 5           # +5 pts on min_confidence
+
+
+# ════════════════════════════════════════════════════════════════
 # 17. ENRICHMENT PIPELINE (additive confidence guardrails)
 # ════════════════════════════════════════════════════════════════
 
