@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 
 
 # ── Hardcoded correlation map (symmetrical) ─────────────────────
+# Covers the top-4 majors where instantaneous pair correlation can be
+# assumed >0.5 without computing it. The broader "BTC-proxy" case for
+# alts is handled via correlation_analyzer.get_cached_correlation()
+# inside _correlation_filter below.
 
 _CORRELATION_MAP: Dict[Tuple[str, str], float] = {
     ("BTCUSDT", "ETHUSDT"): 0.85,
@@ -30,9 +34,39 @@ _CORRELATION_MAP: Dict[Tuple[str, str], float] = {
 
 
 def _pair_correlation(sym_a: str, sym_b: str) -> float:
-    """Return the known correlation between two symbols, or 0.0."""
+    """Return the known correlation between two symbols, or 0.0.
+
+    Lookup order:
+      1. Hardcoded major-pair map (instant, deterministic).
+      2. Cached BTC-correlation from correlation_analyzer for any pair
+         that involves BTC but isn't in the hardcoded map — this lets
+         long-tail alts fall under the same correlation gate as the
+         majors once their BTC-beta has been computed at least once.
+    """
     key = (sym_a, sym_b) if sym_a <= sym_b else (sym_b, sym_a)
-    return _CORRELATION_MAP.get(key, 0.0)
+    mapped = _CORRELATION_MAP.get(key, 0.0)
+    if mapped > 0.0:
+        return mapped
+    # Fallback: if exactly one side is BTC, use the cached alt→BTC correlation.
+    if "BTCUSDT" in key:
+        other = key[1] if key[0] == "BTCUSDT" else key[0]
+        try:
+            from analyzers.correlation import correlation_analyzer
+            return float(correlation_analyzer.get_cached_correlation(other))
+        except Exception:
+            return 0.0
+    return 0.0
+
+
+def _btc_correlation(symbol: str) -> float:
+    """Return |ρ| of this symbol vs. BTC from the correlation analyzer cache."""
+    if symbol == "BTCUSDT":
+        return 1.0
+    try:
+        from analyzers.correlation import correlation_analyzer
+        return abs(float(correlation_analyzer.get_cached_correlation(symbol)))
+    except Exception:
+        return 0.0
 
 
 # ── Core class ───────────────────────────────────────────────────
@@ -123,12 +157,31 @@ class SignalRanker:
         """Remove lower-ranked signals that are correlated with a
         higher-ranked signal in the same direction.
 
+        Runs two passes (both direction-aware):
+          1. Pairwise correlation — kills a lower-ranked signal if its
+             correlation with any already-kept same-direction signal
+             exceeds ``CORRELATION_THRESHOLD`` (hardcoded majors +
+             cached BTC-correlation fallback via _pair_correlation).
+          2. BTC-concentration cap — once more than
+             ``BTC_CONCENTRATION_MAX_SAME_SIDE`` kept signals on the
+             same side are each individually high-BTC-correlated
+             (≥ ``BTC_CONCENTRATION_CORR_THRESHOLD``), any further
+             same-side high-BTC-corr signal is treated as a redundant
+             "BTC proxy" and dropped. This catches the long-tail case
+             where the pairwise map misses (e.g. 3 altcoins each with
+             ρ≈0.75 to BTC but no pair is in the hardcoded table).
+
         The input list must already be sorted by rank (highest first).
         """
         kept: List[ScoredSignal] = []
+        # direction -> count of kept signals that are BTC-proxies on that side
+        btc_proxy_count: Dict[SignalDirection, int] = {}
+
         for sig in signals:
             sym = sig.base_signal.symbol
             direction = sig.base_signal.direction
+
+            # ── Pass 1: pairwise correlation ─────────────────
             is_correlated = False
             for accepted in kept:
                 if accepted.base_signal.direction != direction:
@@ -141,8 +194,29 @@ class SignalRanker:
                     )
                     is_correlated = True
                     break
-            if not is_correlated:
-                kept.append(sig)
+            if is_correlated:
+                continue
+
+            # ── Pass 2: BTC-concentration cap ─────────────────
+            # Count this signal as a BTC-proxy if its |ρ_BTC| clears
+            # the concentration threshold. BTCUSDT itself always
+            # counts. When more than MAX_SAME_SIDE proxies on the
+            # same direction are already kept, drop this one.
+            sym_btc_corr = _btc_correlation(sym)
+            is_btc_proxy = sym_btc_corr >= SignalRanking.BTC_CONCENTRATION_CORR_THRESHOLD
+            if is_btc_proxy and btc_proxy_count.get(direction, 0) >= \
+                    SignalRanking.BTC_CONCENTRATION_MAX_SAME_SIDE:
+                logger.info(
+                    f"🔗 Filtered {sym} (|ρ_BTC|={sym_btc_corr:.2f} — "
+                    f"BTC-concentration cap reached for "
+                    f"{getattr(direction, 'value', str(direction))})"
+                )
+                continue
+
+            kept.append(sig)
+            if is_btc_proxy:
+                btc_proxy_count[direction] = btc_proxy_count.get(direction, 0) + 1
+
         return kept
 
 

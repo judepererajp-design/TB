@@ -672,6 +672,50 @@ class SignalAggregator:
                 pass
             return None
 
+        # ── Fee-adjusted RR floor (cost-model gate) ───────────────
+        # The raw RR floor above does not subtract round-trip commission +
+        # slippage. For marginal setups (rr ≈ floor) that friction can flip
+        # a nominally-profitable trade into a net-losing one. Reject signals
+        # whose fee-adjusted reward does not at least cover their fee-adjusted
+        # risk (i.e. adjusted_rr < 1.0). Uses the same formula as
+        # ``utils.signal_guidance.fee_adjusted_rr`` for consistency with what
+        # the dashboard and Telegram formatter already expose to the user.
+        try:
+            from utils.signal_guidance import fee_adjusted_rr as _fee_rr
+            from config.constants import FeeModel as _FM
+            _adj_rr = _fee_rr(signal)
+            if _adj_rr is not None and _adj_rr < _FM.MIN_FEE_ADJUSTED_RR:
+                logger.info(
+                    f"❌ Signal died (agg) | {signal.symbol} "
+                    f"{getattr(signal.direction, 'value', str(signal.direction))} "
+                    f"| reason=FEE_ADJUSTED_RR | raw_rr={signal.rr_ratio:.2f} "
+                    f"adj_rr={_adj_rr:.2f} < {_FM.MIN_FEE_ADJUSTED_RR:.2f}"
+                )
+                if _tl:
+                    _dir = getattr(signal.direction, 'value', str(signal.direction))
+                    _rr_regime = getattr(regime_analyzer.regime, 'value', 'UNKNOWN')
+                    _tl.signal(symbol=signal.symbol, direction=_dir, grade="?",
+                               confidence=signal.confidence,
+                               entry_low=signal.entry_low, entry_high=signal.entry_high,
+                               stop_loss=signal.stop_loss, tp1=signal.tp1, tp2=signal.tp2,
+                               rr=signal.rr_ratio, strategy=signal.strategy, regime=_rr_regime,
+                               result=f"REJECTED(FEE_ADJUSTED_RR adj={_adj_rr:.2f}<{_FM.MIN_FEE_ADJUSTED_RR:.2f})")
+                try:
+                    from core.diagnostic_engine import diagnostic_engine
+                    diagnostic_engine.record_signal_death(
+                        symbol=signal.symbol,
+                        direction=getattr(signal.direction, 'value', str(signal.direction)),
+                        strategy=signal.strategy, kill_reason="FEE_ADJUSTED_RR",
+                        rr=signal.rr_ratio, confidence=signal.confidence,
+                        regime=self._agg_cfg.get('regime', 'UNKNOWN') if hasattr(self._agg_cfg, 'get') else 'UNKNOWN',
+                        setup_class=getattr(signal, 'setup_class', 'intraday'),
+                    )
+                except Exception:
+                    pass
+                return None
+        except Exception as _fee_err:
+            logger.debug(f"fee_adjusted_rr gate skipped: {_fee_err}")
+
         # ── 0b. Signal data validation ("Skeptical LLM Mode") ────────
         # Dual-layer defense: Layer A (programmatic hard checks) catches
         # impossible values; Layer B (LLM anomaly detection) catches

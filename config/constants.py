@@ -571,6 +571,15 @@ class SignalRanking:
     CORRELATION_THRESHOLD: float = 0.70   # Above this, filter correlated duplicates
     RR_NORMALIZATION_CAP: float = 5.0     # Cap RR at 5 for normalization
 
+    # ── BTC-concentration guard ───────────────────────────────────
+    # Most alts have ρ > 0.70 with BTC; the hardcoded 6-pair map only
+    # catches BTC/ETH/SOL/BNB. When the ranker admits 3 "independent"
+    # alts all correlated to BTC, a single BTC move drags them together.
+    # These thresholds feed the BTC-concentration filter added in
+    # signals/signal_ranker.py (same cycle, same direction).
+    BTC_CONCENTRATION_CORR_THRESHOLD: float = 0.70  # treat ρ_BTC≥this as BTC-proxy
+    BTC_CONCENTRATION_MAX_SAME_SIDE: int = 2         # 3rd same-side BTC-proxy is dropped
+
 
 # ════════════════════════════════════════════════════════════════
 # 15. SLIPPAGE TRACKING
@@ -584,6 +593,25 @@ class SlippageTracking:
     MAX_CONFIDENCE_REDUCTION: float = 0.10            # Never reduce more than 10%
     DEFAULT_WINDOW_HOURS: int = 24                    # Default lookback window
     NEUTRAL_THRESHOLD: float = 1e-4                   # ±0.01% — below this is "neutral" slippage
+
+
+class FeeModel:
+    """
+    Cost-model gate thresholds.
+
+    The aggregator's raw RR floor (``cfg_min_rr``) is calibrated in units of
+    entry→SL distance and does NOT subtract round-trip commission + slippage.
+    For a typical intraday setup with a 1.2R floor, round-trip friction of
+    ~0.14% translates to ~0.1–0.3R reduction, which can flip a 1.25R setup
+    into a net-losing trade. The ``fee_adjusted_rr`` helper already exists in
+    ``utils.signal_guidance`` — this constant set gives the aggregator a
+    canonical minimum below which a signal is rejected outright.
+    """
+
+    # A signal must clear this fee+slippage-adjusted RR floor or it is
+    # structurally incapable of covering its own costs. 1.0 = break-even
+    # after fees on reward vs. risk including cost adds to both sides.
+    MIN_FEE_ADJUSTED_RR: float = 1.0
 
 
 # ════════════════════════════════════════════════════════════════
@@ -601,6 +629,11 @@ class FundingIntegration:
     EXTREME_PENALTY_PTS: float = 15.0                 # Extreme funding opposition
     MAX_HISTORY_LENGTH: int = 24                      # 24 cycles (8h each on Binance)
     TREND_WINDOW: int = 3                             # Last 3 cycles for trend detection
+
+    # ── Funding accrual tracker (cumulative funding into PnL) ─────
+    # Binance perps pay funding every 8 hours. Accrued funding is
+    # cumulative rate * (hours_held / cycle_hours).
+    ACCRUAL_CYCLE_HOURS: float = 8.0                  # Binance perp default
 
 
 # ════════════════════════════════════════════════════════════════
