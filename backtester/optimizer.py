@@ -85,6 +85,7 @@ class ParameterOptimizer:
         min_trades: int = 20,
         fitness_fn: str = "sharpe_pf",   # "sharpe_pf" | "total_r" | "win_rate" | "profit_factor"
         max_combinations: int = 500,
+        seed: Optional[int] = None,
     ) -> OptimizerReport:
         """
         Run grid search optimization.
@@ -98,12 +99,13 @@ class ParameterOptimizer:
             min_trades: Minimum trades to consider a result valid
             fitness_fn: How to rank parameter combinations
             max_combinations: Cap on total combinations to test
+            seed: Optional seed for the local sampler so a sub-sampled grid
+                  is reproducible run-to-run.
 
         Returns:
             OptimizerReport with ranked results
         """
         from backtester.engine import backtest_engine
-        from backtester.data_loader import data_loader
 
         start_time = time.time()
 
@@ -112,12 +114,16 @@ class ParameterOptimizer:
         total = len(combinations)
 
         if total > max_combinations:
-            # Random sample if too many
+            # Random sample (reproducible if a seed is supplied) when the
+            # grid would otherwise blow past the cap.
             import random
-            combinations = random.sample(combinations, max_combinations)
+            rng = random.Random(seed) if seed is not None else random
+            combinations = rng.sample(combinations, max_combinations)
             logger.warning(
                 f"Parameter space too large ({total}). "
-                f"Sampling {max_combinations} combinations."
+                f"Sampling {max_combinations} combinations"
+                + (f" (seed={seed})" if seed is not None else "")
+                + "."
             )
 
         logger.info(
@@ -125,20 +131,28 @@ class ParameterOptimizer:
             f"{len(params)} parameters | {symbol}"
         )
 
-        # Split data into train/test
-        primary_tf = '1h' if '1h' in ohlcv_data else list(ohlcv_data.keys())[0]
-        candles = ohlcv_data[primary_tf]
-        split_idx = int(len(candles) * train_pct)
+        # ── Train/test split aligned across timeframes ──────────────────────
+        # FIX: previous version cut every timeframe at ``len*train_pct``
+        # *bars*, so a 4h test set could include candles whose timestamps
+        # straddled the 1h training cutoff (HTF leakage). We now anchor on
+        # the primary timeframe's split timestamp and partition every other
+        # TF strictly by that timestamp.
+        primary_tf = '1h' if '1h' in ohlcv_data else next(iter(ohlcv_data))
+        primary_candles = ohlcv_data[primary_tf]
+        if not primary_candles:
+            logger.error("No primary-timeframe data; cannot optimize.")
+            return OptimizerReport(parameter_specs=params, total_combinations=0, total_time_seconds=0.0)
 
-        train_data = {}
-        test_data = {}
+        split_idx = max(0, min(len(primary_candles) - 1, int(len(primary_candles) * train_pct)))
+        split_ts = primary_candles[split_idx][0]
+
+        train_data: Dict[str, List] = {}
+        test_data: Dict[str, List] = {}
         for tf, tf_candles in ohlcv_data.items():
-            # Find split point by timestamp
-            split_ts = candles[split_idx][0]
-            train_data[tf] = [c for c in tf_candles if c[0] <= split_ts]
-            test_data[tf] = [c for c in tf_candles if c[0] > split_ts]
+            train_data[tf] = [c for c in tf_candles if c[0] <  split_ts]
+            test_data[tf]  = [c for c in tf_candles if c[0] >= split_ts]
 
-        results = []
+        results: List[OptimizationResult] = []
 
         for i, combo in enumerate(combinations):
             if (i + 1) % 10 == 0:
@@ -170,19 +184,41 @@ class ParameterOptimizer:
                     config_overrides=param_dict,
                 )
 
-                # Calculate fitness
+                # Calculate fitness (OOS-only — never falls back to IS)
                 fitness = self._calculate_fitness(
                     train_result, test_result, fitness_fn
                 )
 
-                # Check for overfitting
+                # ── Multi-axis overfitting detection ───────────────────────
+                # FIX: previous version flagged only when WR decayed > 30%.
+                # In crypto a strategy can keep WR but lose all of its edge
+                # via lower PF / negative Sharpe. We now penalise on the
+                # weakest of WR, Sharpe and PF decay; severe failure
+                # (Sharpe decay > 70% or OOS PF < 1.0) zeros fitness so
+                # the rank-by-fitness sort can't accidentally promote a
+                # curve-fit set.
                 is_overfit = False
-                if test_result.total_trades >= 5:
-                    train_wr = train_result.win_rate
-                    test_wr = test_result.win_rate
-                    if train_wr > 0 and (train_wr - test_wr) / train_wr > 0.3:
+                if test_result and test_result.total_trades >= 5:
+                    decays = []
+                    if train_result.win_rate > 0:
+                        decays.append((train_result.win_rate - test_result.win_rate)
+                                      / train_result.win_rate)
+                    if train_result.sharpe_ratio > 0:
+                        decays.append((train_result.sharpe_ratio - test_result.sharpe_ratio)
+                                      / train_result.sharpe_ratio)
+                    if train_result.profit_factor > 0:
+                        decays.append((train_result.profit_factor - test_result.profit_factor)
+                                      / train_result.profit_factor)
+
+                    worst_decay = max(decays) if decays else 0.0
+                    if worst_decay > 0.3:
                         is_overfit = True
-                        fitness *= 0.5  # Heavy penalty
+                        # 30→70% decay band: scale 0.5 → 0.0
+                        scale = max(0.0, 1.0 - (worst_decay - 0.3) / 0.4) * 0.5
+                        fitness *= scale
+                    if worst_decay > 0.7 or test_result.profit_factor < 1.0:
+                        is_overfit = True
+                        fitness = 0.0
 
                 results.append(OptimizationResult(
                     params=param_dict,

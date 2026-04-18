@@ -20,12 +20,25 @@ import os
 import json
 import csv
 import logging
+import re
 from typing import Dict, List, Optional
 from datetime import datetime, timezone
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+# Cross-platform filename sanitiser. Replaces every character that isn't
+# alphanumeric / dash / underscore / dot with an underscore so trading pairs
+# like ``BTC/USDT:USDT`` (which appear under CCXT's unified symbology) don't
+# create directory traversal artefacts or fail on Windows where ``:`` and
+# ``\`` are reserved.
+_FILENAME_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _safe_name(s: str) -> str:
+    return _FILENAME_UNSAFE.sub("_", str(s)).strip("_") or "report"
 
 
 class BacktestReporter:
@@ -107,8 +120,13 @@ class BacktestReporter:
             lines.append("")
 
         # ── Equity Curve Summary ──────────────────────────────
+        # FIX: previously included EXPIRED trades (filter ``outcome != "PENDING"``)
+        # which used a mark-to-market pnl_r — that mismatched the headline
+        # metrics block above (which excludes EXPIRED) and made the
+        # sparkline tell a different story than the numbers next to it.
         if result.trades:
-            r_values = [t.pnl_r for t in result.trades if t.outcome != "PENDING"]
+            r_values = [t.pnl_r for t in result.trades
+                        if t.outcome in ("WIN", "LOSS", "BE")]
             if r_values:
                 cumulative = np.cumsum(r_values)
                 lines.append("📉 EQUITY CURVE (R)")
@@ -160,8 +178,12 @@ class BacktestReporter:
     def save_csv(self, result, filename: str = None) -> str:
         """Save trade list to CSV"""
         if not filename:
-            sym = result.symbol.replace("/", "_")
-            filename = f"backtest_{sym}_{result.start_date}_{result.end_date}.csv"
+            sym = _safe_name(result.symbol)
+            sd  = _safe_name(result.start_date)
+            ed  = _safe_name(result.end_date)
+            filename = f"backtest_{sym}_{sd}_{ed}.csv"
+        else:
+            filename = _safe_name(filename)
 
         path = os.path.join(self.output_dir, filename)
 
@@ -188,10 +210,19 @@ class BacktestReporter:
     def save_json(self, result, filename: str = None) -> str:
         """Save full results to JSON"""
         if not filename:
-            sym = result.symbol.replace("/", "_")
-            filename = f"backtest_{sym}_{result.start_date}_{result.end_date}.json"
+            sym = _safe_name(result.symbol)
+            sd  = _safe_name(result.start_date)
+            ed  = _safe_name(result.end_date)
+            filename = f"backtest_{sym}_{sd}_{ed}.json"
+        else:
+            filename = _safe_name(filename)
 
         path = os.path.join(self.output_dir, filename)
+
+        # `profit_factor` may be inf when there are zero losses — JSON cannot
+        # serialise inf, so convert to a sentinel string in that case.
+        pf = result.profit_factor
+        pf_serial = None if pf in (float('inf'), float('-inf')) else round(pf, 3)
 
         data = {
             'symbol': result.symbol,
@@ -201,6 +232,7 @@ class BacktestReporter:
             'summary': {
                 'total_signals': result.total_signals,
                 'total_trades': result.total_trades,
+                'invalidated_signals': getattr(result, 'invalidated_signals', 0),
                 'wins': result.wins,
                 'losses': result.losses,
                 'breakevens': result.breakevens,
@@ -208,18 +240,30 @@ class BacktestReporter:
                 'win_rate': round(result.win_rate, 2),
                 'avg_r': round(result.avg_r, 3),
                 'total_r': round(result.total_r, 2),
-                'profit_factor': round(result.profit_factor, 3),
+                'profit_factor': pf_serial,
                 'sharpe_ratio': round(result.sharpe_ratio, 3),
+                # FIX: previously omitted from JSON summary even though
+                # console / markdown reports already published them.
+                'sortino_ratio': round(getattr(result, 'sortino_ratio', 0.0) or 0.0, 3),
+                'calmar_ratio':  round(getattr(result, 'calmar_ratio',  0.0) or 0.0, 3),
+                'avg_mae_r':     round(getattr(result, 'avg_mae_r', 0.0) or 0.0, 3),
+                'avg_mfe_r':     round(getattr(result, 'avg_mfe_r', 0.0) or 0.0, 3),
+                'avg_bars_to_outcome': round(getattr(result, 'avg_bars_to_outcome', 0.0) or 0.0, 2),
                 'max_drawdown_r': round(result.max_drawdown_r, 2),
                 'max_consecutive_wins': result.max_consecutive_wins,
                 'max_consecutive_losses': result.max_consecutive_losses,
                 'buy_and_hold_r': round(getattr(result, 'buy_and_hold_r', 0.0), 2),
                 'alpha_vs_bah': round(result.total_r - getattr(result, 'buy_and_hold_r', 0.0), 2),
                 'monte_carlo': getattr(result, 'monte_carlo', {}),
+                'grade': self._calculate_grade(result),
             },
             'strategy_breakdown': {
                 k: {kk: round(vv, 3) if isinstance(vv, float) else vv for kk, vv in v.items()}
                 for k, v in result.strategy_breakdown.items()
+            },
+            'regime_breakdown': {
+                k: {kk: round(vv, 3) if isinstance(vv, float) else vv for kk, vv in v.items()}
+                for k, v in getattr(result, 'regime_breakdown', {}).items()
             },
             'trades': [
                 {
@@ -245,8 +289,12 @@ class BacktestReporter:
     def save_markdown(self, result, filename: str = None) -> str:
         """Save a Markdown report"""
         if not filename:
-            sym = result.symbol.replace("/", "_")
-            filename = f"backtest_{sym}_{result.start_date}_{result.end_date}.md"
+            sym = _safe_name(result.symbol)
+            sd  = _safe_name(result.start_date)
+            ed  = _safe_name(result.end_date)
+            filename = f"backtest_{sym}_{sd}_{ed}.md"
+        else:
+            filename = _safe_name(filename)
 
         path = os.path.join(self.output_dir, filename)
 
@@ -317,10 +365,15 @@ class BacktestReporter:
         logger.info(f"Markdown saved: {path}")
         return path
 
-    def compare_runs(self, results: List, labels: List[str] = None) -> str:
+    def compare_runs(self, results: List, labels: List[str] = None,
+                     print_output: bool = True) -> str:
         """
         Compare multiple backtest runs side by side.
         Useful for optimizer output.
+
+        ``print_output`` defaults to True for backward compatibility; set to
+        False to obtain the formatted comparison without writing to stdout
+        (useful in tests / programmatic callers).
         """
         if not results:
             return ""
@@ -346,6 +399,8 @@ class BacktestReporter:
             ('Avg R', lambda r: f"{r.avg_r:+.2f}R"),
             ('Profit Factor', lambda r: f"{r.profit_factor:.2f}"),
             ('Sharpe', lambda r: f"{r.sharpe_ratio:.2f}"),
+            ('Sortino', lambda r: f"{getattr(r, 'sortino_ratio', 0.0):.2f}"),
+            ('Calmar', lambda r: f"{getattr(r, 'calmar_ratio', 0.0):.2f}"),
             ('Max DD', lambda r: f"{r.max_drawdown_r:.1f}R"),
             ('Trades', lambda r: f"{r.total_trades}"),
             ('Max Win Streak', lambda r: f"{r.max_consecutive_wins}"),
@@ -360,11 +415,23 @@ class BacktestReporter:
 
         lines.append("")
         report = "\n".join(lines)
-        print(report)
+        if print_output:
+            print(report)
         return report
 
     def _calculate_grade(self, result) -> str:
-        """Grade the backtest result"""
+        """Grade the backtest result.
+
+        FIX: the previous scoring scale could award A+ to a strategy with
+        negative ``total_r`` (e.g. one good MC tail + high WR + high Sortino).
+        We now require positive ``total_r`` AND positive ``avg_r`` for any
+        positive grade, and cap A+/A on the size of the worst drawdown so
+        a 30R-drawdown strategy can never grade A+ regardless of Sharpe.
+        """
+        # Hard floor — losing strategies cannot grade above D.
+        if result.total_r <= 0 or result.avg_r <= 0:
+            return "🔴 D (Poor — Do Not Trade)"
+
         score = 0
 
         # Win rate contribution
@@ -375,12 +442,13 @@ class BacktestReporter:
         elif result.win_rate >= 50:
             score += 1
 
-        # Profit factor
-        if result.profit_factor >= 2.0:
+        # Profit factor (cap inf)
+        pf = result.profit_factor if result.profit_factor != float('inf') else 5.0
+        if pf >= 2.0:
             score += 3
-        elif result.profit_factor >= 1.5:
+        elif pf >= 1.5:
             score += 2
-        elif result.profit_factor >= 1.2:
+        elif pf >= 1.2:
             score += 1
 
         # Average R
@@ -402,14 +470,22 @@ class BacktestReporter:
             score += 1
 
         # Sortino bonus — rewards strategies with low downside deviation
-        if result.sortino_ratio >= 2.5:
+        sortino = getattr(result, 'sortino_ratio', 0.0) or 0.0
+        if sortino >= 2.5:
             score += 2
-        elif result.sortino_ratio >= 1.5:
+        elif sortino >= 1.5:
             score += 1
 
         # Calmar penalty — penalise high-drawdown strategies regardless of Sharpe
-        if result.calmar_ratio > 0 and result.calmar_ratio < 0.5:
+        calmar = getattr(result, 'calmar_ratio', 0.0) or 0.0
+        if 0 < calmar < 0.5:
             score -= 1  # Return not worth the drawdown
+
+        # Hard caps so headline grade reflects true tradeability.
+        if result.max_drawdown_r > 15 and score >= 9:
+            score = 8        # cap at A
+        if result.max_drawdown_r > 25 and score >= 7:
+            score = 6        # cap at B+
 
         if score >= 9:
             return "⭐ A+ (Exceptional)"

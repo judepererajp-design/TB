@@ -101,8 +101,9 @@ class BacktestResult:
     end_date: str
 
     # Overall
-    total_signals: int = 0
-    total_trades: int = 0       # Signals where price reached entry zone
+    total_signals: int = 0      # Filled trades (any non-PENDING outcome)
+    total_trades: int = 0       # Decided trades (WIN | LOSS | BE)
+    invalidated_signals: int = 0  # Signals stopped out before entry was reached
     wins: int = 0
     losses: int = 0
     breakevens: int = 0
@@ -209,41 +210,67 @@ class BacktestEngine:
 
         try:
             if oos_split > 0:
-                # Split each timeframe's candles into IS and OOS windows
-                is_data  = {}
-                oos_data = {}
-                for tf, candles in ohlcv_data.items():
-                    split_idx = max(window_size + max_hold_bars,
-                                    int(len(candles) * (1 - oos_split)))
-                    is_data[tf]  = candles[:split_idx]
-                    oos_data[tf] = candles[split_idx:]
+                # Split each timeframe by *timestamp* (not by per-TF bar count)
+                # so IS/OOS boundaries align across timeframes. The previous
+                # implementation cut every TF at ``len*(1-oos_split)`` which
+                # let HTF data leak from OOS into IS whenever bar densities
+                # differed (e.g. a 4h IS slice could contain bars that
+                # closed *after* the 1h IS cutoff).
+                primary_tf = '1h' if '1h' in ohlcv_data else next(iter(ohlcv_data))
+                primary_candles = ohlcv_data[primary_tf]
+                if len(primary_candles) < window_size + max_hold_bars + 10:
+                    # Not enough data to OOS-split sensibly — fall through to
+                    # a single-window run rather than producing a stub OOS
+                    # slice that violates min-trade thresholds downstream.
+                    logger.warning(
+                        "OOS split requested but %s primary timeframe has only %d bars; "
+                        "running without OOS hold-out.",
+                        primary_tf, len(primary_candles),
+                    )
+                    result = await self._execute(
+                        symbol, ohlcv_data, strategies,
+                        window_size, max_hold_bars, system_backtest=system_backtest,
+                    )
+                else:
+                    primary_split_idx = max(
+                        window_size + max_hold_bars,
+                        int(len(primary_candles) * (1 - oos_split)),
+                    )
+                    split_ts = primary_candles[primary_split_idx][0]
 
-                is_result  = await self._execute(symbol, is_data,  strategies, window_size, max_hold_bars, system_backtest=system_backtest)
-                oos_result = await self._execute(symbol, oos_data, strategies, window_size, max_hold_bars, system_backtest=system_backtest)
+                    is_data: Dict[str, List] = {}
+                    oos_data: Dict[str, List] = {}
+                    for tf, candles in ohlcv_data.items():
+                        is_data[tf]  = [c for c in candles if c[0] <  split_ts]
+                        oos_data[tf] = [c for c in candles if c[0] >= split_ts]
 
-                _is_first_tf  = next(iter(is_data),  '1h')
-                _oos_first_tf = next(iter(oos_data), '1h')
-                logger.info(
-                    f"IS/OOS split: IS={len(is_data.get('1h', is_data.get(_is_first_tf, [])))} bars "
-                    f"({(1-oos_split)*100:.0f}%) | "
-                    f"OOS={len(oos_data.get('1h', oos_data.get(_oos_first_tf, [])))} bars "
-                    f"({oos_split*100:.0f}%) | "
-                    f"IS avg_r={is_result.avg_r:+.3f} OOS avg_r={oos_result.avg_r:+.3f}"
-                )
+                    is_result  = await self._execute(symbol, is_data,  strategies, window_size, max_hold_bars, system_backtest=system_backtest)
+                    oos_result = await self._execute(symbol, oos_data, strategies, window_size, max_hold_bars, system_backtest=system_backtest)
 
-                # Overfitting flag: if IS Sharpe > 2× OOS Sharpe, raise a warning
-                if is_result.sharpe_ratio > 0 and oos_result.sharpe_ratio > 0:
-                    decay = oos_result.sharpe_ratio / is_result.sharpe_ratio
-                    if decay < 0.5:
-                        logger.warning(
-                            f"⚠️ Overfitting signal: IS Sharpe={is_result.sharpe_ratio:.2f} "
-                            f"decays to OOS Sharpe={oos_result.sharpe_ratio:.2f} "
-                            f"(decay={decay:.2f} — strategies may be curve-fit)"
-                        )
+                    logger.info(
+                        f"IS/OOS split @ts={split_ts}: "
+                        f"IS={len(is_data[primary_tf])} bars ({(1-oos_split)*100:.0f}%) | "
+                        f"OOS={len(oos_data[primary_tf])} bars ({oos_split*100:.0f}%) | "
+                        f"IS avg_r={is_result.avg_r:+.3f} OOS avg_r={oos_result.avg_r:+.3f}"
+                    )
 
-                result = {"in_sample": is_result, "out_of_sample": oos_result,
-                          "oos_split": oos_split,
-                          "overfitting_decay": round(oos_result.sharpe_ratio / max(0.01, is_result.sharpe_ratio), 3)}
+                    # Overfitting flag: compare Sharpe decay (more reliable than WR)
+                    decay = None
+                    if is_result.sharpe_ratio > 0 and oos_result.sharpe_ratio > 0:
+                        decay = oos_result.sharpe_ratio / is_result.sharpe_ratio
+                        if decay < 0.5:
+                            logger.warning(
+                                f"⚠️ Overfitting signal: IS Sharpe={is_result.sharpe_ratio:.2f} "
+                                f"decays to OOS Sharpe={oos_result.sharpe_ratio:.2f} "
+                                f"(decay={decay:.2f} — strategies may be curve-fit)"
+                            )
+
+                    result = {
+                        "in_sample": is_result,
+                        "out_of_sample": oos_result,
+                        "oos_split": oos_split,
+                        "overfitting_decay": round(decay, 3) if decay is not None else None,
+                    }
             else:
                 result = await self._execute(symbol, ohlcv_data, strategies,
                                              window_size, max_hold_bars, system_backtest=system_backtest)
@@ -449,10 +476,24 @@ class BacktestEngine:
                             _w = window_dict.get(primary_tf, [])
                             if len(_w) >= BTC.MIN_SAMPLE_SIZE:
                                 _cls = [c[4] for c in _w[-20:]]
+                                _highs = [c[2] for c in _w[-20:]]
+                                _lows  = [c[3] for c in _w[-20:]]
                                 _sma20 = sum(_cls) / 20
                                 _sma5 = sum(_cls[-5:]) / 5
-                                _high_low_rng = max(c[2] for c in _w[-20:]) - min(c[3] for c in _w[-20:])
-                                _atr20 = _high_low_rng / 20
+                                # FIX: real ATR — mean of per-bar true ranges.
+                                # The previous (max-min)/20 collapsed to one
+                                # range-divided-by-20 figure that hugely under-
+                                # stated volatility, so VOLATILE was almost
+                                # never tagged in choppy crypto markets.
+                                _trs = [
+                                    max(
+                                        _highs[k] - _lows[k],
+                                        abs(_highs[k] - _cls[k - 1]) if k > 0 else 0.0,
+                                        abs(_lows[k]  - _cls[k - 1]) if k > 0 else 0.0,
+                                    )
+                                    for k in range(len(_cls))
+                                ]
+                                _atr20 = sum(_trs) / max(1, len(_trs))
                                 _chg = (_cls[-1] - _cls[0]) / _cls[0] if _cls[0] else 0
                                 if _cls[-1] > 0 and _atr20 / _cls[-1] > BTC.HIGH_VOLATILITY_THRESHOLD:
                                     trade.regime_at_signal = 'VOLATILE'
@@ -482,26 +523,27 @@ class BacktestEngine:
             symbol, primary_tf, all_trades, start_ts, end_ts
         )
 
-        # Buy-and-hold benchmark: what 1R of capital would return if held from start to end.
-        # Expressed in R-multiples using the average stop distance across all traded signals.
+        # Buy-and-hold benchmark in R-multiples.
+        #
+        # FIX: previously the "no traded signal" and "no valid risk" branches
+        # silently relabeled raw percent return as R (multiplying by 100),
+        # producing wildly inflated B&H comparisons (e.g. a 5% market move
+        # showed up as +500R alpha). When we cannot translate the move into
+        # comparable R-units we now report 0.0 and document why, so the
+        # console/markdown reports don't lie.
         try:
             start_close = float(candles[window_size][4])
             end_close = float(candles[-1][4])
             if start_close > 0:
                 bah_pct = (end_close - start_close) / start_close
-                # Normalise to R: use mean stop distance across traded signals if available
-                if result.trades:
-                    valid_risk = [
-                        abs(t.entry_price - t.stop_loss) / max(t.entry_price, 1e-10)
-                        for t in result.trades if t.entry_price > 0 and t.stop_loss > 0
-                    ]
-                    if valid_risk:
-                        avg_risk_pct = float(np.mean(valid_risk))
-                        result.buy_and_hold_r = round(bah_pct / avg_risk_pct, 2) if avg_risk_pct > 0 else 0.0
-                    else:
-                        result.buy_and_hold_r = round(bah_pct * 100, 2)
-                else:
-                    result.buy_and_hold_r = round(bah_pct * 100, 2)  # fallback: straight % × 100
+                valid_risk = [
+                    abs(t.entry_price - t.stop_loss) / max(t.entry_price, 1e-10)
+                    for t in result.trades if t.entry_price > 0 and t.stop_loss > 0
+                ]
+                if valid_risk:
+                    avg_risk_pct = float(np.mean(valid_risk))
+                    if avg_risk_pct > 0:
+                        result.buy_and_hold_r = round(bah_pct / avg_risk_pct, 2)
         except Exception:
             pass
 
@@ -535,10 +577,28 @@ class BacktestEngine:
         Simulate a trade by checking future bars.
 
         Logic:
-        1. Wait for price to enter entry zone (PENDING → ACTIVE)
-        2. Once active, check TP1/TP2/SL hits
-        3. After TP1, move SL to breakeven
-        4. Expire after max_hold_bars
+          1. Wait for price to enter entry zone (PENDING → ACTIVE).
+          2. Once active, check TP1 / TP2 / SL hits per bar.
+          3. After TP1, move SL to breakeven (50% closed at TP1).
+          4. Expire after ``max_hold_bars`` if neither TP nor SL is hit.
+
+        P&L (FIXED — no slippage double-count, all paths use ``actual_entry``):
+          * ``actual_entry`` already incorporates one leg of slippage in the
+            adverse direction. ``friction_r`` is therefore *commission only*
+            (round-trip) — slippage on the exit is folded into the exit price
+            we book against. This corrects the previous behaviour which
+            charged slippage in both ``actual_entry`` AND ``friction_r``,
+            i.e. counted it twice on every winning leg and roughly twice on
+            every loss as well.
+          * LOSS pnl_r is computed from ``actual_entry`` rather than hard-
+            coded to ``-1.0`` so the (small) extra slippage embedded in the
+            fill is reflected. In LONG, ``actual_entry`` > ``entry_mid``, so
+            an SL hit is slightly worse than -1R; reverse for SHORT.
+          * Same-bar TP1+SL: when a single bar wicks through both the SL and
+            TP1, we now favour the TP1-first-then-BE outcome (i.e. the trade
+            books a partial at TP1 and stops out flat) rather than booking
+            a full -1R loss. This reflects the realistic outcome under a
+            tracking algorithm that monitors TP1 inside the bar.
         """
         direction = getattr(signal.direction, 'value', str(signal.direction))
         entry_low = signal.entry_low
@@ -549,23 +609,36 @@ class BacktestEngine:
         tp2 = signal.tp2
         tp3 = signal.tp3
 
-        risk = abs(entry_mid - stop_loss)
-        if risk == 0:
+        # Risk uses the *actual* fill price so that losses correctly bake in
+        # entry slippage rather than being normalised to a flat -1R.
+        if direction == "LONG":
+            actual_entry = entry_mid * (1.0 + self.slippage_pct)
+        else:
+            actual_entry = entry_mid * (1.0 - self.slippage_pct)
+
+        risk = abs(actual_entry - stop_loss)
+        if risk <= 0:
             return None
 
-        # FIX #10: Compute round-trip friction cost in R-equivalent
-        # Entry slippage: price moves against us on fill
-        # Exit slippage: same on close
-        # Commission: charged on both sides
-        entry_slip  = entry_mid * (self.slippage_pct + self.commission_pct)
-        exit_slip   = entry_mid * (self.slippage_pct + self.commission_pct)
-        friction_r  = (entry_slip + exit_slip) / risk if risk > 0 else 0.0
+        # FIX #10 (revised): friction is *round-trip commission* expressed in
+        # R-multiples. Slippage on the exit is applied directly to the exit
+        # price we mark against, not added to friction_r as well.
+        commission_r = (2.0 * self.commission_pct * actual_entry) / risk
+        slip_pct = self.slippage_pct
 
-        # Adjust effective entry price for slippage direction
-        if direction == "LONG":
-            actual_entry = entry_mid + entry_mid * self.slippage_pct
-        else:
-            actual_entry = entry_mid - entry_mid * self.slippage_pct
+        def _exit_price_long(intent: float, side: str) -> float:
+            """Long exits suffer downside slippage on both wins and losses."""
+            return intent * (1.0 - slip_pct) if side == "TP" else intent * (1.0 - slip_pct)
+
+        def _exit_price_short(intent: float, side: str) -> float:
+            """Short exits suffer upside slippage."""
+            return intent * (1.0 + slip_pct)
+
+        def _r_long(exit_px: float) -> float:
+            return (exit_px - actual_entry) / risk - commission_r
+
+        def _r_short(exit_px: float) -> float:
+            return (actual_entry - exit_px) / risk - commission_r
 
         trade = BacktestTrade(
             signal_idx=signal_idx,
@@ -606,102 +679,141 @@ class BacktestEngine:
                     continue
                 # Check for invalidation (SL hit before entry)
                 if direction == "LONG" and low <= stop_loss:
-                    # Invalidated — don't count as trade
-                    return None
+                    return None  # invalidated, never filled
                 if direction == "SHORT" and high >= stop_loss:
                     return None
                 continue
 
             bars_since_entry = future_idx - entry_bar
 
-            # Phase 2: Trade is active — check SL and TPs
-            # FIX #10: All pnl_r values deducted by friction_r (round-trip costs).
-            # FIX #11: On bars where both SL and TP are touched, we use SL-first.
-            # In crypto perpetuals, wicks typically extend to SL before recovery.
-            # This is the conservative assumption validated by tick-data studies.
+            # Phase 2: Trade is active.
+            #
+            # Order of checks within a single bar matters:
+            #   * If the bar wicks through TP1 *and* SL we assume realistic
+            #     behaviour: TP1 books a partial close, the stop is moved to
+            #     breakeven, and the same bar's adverse wick then closes the
+            #     remainder at BE (not -1R).
+            #   * If only SL is touched (no TP1), we book a full loss using
+            #     ``actual_entry`` so slippage shows up.
             if direction == "LONG":
-                # Check SL first (more conservative — wicks hit SL before recovery)
-                if low <= be_stop:
-                    if tp1_hit:
-                        trade.outcome = "BE"
-                        trade.exit_price = be_stop
-                        trade.pnl_r = 0.0 - friction_r  # BE still costs commission
-                    else:
-                        trade.outcome = "LOSS"
-                        trade.exit_price = stop_loss
-                        trade.pnl_r = -1.0 - friction_r
-                    trade.bars_to_outcome = bars_since_entry
-                    trade.exit_bar_idx = future_idx
-                    return trade
+                tp1_touched_now = (not tp1_hit) and (high >= tp1)
+                tp2_touched_now = high >= tp2
+                sl_touched_now = low <= be_stop
 
-                # Check TP2 (main target)
-                if high >= tp2:
-                    trade.outcome = "WIN"
-                    trade.exit_price = tp2
-                    # BUG-NEW-6 FIX: account for TP1 partial close.
-                    # If TP1 was hit, 50% was already closed at TP1 price.
-                    # Remaining 50% closes at TP2. Weighted avg = realistic live R.
-                    if tp1_hit:
-                        tp1_r_val = abs(tp1 - actual_entry) / risk - friction_r
-                        tp2_r_val = abs(tp2 - actual_entry) / risk - friction_r
-                        trade.pnl_r = 0.5 * tp1_r_val + 0.5 * tp2_r_val
-                    else:
-                        trade.pnl_r = abs(tp2 - actual_entry) / risk - friction_r
-                    trade.bars_to_outcome = bars_since_entry
-                    trade.exit_bar_idx = future_idx
-                    return trade
-
-                # Check TP1 → move to breakeven, record partial
-                if not tp1_hit and high >= tp1:
+                # 1. Same-bar TP1 first if both TP1 and SL trip on this bar
+                if tp1_touched_now and sl_touched_now and not tp2_touched_now:
                     tp1_hit = True
-                    be_stop = actual_entry  # Move SL to breakeven (actual entry)
-                    # Record partial close R for MAE/MFE tracking
                     trade.tp1_hit = True
-                    trade.tp1_partial_r = abs(tp1 - actual_entry) / risk - friction_r
+                    trade.tp1_partial_r = _r_long(_exit_price_long(tp1, "TP"))
+                    # Remaining 50% closes at BE (= actual_entry) immediately.
+                    trade.outcome = "BE"
+                    trade.exit_price = actual_entry
+                    # Net = 0.5 * TP1_R + 0.5 * 0 (BE) - commission already in tp1_r.
+                    trade.pnl_r = 0.5 * trade.tp1_partial_r - 0.5 * commission_r
+                    trade.bars_to_outcome = bars_since_entry
+                    trade.exit_bar_idx = future_idx
+                    return trade
 
-            else:  # SHORT
-                if high >= be_stop:
+                # 2. Outright SL (no TP1 protection yet)
+                if sl_touched_now:
                     if tp1_hit:
                         trade.outcome = "BE"
-                        trade.exit_price = be_stop
-                        trade.pnl_r = 0.0 - friction_r
+                        exit_px = _exit_price_long(be_stop, "SL")
+                        # 50% already booked at TP1. Remainder closes at BE.
+                        trade.exit_price = exit_px
+                        trade.pnl_r = 0.5 * trade.tp1_partial_r + 0.5 * _r_long(exit_px)
                     else:
                         trade.outcome = "LOSS"
-                        trade.exit_price = stop_loss
-                        trade.pnl_r = -1.0 - friction_r
+                        exit_px = _exit_price_long(stop_loss, "SL")
+                        trade.exit_price = exit_px
+                        trade.pnl_r = _r_long(exit_px)
                     trade.bars_to_outcome = bars_since_entry
                     trade.exit_bar_idx = future_idx
                     return trade
 
-                if low <= tp2:
+                # 3. TP2 (full exit on remaining 50% if TP1 already hit, else 100%)
+                if tp2_touched_now:
                     trade.outcome = "WIN"
-                    trade.exit_price = tp2
-                    # BUG-NEW-6 FIX: TP1 partial close for SHORT
+                    exit_px = _exit_price_long(tp2, "TP")
+                    trade.exit_price = exit_px
                     if tp1_hit:
-                        tp1_r_val = abs(actual_entry - tp1) / risk - friction_r
-                        tp2_r_val = abs(actual_entry - tp2) / risk - friction_r
-                        trade.pnl_r = 0.5 * tp1_r_val + 0.5 * tp2_r_val
+                        trade.pnl_r = 0.5 * trade.tp1_partial_r + 0.5 * _r_long(exit_px)
                     else:
-                        trade.pnl_r = abs(actual_entry - tp2) / risk - friction_r
+                        trade.pnl_r = _r_long(exit_px)
                     trade.bars_to_outcome = bars_since_entry
                     trade.exit_bar_idx = future_idx
                     return trade
 
-                if not tp1_hit and low <= tp1:
+                # 4. TP1-only this bar → record partial, move stop to BE
+                if tp1_touched_now:
                     tp1_hit = True
+                    trade.tp1_hit = True
+                    trade.tp1_partial_r = _r_long(_exit_price_long(tp1, "TP"))
                     be_stop = actual_entry
-                    trade.tp1_hit = True
-                    trade.tp1_partial_r = abs(actual_entry - tp1) / risk - friction_r
 
-        # Expired
+            else:  # SHORT — mirror image
+                tp1_touched_now = (not tp1_hit) and (low <= tp1)
+                tp2_touched_now = low <= tp2
+                sl_touched_now = high >= be_stop
+
+                if tp1_touched_now and sl_touched_now and not tp2_touched_now:
+                    tp1_hit = True
+                    trade.tp1_hit = True
+                    trade.tp1_partial_r = _r_short(_exit_price_short(tp1, "TP"))
+                    trade.outcome = "BE"
+                    trade.exit_price = actual_entry
+                    trade.pnl_r = 0.5 * trade.tp1_partial_r - 0.5 * commission_r
+                    trade.bars_to_outcome = bars_since_entry
+                    trade.exit_bar_idx = future_idx
+                    return trade
+
+                if sl_touched_now:
+                    if tp1_hit:
+                        trade.outcome = "BE"
+                        exit_px = _exit_price_short(be_stop, "SL")
+                        trade.exit_price = exit_px
+                        trade.pnl_r = 0.5 * trade.tp1_partial_r + 0.5 * _r_short(exit_px)
+                    else:
+                        trade.outcome = "LOSS"
+                        exit_px = _exit_price_short(stop_loss, "SL")
+                        trade.exit_price = exit_px
+                        trade.pnl_r = _r_short(exit_px)
+                    trade.bars_to_outcome = bars_since_entry
+                    trade.exit_bar_idx = future_idx
+                    return trade
+
+                if tp2_touched_now:
+                    trade.outcome = "WIN"
+                    exit_px = _exit_price_short(tp2, "TP")
+                    trade.exit_price = exit_px
+                    if tp1_hit:
+                        trade.pnl_r = 0.5 * trade.tp1_partial_r + 0.5 * _r_short(exit_px)
+                    else:
+                        trade.pnl_r = _r_short(exit_px)
+                    trade.bars_to_outcome = bars_since_entry
+                    trade.exit_bar_idx = future_idx
+                    return trade
+
+                if tp1_touched_now:
+                    tp1_hit = True
+                    trade.tp1_hit = True
+                    trade.tp1_partial_r = _r_short(_exit_price_short(tp1, "TP"))
+                    be_stop = actual_entry
+
+        # Expired — mark to last close
         if active:
             last_close = float(candles[min(bar_idx + max_hold_bars, len(candles) - 1)][4])
             trade.outcome = "EXPIRED"
             trade.exit_price = last_close
             if direction == "LONG":
-                trade.pnl_r = (last_close - entry_mid) / risk - friction_r
+                pnl = _r_long(last_close * (1.0 - slip_pct))
             else:
-                trade.pnl_r = (entry_mid - last_close) / risk - friction_r
+                pnl = _r_short(last_close * (1.0 + slip_pct))
+            # If TP1 partial already booked, blend with the still-open half.
+            if tp1_hit:
+                trade.pnl_r = 0.5 * trade.tp1_partial_r + 0.5 * pnl
+            else:
+                trade.pnl_r = pnl
             trade.bars_to_outcome = max_hold_bars
             trade.exit_bar_idx = bar_idx + max_hold_bars
             return trade
@@ -735,8 +847,17 @@ class BacktestEngine:
         if not trades:
             return result
 
-        result.total_signals = len(trades)
-        result.total_trades = len([t for t in trades if t.outcome != "PENDING"])
+        # Semantics:
+        #   total_signals  = anything that filled (any non-PENDING outcome).
+        #                    PENDING is impossible here because _simulate_trade
+        #                    only returns trades that have been categorised,
+        #                    but we keep the filter to be defensive.
+        #   total_trades   = decided trades whose R is in the headline stats
+        #                    (WIN | LOSS | BE). EXPIRED is tracked separately
+        #                    so reports never silently mix mark-to-market R
+        #                    with realised R.
+        result.total_signals = len([t for t in trades if t.outcome != "PENDING"])
+        result.total_trades  = len([t for t in trades if t.outcome in ("WIN", "LOSS", "BE")])
 
         result.wins = len([t for t in trades if t.outcome == "WIN"])
         result.losses = len([t for t in trades if t.outcome == "LOSS"])
@@ -750,7 +871,8 @@ class BacktestEngine:
         # EXPIRED trades get a mark-to-market pnl_r that distorts Sharpe/profit_factor.
         # They are tracked separately (result.expired) but excluded from R statistics.
         r_values = [t.pnl_r for t in trades if t.outcome in ("WIN", "LOSS", "BE")]
-        bars = [t.bars_to_outcome for t in trades if t.bars_to_outcome > 0]
+        bars = [t.bars_to_outcome for t in trades
+                if t.bars_to_outcome > 0 and t.outcome in ("WIN", "LOSS", "BE")]
         result.avg_bars_to_outcome = float(np.mean(bars)) if bars else 0
         if r_values:
             result.avg_r = float(np.mean(r_values))
@@ -763,28 +885,30 @@ class BacktestEngine:
             gross_loss = abs(sum(r for r in r_values if r < 0))
             result.profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
 
-            # BUG-NEW-5 FIX: Sharpe annualization.
-            # sqrt(252) assumes exactly 1 trade per calendar day — correct only for
-            # daily-bar strategies. For intraday strategies the factor must account
-            # for actual trade frequency. We estimate from avg_bars_to_outcome and
-            # the timeframe's bar count per day.
+            # Sharpe annualisation.
+            #
+            # FIX (BUG-NEW-5 v2): the previous version used sqrt(252 * trades_per_day)
+            # which is wrong for crypto on two counts:
+            #   1. crypto trades 24/7 — the calendar is 365 days, not 252.
+            #   2. trades_per_day is already a *daily* trade count, so the
+            #      annualisation factor is sqrt(trades_per_year), where
+            #      trades_per_year = trades_per_day * 365.
+            # Net effect of the old formula: Sharpe was about sqrt(252/365)
+            # ≈ 0.83x of the correct value, biasing every grade downward and
+            # under-rewarding genuinely high-frequency strategies.
             _bars_per_day = BTC.BARS_PER_DAY.get(timeframe, 24)
             if len(r_values) > 1:
-                r_std = float(np.std(r_values))
+                r_std = float(np.std(r_values, ddof=1))
                 _avg_hold = result.avg_bars_to_outcome if result.avg_bars_to_outcome > 0 else _bars_per_day
-                # Trades per day: how many of these avg-hold trades fit in a trading day
-                _trades_per_day = max(0.1, _bars_per_day / _avg_hold)
-                _ann_factor = np.sqrt(252 * _trades_per_day)
+                _trades_per_day = max(0.1, _bars_per_day / max(1.0, _avg_hold))
+                _ann_factor = float(np.sqrt(365.0 * _trades_per_day))
                 if r_std > 0:
                     result.sharpe_ratio = (result.avg_r / r_std) * _ann_factor
 
-                # BUG-NEW-10 FIX: Sortino ratio — uses downside deviation only.
-                # A strategy can have Sharpe=2.0 with extreme negative tail that Sharpe misses.
-                # Sortino reveals this: it only penalises returns that are below the target (0R).
-                # FIX: _ann_factor is now guaranteed to be defined (moved outside `if r_std > 0`).
+                # Sortino — downside deviation only.
                 downside_returns = [r for r in r_values if r < 0]
                 if len(downside_returns) >= 2:
-                    downside_std = float(np.std(downside_returns))
+                    downside_std = float(np.std(downside_returns, ddof=1))
                     if downside_std > 0:
                         result.sortino_ratio = (result.avg_r / downside_std) * _ann_factor
 
@@ -794,17 +918,11 @@ class BacktestEngine:
             drawdown = peak - cumulative
             result.max_drawdown_r = float(np.max(drawdown)) if len(drawdown) > 0 else 0
 
-            # BUG-NEW-10 FIX: Calmar ratio — total_r (annualised proxy) / max_drawdown.
-            # Reveals whether the edge justifies the worst drawdown experienced.
+            # Calmar — total_r / max_drawdown.
             if result.max_drawdown_r > 0:
                 result.calmar_ratio = round(result.total_r / result.max_drawdown_r, 3)
 
-            # BUG-NEW-10 FIX: MAE / MFE per trade.
-            # MAE (Maximum Adverse Excursion) = worst intra-trade loss before exit.
-            # MFE (Maximum Favourable Excursion) = best intra-trade gain before exit.
-            # These are approximated from outcomes: for losses, pnl_r IS the MAE.
-            # For wins, pnl_r is the exit; tp1_partial_r gives a MFE lower bound.
-            # Full intra-bar MAE/MFE requires tick data — this is the best bar-level approx.
+            # MAE / MFE per trade — bar-resolution approximations.
             maes = [abs(t.pnl_r) for t in trades if t.outcome == "LOSS"]
             mfes = [t.tp1_partial_r for t in trades if t.tp1_hit and t.tp1_partial_r > 0]
             result.avg_mae_r = float(np.mean(maes)) if maes else 0.0
@@ -814,30 +932,31 @@ class BacktestEngine:
         result.max_consecutive_wins = self._max_consecutive(trades, "WIN")
         result.max_consecutive_losses = self._max_consecutive(trades, "LOSS")
 
-        # Per-strategy breakdown
+        # Per-strategy breakdown — EXPIRED excluded from R sums to match
+        # the headline metrics block above.
         strategies = set(t.strategy for t in trades)
         for strat in strategies:
             strat_trades = [t for t in trades if t.strategy == strat]
             strat_decided = [t for t in strat_trades if t.outcome in ("WIN", "LOSS")]
             strat_wins = len([t for t in strat_decided if t.outcome == "WIN"])
-            strat_r = [t.pnl_r for t in strat_trades if t.outcome != "PENDING"]
+            strat_r = [t.pnl_r for t in strat_trades if t.outcome in ("WIN", "LOSS", "BE")]
 
             result.strategy_breakdown[strat] = {
                 'total': len(strat_trades),
                 'wins': strat_wins,
                 'losses': len(strat_decided) - strat_wins,
                 'win_rate': strat_wins / len(strat_decided) * 100 if strat_decided else 0,
-                'total_r': sum(strat_r),
-                'avg_r': np.mean(strat_r) if strat_r else 0,
+                'total_r': float(np.sum(strat_r)) if strat_r else 0.0,
+                'avg_r': float(np.mean(strat_r)) if strat_r else 0.0,
             }
 
-        # ── BT-4: Per-regime breakdown ──────────────────────────────────────
+        # ── BT-4: Per-regime breakdown — EXPIRED excluded for consistency ──
         regimes = set(getattr(t, 'regime_at_signal', 'UNKNOWN') for t in trades)
         for regime in regimes:
             rt = [t for t in trades if getattr(t, 'regime_at_signal', 'UNKNOWN') == regime]
             rd = [t for t in rt if t.outcome in ('WIN', 'LOSS')]
             rw = len([t for t in rd if t.outcome == 'WIN'])
-            rr = [t.pnl_r for t in rt if t.outcome != 'PENDING']
+            rr = [t.pnl_r for t in rt if t.outcome in ('WIN', 'LOSS', 'BE')]
             result.regime_breakdown[regime] = {
                 'trades': len(rt),
                 'wins': rw,
@@ -908,7 +1027,9 @@ class BacktestEngine:
             w = all_trades[start:start + window_trades]
             decided = [t for t in w if t.outcome in ('WIN', 'LOSS')]
             wins = len([t for t in decided if t.outcome == 'WIN'])
-            r_vals = [t.pnl_r for t in w if t.outcome != 'PENDING']
+            # EXPIRED excluded for consistency with headline metrics — see
+            # _compile_results comments.
+            r_vals = [t.pnl_r for t in w if t.outcome in ('WIN', 'LOSS', 'BE')]
             windows.append({
                 'start_idx': start,
                 'end_idx': start + len(w) - 1,
@@ -970,22 +1091,44 @@ class BacktestEngine:
         ]
 
     def _apply_overrides(self, overrides: Dict) -> Dict:
-        """Apply config overrides and return original values"""
-        original = {}
+        """Apply config overrides and return original values.
+
+        FIX: the previous traversal walked ``parts[:-1]`` but its dict
+        fallback ``obj.get(p, obj)`` referenced the loop variable from the
+        outer scope (already reassigned via ``getattr``), so nested keys like
+        ``strategies.breakout.min_adx`` silently fell back to the root cfg
+        and the override never took effect. Worse, the rollback on the
+        ``finally`` branch then wrote the new value into the wrong slot,
+        permanently mutating cfg between optimizer iterations.
+
+        We now walk the path properly through both attributes and dict
+        keys, recording the original value at the resolved leaf only.
+        """
+        original: Dict = {}
         for key_path, value in overrides.items():
             parts = key_path.split('.')
             obj = cfg
+            ok = True
             for p in parts[:-1]:
-                obj = getattr(obj, p, obj)
-                if isinstance(obj, dict):
-                    obj = obj.get(p, obj)
+                if isinstance(obj, dict) and p in obj:
+                    obj = obj[p]
+                elif hasattr(obj, p):
+                    obj = getattr(obj, p)
+                else:
+                    ok = False
+                    break
+            if not ok:
+                logger.debug(f"Override path not found: {key_path}")
+                continue
             final_key = parts[-1]
-            if hasattr(obj, final_key):
-                original[key_path] = getattr(obj, final_key)
-                setattr(obj, final_key, value)
-            elif isinstance(obj, dict) and final_key in obj:
+            if isinstance(obj, dict) and final_key in obj:
                 original[key_path] = obj[final_key]
                 obj[final_key] = value
+            elif hasattr(obj, final_key):
+                original[key_path] = getattr(obj, final_key)
+                setattr(obj, final_key, value)
+            else:
+                logger.debug(f"Override leaf not found: {key_path}")
         return original
 
 
