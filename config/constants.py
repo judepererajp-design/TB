@@ -297,7 +297,10 @@ class Portfolio:
     MAX_POSITIONS: int = 8                  # Max concurrent positions
     MAX_SECTOR_EXPOSURE_PCT: float = 0.25   # Max 25% in one sector
     MAX_DIRECTION_IMBALANCE: float = 0.7    # Max 70% net long or short
-    MAX_CORRELATED_POSITIONS: int = 3       # Max positions correlation > 0.7
+    # Must match risk.max_correlated_positions in settings.yaml; the correlation
+    # analyzer reads the YAML value directly while portfolio_engine reads this
+    # constant. Keep them aligned or the two gates will disagree.
+    MAX_CORRELATED_POSITIONS: int = 2       # Max positions correlation > 0.7
     MAX_SAME_DIRECTION: int = 4             # V10 correlation gate
     MAX_SAME_SECTOR: int = 2               # V10 correlation gate
     TARGET_PORTFOLIO_VOL: float = 0.02      # Target 2% daily vol
@@ -1020,8 +1023,10 @@ class NewsIntelligence:
     UNEXPLAINED_ONCHAIN_PENALTY: float = 0.90  # Reduce confidence for unexplained moves
 
     # Feature 7: Fear & Greed regime overlay
-    FEAR_GREED_EXTREME_FEAR_THRESHOLD: int = 25   # Widened from 20 to catch more fear
-    FEAR_GREED_EXTREME_GREED_THRESHOLD: int = 75  # Widened from 80 to catch more greed
+    # Delegate to FearGreedThresholds so regime/htf_guardrail/sentiment stay
+    # aligned on a single source of truth and can't silently drift apart.
+    FEAR_GREED_EXTREME_FEAR_THRESHOLD: int = FearGreedThresholds.EXTREME_FEAR
+    FEAR_GREED_EXTREME_GREED_THRESHOLD: int = FearGreedThresholds.EXTREME_GREED
     FEAR_GREED_MAX_ADJUSTMENT_PCT: float = 0.15   # ±15% max threshold adjustment (was ±10%)
 
     # Feature 8: Narrative tracker
