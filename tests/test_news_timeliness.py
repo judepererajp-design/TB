@@ -9,7 +9,9 @@ The bot should:
 """
 
 import asyncio
+import sys
 import time
+import types
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -158,6 +160,71 @@ async def test_news_scraper_stop_cancels_tracked_bni_tasks():
     await scraper.stop()
 
     assert sleeper.cancelled()
+    assert scraper._bni_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_news_scraper_fetch_news_tracks_real_bni_dispatch_path():
+    """Fresh headlines should create and track the background BNI task via
+    the real _fetch_news dispatch path."""
+    from analyzers.news_scraper import NewsItem, NewsScraper
+    import analyzers.news_scraper as news_scraper_mod
+
+    class _Resp:
+        status = 200
+
+        async def text(self):
+            return "<rss />"
+
+    class _RespCtx:
+        async def __aenter__(self):
+            return _Resp()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class _Session:
+        def get(self, _url):
+            return _RespCtx()
+
+    blocker = asyncio.Event()
+    seen_batches = []
+
+    async def _process_headlines(batch):
+        seen_batches.append(batch)
+        await blocker.wait()
+
+    fake_bni_mod = types.SimpleNamespace(
+        btc_news_intelligence=types.SimpleNamespace(process_headlines=_process_headlines)
+    )
+    fake_narrative_mod = types.SimpleNamespace(
+        narrative_tracker=types.SimpleNamespace(process_headline=lambda *_args, **_kwargs: None)
+    )
+
+    scraper = NewsScraper()
+    scraper._news_ttl = 0.0
+
+    with patch.object(news_scraper_mod, "RSS_FEEDS", [("TestFeed", "https://example.test/rss")]), \
+         patch.object(scraper, "_get_session", AsyncMock(return_value=_Session())), \
+         patch.object(scraper, "_parse_rss", return_value=[
+             NewsItem(
+                 title="Fresh headline",
+                 source="TestFeed",
+                 url="https://example.test/story",
+                 published_at=time.time(),
+             )
+         ]), \
+         patch.object(scraper, "_fetch_free_crypto_news", AsyncMock(return_value=[])), \
+         patch.dict(sys.modules, {
+             "analyzers.btc_news_intelligence": fake_bni_mod,
+             "analyzers.narrative_tracker": fake_narrative_mod,
+         }):
+        await scraper._fetch_news()
+        await asyncio.sleep(0)
+        assert len(scraper._bni_tasks) == 1
+        assert seen_batches and seen_batches[0][0]["title"] == "Fresh headline"
+        await scraper.stop()
+
     assert scraper._bni_tasks == set()
 
 

@@ -250,6 +250,18 @@ class NewsScraper:
         if self._session and not self._session.closed:
             await self._session.close()
 
+    def _handle_bni_task_completion(self, task: asyncio.Task) -> None:
+        """Drop completed BTC news-intelligence tasks and surface failures."""
+        self._bni_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.warning(
+                "btc_news_intelligence.process_headlines failed",
+                exc_info=exc,
+            )
+
     async def _poll_loop(self):
         """Background loop — stagger fetches to avoid burst requests."""
         await asyncio.sleep(5)  # Let bot fully start first
@@ -351,21 +363,7 @@ class NewsScraper:
                         name="btc_news_intelligence.process_headlines",
                     )
                     self._bni_tasks.add(_bni_task)
-
-                    def _bni_done(t: asyncio.Task) -> None:
-                        self._bni_tasks.discard(t)
-                        if t.cancelled():
-                            return
-                        exc = t.exception()
-                        if exc is not None:
-                            # Include the exception traceback via exc_info so
-                            # log consumers get a full stack, not just str(exc).
-                            logger.warning(
-                                "btc_news_intelligence.process_headlines failed",
-                                exc_info=exc,
-                            )
-
-                    _bni_task.add_done_callback(_bni_done)
+                    _bni_task.add_done_callback(self._handle_bni_task_completion)
                 except Exception as _bni_err:
                     logger.warning("btc_news_intelligence dispatch failed: %s", _bni_err)
 
