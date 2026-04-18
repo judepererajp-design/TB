@@ -146,6 +146,21 @@ class TestStalenessGate:
         assert NewsIntelligence.STALE_HEADLINE_ALERT_GATE_MINUTES == 45
 
 
+@pytest.mark.asyncio
+async def test_news_scraper_stop_cancels_tracked_bni_tasks():
+    """Tracked background news-intelligence tasks should be cancelled on stop."""
+    from analyzers.news_scraper import NewsScraper
+
+    scraper = NewsScraper()
+    sleeper = asyncio.create_task(asyncio.sleep(60))
+    scraper._bni_tasks.add(sleeper)
+
+    await scraper.stop()
+
+    assert sleeper.cancelled()
+    assert scraper._bni_tasks == set()
+
+
 # ─── Confidence decay tests ──────────────────────────────────────
 
 class TestStalenessConfidenceDecay:

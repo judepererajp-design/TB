@@ -242,6 +242,11 @@ class NewsScraper:
         self._running = False
         if self._task:
             self._task.cancel()
+        if self._bni_tasks:
+            for task in list(self._bni_tasks):
+                task.cancel()
+            await asyncio.gather(*self._bni_tasks, return_exceptions=True)
+            self._bni_tasks.clear()
         if self._session and not self._session.closed:
             await self._session.close()
 
