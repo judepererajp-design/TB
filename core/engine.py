@@ -5336,6 +5336,26 @@ class Engine:
                 rich_text = formatter.format_expired(symbol, direction, strategy, signal_id=signal_id)
                 await telegram_bot.send_reply(message_id, rich_text)
 
+            # PR5 #4: register expired-unfilled signal with the missed-fill
+            # tracker so we can later determine "would this have won?".
+            try:
+                if sig_row:
+                    from core.missed_fill_tracker import missed_fill_tracker as _mft
+                    _mft.record_missed(
+                        signal_id=signal_id,
+                        symbol=sig_row.get('symbol', ''),
+                        direction=sig_row.get('direction', ''),
+                        entry_low=float(sig_row.get('entry_low') or 0.0),
+                        entry_high=float(sig_row.get('entry_high') or 0.0),
+                        stop_loss=float(sig_row.get('stop_loss') or 0.0),
+                        tp1=float(sig_row.get('tp1') or 0.0),
+                        tp2=float(sig_row.get('tp2') or 0.0),
+                        confidence=float(sig_row.get('confidence') or 0.0),
+                        strategy=sig_row.get('strategy', '') or '',
+                    )
+            except Exception as _mft_e:
+                logger.debug(f"missed_fill_tracker register failed: {_mft_e}")
+
             # FIX P1-D: feed expiry into learning loop as weak negative
             try:
                 if sig_row:
