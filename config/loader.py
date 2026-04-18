@@ -27,6 +27,13 @@ from config.schema import validate_config
 
 logger = logging.getLogger(__name__)
 
+# Optional integrations may source secrets from env placeholders without
+# requiring a startup warning when absent. Their dependent features handle
+# the empty-string fallback explicitly.
+_OPTIONAL_MISSING_ENV_VARS = {
+    "OPENROUTER_API_KEY",
+}
+
 # Load .env file
 load_dotenv()
 
@@ -139,6 +146,13 @@ class Config:
 
                 new_value = re.sub(r"\$\{(\w+)\}", _sub, value)
                 for var_name in missing:
+                    if var_name in _OPTIONAL_MISSING_ENV_VARS:
+                        logger.debug(
+                            "Config: optional env var '%s' is not set; "
+                            "related functionality will stay disabled.",
+                            var_name,
+                        )
+                        continue
                     logger.warning(
                         f"Config: env var '{var_name}' is not set. "
                         f"Add it to your .env file. Functionality requiring "

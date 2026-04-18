@@ -51,3 +51,34 @@ finally:
         timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_config_loader_does_not_warn_for_missing_optional_openrouter_key():
+    script = r"""
+import importlib.util
+import os
+import pathlib
+import sys
+
+loader_path = pathlib.Path(sys.argv[1]) / "config" / "loader.py"
+spec = importlib.util.spec_from_file_location("temp_config_loader", loader_path)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+print(mod.cfg.global_cfg.get("openrouter_api_key", ""))
+"""
+    env = {
+        **os.environ,
+        "PYTHONPATH": PROJECT_ROOT,
+    }
+    env.pop("OPENROUTER_API_KEY", None)
+    result = subprocess.run(
+        [PYTHON, "-c", script, PROJECT_ROOT],
+        capture_output=True,
+        text=True,
+        cwd=PROJECT_ROOT,
+        env=env,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "env var 'OPENROUTER_API_KEY' is not set" not in result.stderr
+    assert "env var 'OPENROUTER_API_KEY' is not set" not in result.stdout
