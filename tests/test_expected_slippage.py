@@ -1,6 +1,8 @@
 """Tests for the predictive slippage model (analyzers.expected_slippage)."""
 from __future__ import annotations
 
+import pytest
+
 from analyzers.expected_slippage import (
     estimate_slippage,
     estimate_slippage_pct_from_signal,
@@ -85,6 +87,25 @@ def test_signal_bridge_derives_atr_pct_from_atr_proxy():
     p_with = estimate_slippage_pct_from_signal(sig_with)
     p_without = estimate_slippage_pct_from_signal(sig_without)
     assert p_with >= p_without
+
+
+def test_signal_bridge_uses_top_level_position_size():
+    sig = _StubSignal(raw_data={
+        "spread_bps": 8.0,
+        "atr_pct": 0.01,
+        "top_book_depth_usd": 250_000,
+    })
+    sig.position_size = 20_000
+
+    pct = estimate_slippage_pct_from_signal(sig)
+    expected = estimate_slippage(
+        spread_bps=8.0,
+        atr_pct=0.01,
+        size_usd=20_000,
+        top_book_depth_usd=250_000,
+    ).expected_pct
+
+    assert pct == pytest.approx(expected)
 
 
 def test_signal_bridge_fallback_on_empty_raw_data():

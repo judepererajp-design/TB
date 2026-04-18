@@ -338,6 +338,8 @@ class TelegramFormatter:
         conf = scored.final_confidence or sig.confidence
         raw = sig.raw_data or {}
         strategy = sig.strategy or "Unknown"
+        if sizing and getattr(sizing, "position_size_usdt", 0) > 0:
+            raw["intended_size_usd"] = sizing.position_size_usdt
         guidance = guidance_payload(
             sig,
             confluence=sig.confluence,
@@ -823,6 +825,9 @@ class TelegramFormatter:
         p_win_str = f"\nP(win): {prob_estimate.p_win*100:.0f}%" if prob_estimate else ""
         ev_str = f"\nEV: {alpha_score.expected_value_r:+.2f}R" if alpha_score else ""
         tp3_line = f"\nTP3: <code>{fmt_price(sig.tp3)}</code>" if sig.tp3 else ""
+        raw = sig.raw_data or {}
+        if sizing and getattr(sizing, "position_size_usdt", 0) > 0:
+            raw["intended_size_usd"] = sizing.position_size_usdt
         guidance = guidance_payload(
             sig,
             confluence=sig.confluence,

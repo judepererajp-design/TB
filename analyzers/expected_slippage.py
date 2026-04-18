@@ -147,7 +147,14 @@ def estimate_slippage_pct_from_signal(signal) -> float:
             if mid > 0:
                 atr_pct = float(atr) / mid
     top_book_depth_usd = raw.get("top_book_depth_usd")
-    size_usd = raw.get("intended_size_usd") or _ES.DEFAULT_SIZE_USD
+    size_usd = (
+        raw.get("intended_size_usd")
+        or raw.get("position_size")
+        or raw.get("position_size_usdt")
+        or getattr(signal, "position_size", None)
+        or getattr(signal, "position_size_usdt", None)
+        or _ES.DEFAULT_SIZE_USD
+    )
 
     est = estimate_slippage(
         spread_bps=spread_bps,
