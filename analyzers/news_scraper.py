@@ -213,7 +213,7 @@ class NewsScraper:
         # AUDIT FIX (news_scraper fire-and-forget): keep strong references to
         # background dispatch tasks so they aren't garbage collected mid-run
         # and any failure is visible via the done-callback installed at spawn.
-        self._bni_tasks: set = set()
+        self._bni_tasks: set[asyncio.Task] = set()
 
         # Feature 3: Title dedup — tracks clusters of similar headlines
         self._dedup_clusters: List[Dict] = []  # [{titles: set, source_count: int, first_seen: float}]

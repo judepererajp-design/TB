@@ -213,6 +213,8 @@ class VolumeAnalyzer:
 
         # Value Area — 70% of total volume centered around POC
         total_volume = volume_at_price.sum()
+        # No traded volume means the profile is empty; leave the default
+        # POC/VA fields untouched instead of fabricating levels from zero bins.
         if total_volume <= 0:
             return
         target_volume = total_volume * self._value_area_pct

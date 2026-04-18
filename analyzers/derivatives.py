@@ -66,6 +66,8 @@ class DerivativesAnalyzer:
         # ccxt's `openInterestAmount` (base-unit OI level), which is NOT
         # a 24h change and permanently left `oi_trend=NEUTRAL`, dropping
         # the OI contribution to score/validity.
+        # Per-symbol deque of (timestamp, open_interest_level) samples used to
+        # derive a real rolling 24h OI change from raw OI levels.
         self._oi_history: Dict[str, Deque[Tuple[float, float]]] = {}
         # Retain ~26h of samples to survive a stale fetch or two.
         self._oi_history_max = 60
