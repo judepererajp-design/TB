@@ -65,17 +65,17 @@ def test_signal_decision_endpoint_returns_review(monkeypatch):
         "inputs_used": {"signal": ["stub"], "market": [], "execution": []},
     }
 
-    sys.modules["config.loader"] = types.SimpleNamespace(
+    monkeypatch.setitem(sys.modules, "config.loader", types.SimpleNamespace(
         cfg=types.SimpleNamespace(ai={}, database=types.SimpleNamespace(path=":memory:"))
-    )
+    ))
     monkeypatch.setattr("web.app._json_response", lambda data, status=200: data)
     monkeypatch.setattr(DashboardApp, "_build_signal_detail_payload", AsyncMock(return_value=detail))
-    sys.modules["data.database"] = types.SimpleNamespace(
+    monkeypatch.setitem(sys.modules, "data.database", types.SimpleNamespace(
         db=types.SimpleNamespace(get_signal=AsyncMock(return_value=sig))
-    )
-    sys.modules["signals.signal_decision"] = types.SimpleNamespace(
+    ))
+    monkeypatch.setitem(sys.modules, "signals.signal_decision", types.SimpleNamespace(
         review_signal=AsyncMock(return_value=review)
-    )
+    ))
 
     app = DashboardApp()
     request = types.SimpleNamespace(match_info={"id": "42"})

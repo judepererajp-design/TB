@@ -48,9 +48,16 @@ class TestOHLCVCooldownScanner:
         import sys
         from unittest.mock import MagicMock
 
-        # Mock transitive deps that scanner.scanner imports
+        # Mock transitive deps that scanner.scanner imports, but only if they
+        # are genuinely unavailable. Unconditionally inserting MagicMock into
+        # sys.modules poisons later tests (e.g. test_phase3_audit) that need
+        # the real aiosqlite module.
         for mod_name in ("aiosqlite", "data.database"):
-            if mod_name not in sys.modules:
+            if mod_name in sys.modules:
+                continue
+            try:
+                __import__(mod_name)
+            except ImportError:
                 sys.modules[mod_name] = MagicMock()
 
         mock_cfg = MagicMock()

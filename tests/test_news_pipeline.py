@@ -106,7 +106,7 @@ class TestDecayInProcessHeadlines:
         """A 0-age headline should keep full confidence."""
         intel = _make_intel()
         headlines = [{"title": "Bitcoin ETF approved", "published_at": time.time(), "source": "reuters"}]
-        asyncio.get_event_loop().run_until_complete(intel.process_headlines(headlines))
+        asyncio.run(intel.process_headlines(headlines))
         ctx = intel.get_event_context()
         # If classified, confidence should not be reduced
         # (may or may not trigger depending on classifier)
@@ -516,7 +516,7 @@ class TestProcessHeadlinesRegression:
             "classify_batch",
             return_value=(BTCEventType.BTC_FUNDAMENTAL, "BULLISH", 0.80, old_headline["title"], False),
         ):
-            asyncio.get_event_loop().run_until_complete(
+            asyncio.run(
                 intel.process_headlines([old_headline, fresh_headline])
             )
 
@@ -531,7 +531,7 @@ class TestProcessHeadlinesRegression:
             {"title": "Bitcoin war escalation triggers market panic", "published_at": time.time(), "source": "reuters"},
         ]
 
-        asyncio.get_event_loop().run_until_complete(intel.process_headlines(headlines))
+        asyncio.run(intel.process_headlines(headlines))
 
         directions = {h["direction"] for h in intel._headline_history}
         assert "BULLISH" in directions

@@ -283,7 +283,7 @@ class TestSeverityGatedBlocking:
             assert int(base_ttl * ttl_scale) == int(14400 * 0.75), \
                 f"TTL should be {int(14400 * 0.75)}, not {int(base_ttl * ttl_scale)}"
 
-        asyncio.get_event_loop().run_until_complete(_run())
+        asyncio.run(_run())
 
     def test_medium_confidence_downgrades_to_penalty(self):
         """MEDIUM confidence (<0.65) should downgrade block_longs to False."""
