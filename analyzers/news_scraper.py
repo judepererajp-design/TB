@@ -210,6 +210,10 @@ class NewsScraper:
         self._session: Optional[aiohttp.ClientSession] = None
         self._running = False
         self._task = None
+        # AUDIT FIX (news_scraper fire-and-forget): keep strong references to
+        # background dispatch tasks so they aren't garbage collected mid-run
+        # and any failure is visible via the done-callback installed at spawn.
+        self._bni_tasks: set[asyncio.Task] = set()
 
         # Feature 3: Title dedup — tracks clusters of similar headlines
         self._dedup_clusters: List[Dict] = []  # [{titles: set, source_count: int, first_seen: float}]
@@ -238,8 +242,25 @@ class NewsScraper:
         self._running = False
         if self._task:
             self._task.cancel()
+        if self._bni_tasks:
+            for task in list(self._bni_tasks):
+                task.cancel()
+            await asyncio.gather(*self._bni_tasks, return_exceptions=True)
+            self._bni_tasks.clear()
         if self._session and not self._session.closed:
             await self._session.close()
+
+    def _handle_bni_task_completion(self, task: asyncio.Task) -> None:
+        """Drop completed BTC news-intelligence tasks and surface failures."""
+        self._bni_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.warning(
+                "btc_news_intelligence.process_headlines failed",
+                exc_info=exc,
+            )
 
     async def _poll_loop(self):
         """Background loop — stagger fetches to avoid burst requests."""
@@ -332,9 +353,19 @@ class NewsScraper:
                     ]
                     for n in fresh:
                         narrative_tracker.process_headline(n.title, n.published_at)
-                    asyncio.create_task(btc_news_intelligence.process_headlines(fresh_dicts))
-                except Exception:
-                    pass
+                    # AUDIT FIX (news_scraper fire-and-forget): track the
+                    # spawned task and log any failure from the background
+                    # coroutine.  Previously `create_task(...)` with bare
+                    # `except Exception: pass` swallowed both spawn errors
+                    # AND downstream coroutine errors silently.
+                    _bni_task = asyncio.create_task(
+                        btc_news_intelligence.process_headlines(fresh_dicts),
+                        name="btc_news_intelligence.process_headlines",
+                    )
+                    self._bni_tasks.add(_bni_task)
+                    _bni_task.add_done_callback(self._handle_bni_task_completion)
+                except Exception as _bni_err:
+                    logger.warning("btc_news_intelligence dispatch failed: %s", _bni_err)
 
         self._news_last_fetch = time.time()
 
@@ -849,8 +880,13 @@ class NewsScraper:
             "representative": title,
         }
         self._dedup_clusters.append(cluster)
-        # Prune old clusters (>2 hours)
-        cutoff = time.time() - 7200
+        # AUDIT FIX: dedup clusters previously pruned after 2 h while the
+        # news cache itself keeps items for 6 h (see _merge cutoff=21600).
+        # A headline dropped from the cluster store would reappear from
+        # the still-live cache and be treated as a unique new article,
+        # double-counting it in sentiment weighting.  Align the prune
+        # window with the news-cache TTL so the two stores agree.
+        cutoff = time.time() - 21600
         self._dedup_clusters = [
             c for c in self._dedup_clusters if c["first_seen"] > cutoff
         ]

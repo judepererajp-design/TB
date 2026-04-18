@@ -607,7 +607,13 @@ class BaseStrategy(ABC):
     # ── Parabolic / Acceleration Detection ───────────────────────────
 
     @staticmethod
-    def detect_parabolic(closes: np.ndarray, period: int = 10) -> Dict[str, Any]:
+    def detect_parabolic(
+        closes: np.ndarray,
+        period: int = 10,
+        *,
+        ohlcv: Optional[list] = None,
+        direction: str = "LONG",
+    ) -> Dict[str, Any]:
         """
         Detect parabolic price acceleration using ROC-of-ROC (second derivative).
 
@@ -616,6 +622,16 @@ class BaseStrategy(ABC):
           - acceleration: float — rate of change of ROC (positive = accelerating up)
           - roc: float — current rate of change
           - direction: str — "UP", "DOWN", or "FLAT"
+          - is_exhausted: bool — exhaustion pattern present (only when ohlcv passed)
+          - exhaustion_signals: list[str] — names of exhaustion patterns
+          - confidence_penalty: int — suggested penalty (negative) or bonus (positive)
+            for the proposed `direction` (only when ohlcv passed)
+
+        AUDIT FIX (parabolic_detector wiring): when caller provides the full
+        OHLCV array, delegate to analyzers.parabolic_detector for the richer
+        exhaustion + confidence_penalty output.  Previously parabolic_detector
+        was a standalone module with no consumers despite providing strictly
+        more information than this helper's closes-only analysis.
         """
         closes = np.asarray(closes, dtype=float)
         result = {
@@ -623,6 +639,12 @@ class BaseStrategy(ABC):
             "acceleration": 0.0,
             "roc": 0.0,
             "direction": "FLAT",
+            # AUDIT FIX: always include the enrichment keys so early-return
+            # paths (insufficient data, empty ROC series) don't surprise
+            # callers that look for these fields.
+            "is_exhausted": False,
+            "exhaustion_signals": [],
+            "confidence_penalty": 0,
         }
         if len(closes) < period * 2 + 2:
             return result
@@ -660,16 +682,44 @@ class BaseStrategy(ABC):
         is_parabolic = _all_same_sign and abs(_avg_accel) > 0.005  # 0.5% acceleration per bar
 
         if current_roc > 0.01:
-            direction = "UP"
+            price_direction = "UP"
         elif current_roc < -0.01:
-            direction = "DOWN"
+            price_direction = "DOWN"
         else:
-            direction = "FLAT"
+            price_direction = "FLAT"
 
         result["is_parabolic"] = is_parabolic
         result["acceleration"] = round(acceleration, 6)
         result["roc"] = round(current_roc, 6)
-        result["direction"] = direction
+        result["direction"] = price_direction
+
+        # ── Optional enrichment via analyzers.parabolic_detector ─────────
+        # When caller supplies the full OHLCV array, run the richer analyzer
+        # so callers can surface exhaustion patterns and the direction-aware
+        # confidence penalty alongside the base parabolic fields.
+        if ohlcv is not None:
+            try:
+                from analyzers.parabolic_detector import parabolic_detector as _pd
+                # `direction` here is the trade direction (LONG/SHORT) used by
+                # the analyzer to decide whether we're entering *into* or *against*
+                # the parabolic move — not the price direction above.
+                _full = _pd.analyze(ohlcv, direction=direction, roc_period=period)
+                result["is_parabolic"] = bool(_full.is_parabolic)
+                result["is_exhausted"] = bool(_full.is_exhausted)
+                result["exhaustion_signals"] = list(_full.exhaustion_signals)
+                result["confidence_penalty"] = int(_full.confidence_penalty)
+                # Prefer analyzer's numbers if they're populated (keeps parity)
+                if _full.roc or _full.acceleration:
+                    result["roc"] = round(float(_full.roc), 6)
+                    result["acceleration"] = round(float(_full.acceleration), 6)
+                    result["direction"] = _full.direction
+            except Exception:
+                # Enrichment is best-effort — fall back to base result on any error.
+                # Include traceback at debug so regressions in parabolic_detector
+                # are visible when debug logging is on without impacting the
+                # hot path at higher log levels.
+                logger.debug("parabolic_detector enrichment skipped", exc_info=True)
+
         return result
 
     # ── Exhaustion Detection ─────────────────────────────────────────

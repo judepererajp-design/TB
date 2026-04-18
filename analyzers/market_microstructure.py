@@ -141,10 +141,14 @@ class OptionsSnapshot:
         if expiry_gravity:
             hrs = int(self.next_expiry_h)
             if direction == "SHORT" and deviation > 2.0:
+                # Positive deviation means price is ABOVE max_pain.
+                # AUDIT FIX: previously this note read "% below", inverting
+                # the semantics shown to the operator (delta logic below
+                # remains correct).
                 delta += 4
                 notes.append(
                     f"🎯 Max pain ${self.max_pain:,.0f} "
-                    f"({deviation:+.1f}% below, expiry {hrs}h)"
+                    f"({deviation:+.1f}% above, expiry {hrs}h)"
                 )
             elif direction == "LONG" and deviation < -2.0:
                 delta += 4
@@ -784,14 +788,23 @@ class MarketMicrostructure:
                     # Net: positive = more large selling (bearish/inflow signal)
                     #      negative = more large buying (bullish/outflow signal)
                     netflow = large_sell - large_buy
-                    ma7 = (large_sell + large_buy) / 2  # rough baseline
-
+                    # AUDIT FIX: this path previously stored
+                    # ``ma7 = (large_sell + large_buy) / 2`` and labelled it a
+                    # "7-day moving average".  It is in fact the current-day
+                    # mean of sell/buy volumes, which bounds the downstream
+                    # ``netflow / ma7`` ratio to [-2, +2] — making the
+                    # ``> 2.0`` / ``< -2.0`` "2× historical" thresholds in
+                    # ``confidence_delta`` numerically unreachable from this
+                    # source.  Emit ``ma7_netflow=0`` so ``confidence_delta``
+                    # early-returns with zero adjustment until a real 7-day
+                    # baseline is available (e.g. via the Glassnode path,
+                    # which still populates a proper MA).
                     return NetflowSnapshot(
                         coin        = coin,
                         netflow_24h = netflow,
                         inflow_24h  = large_sell,
                         outflow_24h = large_buy,
-                        ma7_netflow = ma7,
+                        ma7_netflow = 0.0,
                         source      = "binance_flow",
                     )
         except Exception as e:

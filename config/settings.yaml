@@ -97,14 +97,11 @@ system:
   log_max_bytes: 10485760      # 10 MB per file before rotation
   log_backup_count: 5          # keep 5 rotated copies of each log
   pending_signal_timeout: 14400
-  invalidation_check_interval: 30
-  entry_refiner_enabled: true
-  confirmation_bars: 2
-  liquidation_heatmap_enabled: true
-  liquidation_cache_ttl: 300
-  min_cluster_usd: 50000
-  backtest_window: 200
-  backtest_max_hold: 48
+  # How often the invalidation monitor re-checks each pending signal
+  # (signals/invalidation_monitor.py). Lower = catch stop-hits and
+  # entry-fills sooner, at the cost of slightly more price-cache lookups.
+  # Min 1s, default 15s.
+  invalidation_check_interval: 15
 
 # ============================================================
 # EXCHANGE — Binance Perpetual Futures
@@ -113,12 +110,9 @@ exchange:
   name: "binance"
   type: "future"
   testnet: false
-  rate_limit_buffer: 0.8
   timeout_ms: 30000        # increased: load_markets() downloads 300+ contracts
-  connect_timeout_ms: 15000
   retry_attempts: 5
   retry_delay: 3.0
-  recv_window: 5000
   excluded_symbols:
     - "UP/USDT"
     - "DOWN/USDT"
@@ -154,32 +148,26 @@ telegram:
   # market_chat_id = MARKET channel  (digests)
   # admin_chat_id  = ADMIN channel   (system chatter, debug)
   parse_mode: "HTML"
-  disable_web_preview: true
-  market_digest_interval_hours: 4
   send_signals: true
   send_watchlist_alerts: true
   send_whale_alerts: true
   send_tier_promotions: true
   send_circuit_breaker_alerts: true
   send_daily_summary: true
-  send_weekly_report: true
   send_startup_message: true
   send_error_alerts: true
   daily_summary_hour: 8
-  weekly_report_day: 6
+  # Per-symbol publish cooldown in seconds. Prevents two back-to-back alerts on
+  # the same symbol (e.g. different strategies scoring the same setup). A+
+  # signals bypass this gate. Set to 0 to disable.
   min_signal_interval: 60
   max_signals_per_hour: 12  # Matched aggregator increase
-  emoji_style: "professional"
-  show_confluence_stack: true
-  show_invalidation: true
-  show_session_info: true
 
 # ============================================================
 # SCANNING — Tiered universe management
 # ============================================================
 scanning:
   quote_currency: "USDT"
-  min_price_usdt: 0.000001
   tier1:
     enabled: true
     max_symbols: 120
@@ -207,16 +195,6 @@ scanning:
     min_volume_spike: 3.0
     cooldown_minutes: 45
     send_telegram_alert: true
-  priority_sectors:
-    - "LAYER1"
-    - "LAYER2"
-    - "DEFI"
-    - "AI"
-    - "GAMING"
-    - "RWA"
-    - "DEPIN"
-    - "EXCHANGE"
-    - "LSD"
 
 # ============================================================
 # STRATEGIES

@@ -75,19 +75,31 @@ class CorrelationAnalyzer:
                 return beta, corr
 
         btc_ohlcv = await api.fetch_ohlcv("BTC/USDT", "1h", limit=dynamic_window + 1)
+        # AUDIT FIX: when we don't have enough data, return a conservative
+        # (high-correlation) assumption so portfolio exposure / sizing gates
+        # err on the SAFE side instead of under-counting correlated risk.
+        # Previous default (1.0, 0.5) made a new listing look half-correlated
+        # and let heat checks pass through.
+        _FALLBACK_BETA, _FALLBACK_CORR = 1.0, 0.85
         if not btc_ohlcv or not ohlcv_symbol or len(ohlcv_symbol) < dynamic_window:
-            return 1.0, 0.5
+            return _FALLBACK_BETA, _FALLBACK_CORR
 
         # Align lengths
         n = min(len(btc_ohlcv), len(ohlcv_symbol), dynamic_window) - 1
         btc_closes = np.array([c[4] for c in btc_ohlcv[-n-1:]], dtype=float)
         sym_closes = np.array([c[4] for c in ohlcv_symbol[-n-1:]], dtype=float)
 
-        btc_returns = np.diff(np.log(btc_closes + 1e-10))
-        sym_returns = np.diff(np.log(sym_closes + 1e-10))
+        # Guard against zero / non-positive prices before taking logs — avoid
+        # the previous `+ 1e-10` additive bias that materially skewed returns
+        # on sub-cent coins.
+        if (btc_closes <= 0).any() or (sym_closes <= 0).any():
+            return _FALLBACK_BETA, _FALLBACK_CORR
+
+        btc_returns = np.diff(np.log(btc_closes))
+        sym_returns = np.diff(np.log(sym_closes))
 
         if len(btc_returns) < 10 or np.std(btc_returns) == 0:
-            return 1.0, 0.5
+            return _FALLBACK_BETA, _FALLBACK_CORR
 
         # Beta = Cov(sym, btc) / Var(btc)
         cov  = np.cov(sym_returns, btc_returns)[0, 1]

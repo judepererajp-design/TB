@@ -120,8 +120,15 @@ class NetworkActivityAnalyzer:
 
     async def stop(self):
         self._running = False
+        # AUDIT FIX: await the cancelled task before closing the aiohttp
+        # session so pending ``_update_all`` HTTP calls can unwind cleanly.
         if self._task:
             self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._task = None
         if self._session:
             await self._session.close()
 

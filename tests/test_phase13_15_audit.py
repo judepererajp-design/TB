@@ -88,9 +88,15 @@ class TestSignalDatabaseEnsembleVotes:
 
     @pytest.mark.asyncio
     async def test_save_signal_persists_ensemble_votes_json(self):
-        sys.modules.setdefault("aiosqlite", MagicMock())
+        # aiosqlite is available as a real dependency (see requirements.txt).
+        # Previously this used sys.modules.setdefault(..., MagicMock()) which
+        # poisoned downstream tests that actually need the real module.
+        import aiosqlite  # noqa: F401
         sys.modules.setdefault("data.connection_pool", MagicMock(ConnectionPool=MagicMock()))
-        module_path = Path("/home/runner/work/Titanbot/Titanbot/data/database.py")
+        # Resolve relative to this test file so the test works regardless of
+        # where the repository is checked out (was previously hard-coded to
+        # /home/runner/work/Titanbot/Titanbot/...).
+        module_path = Path(__file__).resolve().parents[1] / "data" / "database.py"
         spec = importlib.util.spec_from_file_location("audit_database_module", module_path)
         dbmod = importlib.util.module_from_spec(spec)
         assert spec and spec.loader

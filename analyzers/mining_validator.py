@@ -141,8 +141,17 @@ class MiningValidatorAnalyzer:
 
     async def stop(self):
         self._running = False
+        # AUDIT FIX: previously cancelled the task and immediately closed
+        # the aiohttp session, which could race with pending I/O inside
+        # `_poll_loop` and surface as "Session is closed" errors plus
+        # "Task was destroyed but it is pending" warnings.
         if self._task:
             self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._task = None
         if self._session:
             await self._session.close()
 
@@ -238,6 +247,15 @@ class MiningValidatorAnalyzer:
         """Fetch current fee market data from mempool.space."""
         if not self._session:
             return
+        # AUDIT FIX: ``fastest`` and ``level`` were only assigned inside the
+        # first ``async with`` on a HTTP-200 response.  When the first call
+        # failed (timeout/503) but the second ``/mempool`` call succeeded,
+        # the trailing ``logger.debug`` referenced undefined locals and
+        # raised ``NameError`` (silently swallowed by the outer except,
+        # but wiping every subsequent update in this tick).  Initialise
+        # defaults up-front so the log line is always safe.
+        fastest = 0
+        level = "LOW"
         try:
             # Fee estimates
             url = f"{_MEMPOOL_SPACE}/v1/fees/recommended"

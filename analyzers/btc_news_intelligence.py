@@ -254,6 +254,13 @@ class NewsClassifier:
         (MACRO_RISK_OFF) but the headline also contains bullish capital-inflow
         keywords, ``is_mixed`` is True so the caller can apply softer penalties
         instead of a full hard-block.
+
+        AUDIT FIX: Keyword matches are de-duplicated by match position so
+        overlapping keywords within the same rule (e.g. ``"tariff"`` +
+        ``"tariffs"``, ``"hack"`` + ``"hacked"``, ``"bankrupt"`` +
+        ``"bankruptcy"``) can't inflate the confidence by counting the same
+        substring multiple times.  Uses word-boundary-ish matching so
+        "important" no longer matches "import".
         """
         low = title.lower()
 
@@ -265,7 +272,25 @@ class NewsClassifier:
         all_matches: List[Tuple[BTCEventType, str, float]] = []
 
         for keywords, event_type, direction, base_conf in _HEADLINE_RULES:
-            hits = sum(1 for kw in keywords if kw in low)
+            # AUDIT FIX (keyword inflation): collect matched spans and drop
+            # any span fully contained inside another.  "hacked" matches both
+            # "hack" and "hacked" — we count the longest matching keyword only.
+            matched_spans: List[Tuple[int, int, str]] = []
+            for kw in keywords:
+                start = low.find(kw)
+                while start != -1:
+                    matched_spans.append((start, start + len(kw), kw))
+                    start = low.find(kw, start + 1)
+            # Sort longest-first so contained sub-matches are discarded.
+            matched_spans.sort(key=lambda s: (s[0], -(s[1] - s[0])))
+            unique_hits: List[Tuple[int, int]] = []
+            for s, e, _kw in matched_spans:
+                if any(us <= s and e <= ue for us, ue in unique_hits):
+                    continue  # contained inside an already-counted span
+                # Drop a previous span if this new one strictly contains it
+                unique_hits = [(us, ue) for us, ue in unique_hits if not (s <= us and ue <= e)]
+                unique_hits.append((s, e))
+            hits = len(unique_hits)
             if hits > 0:
                 conf = min(1.0, base_conf + (hits - 1) * 0.08)
                 all_matches.append((event_type, direction, conf))
@@ -292,6 +317,20 @@ class NewsClassifier:
                 )
                 if has_bullish:
                     is_mixed = True
+        elif best_dir == "BULLISH" and best_type in (
+            BTCEventType.MACRO_RISK_ON, BTCEventType.BTC_FUNDAMENTAL
+        ):
+            # AUDIT FIX: symmetric mixed-signal detection for BULLISH winners
+            # with conflicting bearish rule hits.  Prevents the bot from
+            # loading full bullish boost into headlines like
+            # "Microstrategy buys BTC despite Fed rate hike".
+            if len(all_matches) >= 2:
+                has_bearish = any(
+                    d == "BEARISH" for _, d, c in all_matches
+                    if c > NewsIntelligence.MIXED_SIGNAL_MIN_BULLISH_CONF
+                )
+                if has_bearish:
+                    is_mixed = True
 
         return best_type, best_dir, best_conf, is_mixed
 
@@ -305,9 +344,17 @@ class NewsClassifier:
         if not headlines:
             return BTCEventType.UNKNOWN, "NEUTRAL", 0.0, "", False
 
-        votes: Dict[BTCEventType, float] = {}
+        # AUDIT FIX (news batch dilution): the previous aggregation normalized by
+        # `len(headlines)` which meant a single high-confidence risk-off headline
+        # in a batch of 10 unrelated items was diluted from ~0.9 down to ~0.18,
+        # silently suppressing real risk-off events.  We now use the MAX confidence
+        # per event type as the base and add a small support bonus (capped at
+        # +0.25) for additional headlines supporting the winning type.  This:
+        #   • preserves strong single-headline signals,
+        #   • still rewards consensus across multiple supporting headlines,
+        #   • prevents weak-headline spam from amplifying past the cap.
+        type_entries: Dict[BTCEventType, List[Tuple[float, str]]] = {}
         vote_dirs: Dict[BTCEventType, Set[str]] = {}
-        best_headline = ""
         any_mixed = False
 
         for h in headlines:
@@ -315,18 +362,21 @@ class NewsClassifier:
             if is_mixed:
                 any_mixed = True
             if etype != BTCEventType.UNKNOWN and conf > 0:
-                votes[etype]     = votes.get(etype, 0) + conf
-                if etype not in vote_dirs:
-                    vote_dirs[etype] = set()
-                vote_dirs[etype].add(direction)
-                if conf > 0.2:
-                    best_headline = h
+                type_entries.setdefault(etype, []).append((conf, h))
+                vote_dirs.setdefault(etype, set()).add(direction)
 
-        if not votes:
+        if not type_entries:
             return BTCEventType.UNKNOWN, "NEUTRAL", 0.0, "", False
 
-        winner = max(votes, key=lambda k: votes[k])
-        norm_conf = min(1.0, votes[winner] / max(1, len(headlines)) * 2)
+        # Winner = event type with the single highest-confidence headline.
+        winner = max(type_entries, key=lambda k: max(e[0] for e in type_entries[k]))
+        entries_sorted = sorted(type_entries[winner], key=lambda x: x[0], reverse=True)
+        base_conf, best_headline = entries_sorted[0]
+        # Support bonus from other headlines of the same type (clip each at 0.6
+        # so a spam of near-duplicate weak headlines can't drown out quality).
+        support_sum = sum(min(c, 0.6) for c, _ in entries_sorted[1:])
+        bonus = min(0.25, support_sum * 0.2)
+        norm_conf = min(1.0, base_conf + bonus)
 
         # Pick dominant direction for the winning type
         # If multiple directions seen for one type, that's already mixed
@@ -644,12 +694,30 @@ class BTCNewsIntelligence:
                (direction == "BEARISH" and move_dir == "UP"):
                 conf *= 0.6   # news contradicts price — lower confidence
 
-        # Only update context if new event is higher confidence or different type
+        # Only update context if new event is higher confidence or different type.
+        # AUDIT FIX: for DIFFERENT event types, require the new confidence to be at
+        # least EVENT_REPLACE_CONF_RATIO × current confidence.  Prevents a weak
+        # BTC_TECHNICAL headline from clobbering an active high-confidence
+        # EXCHANGE_EVENT / MACRO_RISK_OFF block just because the type differs.
+        # AUDIT FIX (cross-type decay): when the event type changes we additionally
+        # require STRICT superiority over the current confidence.  Without this,
+        # a 0.77 headline could replace an active 0.9 context (0.77 ≥ 0.9×0.85)
+        # causing gradual signal decay via type-swap rather than via TTL expiry.
         async with self._ctx_lock:
-            if conf > self._current_ctx.confidence or \
-               not self._current_ctx.is_active or \
-               etype != self._current_ctx.event_type:
-
+            _should_update = False
+            if not self._current_ctx.is_active:
+                _should_update = True
+            elif etype == self._current_ctx.event_type:
+                _should_update = conf > self._current_ctx.confidence
+            else:
+                _min_replace = (
+                    self._current_ctx.confidence * NewsIntelligence.EVENT_REPLACE_CONF_RATIO
+                )
+                _should_update = (
+                    conf >= _min_replace
+                    and conf > self._current_ctx.confidence
+                )
+            if _should_update:
                 base_ttl = self._context_ttl.get(etype, 3600)
 
                 # ── Confidence-scaled TTL ─────────────────────────
@@ -980,8 +1048,24 @@ class BTCNewsIntelligence:
 
         reaction_check_id = chk.get("reaction_check_id")
 
-        # Apply to current context
-        if self._current_ctx.is_active and not self._current_ctx.reaction_validated:
+        # Apply to current context ONLY if this reaction check was scheduled
+        # for the currently active context.  AUDIT FIX: previously any pending
+        # check would mutate whichever context happened to be current at the
+        # time the check fired, so a new headline replacing the old context
+        # could inherit CONFIRM/CONTRADICT boosts scheduled for the prior one.
+        # Legacy pending-check dicts may omit ``reaction_check_id`` — fall
+        # back to comparing ``detected_at`` in that case.
+        _match_ref = reaction_check_id if reaction_check_id is not None else chk.get("detected_at")
+        _reaction_matches_ctx = (
+            _match_ref is not None
+            and self._current_ctx.detected_at > 0
+            and abs(self._current_ctx.detected_at - _match_ref) < 1e-3
+        )
+        if (
+            self._current_ctx.is_active
+            and not self._current_ctx.reaction_validated
+            and _reaction_matches_ctx
+        ):
             self._current_ctx.reaction_validated = True
             if result == "CONFIRMED":
                 self._current_ctx.reaction_confirmed = True

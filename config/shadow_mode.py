@@ -17,30 +17,45 @@ Usage:
 
 import json
 import logging
+import logging.handlers
 import time
+from pathlib import Path
 from typing import Any, Dict
 
 logger = logging.getLogger("titanbot.shadow")
 
 # Dedicated shadow mode logger — writes to shadow_mode.log
 _shadow_handler = None
+_setup_failed = False
+
+SHADOW_LOG_FILE = "logs/shadow_mode.log"
 
 
 def _ensure_handler():
-    """Lazy-init the file handler for shadow mode logs."""
-    global _shadow_handler
-    if _shadow_handler is not None:
+    """Lazy-init the rotating file handler for shadow mode logs."""
+    global _shadow_handler, _setup_failed
+    if _shadow_handler is not None or _setup_failed:
         return
     try:
-        _shadow_handler = logging.FileHandler("logs/shadow_mode.log", mode="a")
-        _shadow_handler.setFormatter(
+        Path(SHADOW_LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(
+            SHADOW_LOG_FILE,
+            maxBytes=5_242_880,   # 5 MB
+            backupCount=3,
+            encoding="utf-8",
+        )
+        handler.setFormatter(
             logging.Formatter("%(asctime)s | %(message)s")
         )
-        logger.addHandler(_shadow_handler)
+        logger.addHandler(handler)
         logger.setLevel(logging.INFO)
+        # Shadow entries are high-volume JSON; keep them out of the main log.
+        logger.propagate = False
+        _shadow_handler = handler
     except Exception:
-        # If we can't create the file handler, fall back to standard logging
-        _shadow_handler = True  # Prevent retries
+        # Disable further attempts but leave the handler reference as None so
+        # the sentinel can never be confused with a real handler object.
+        _setup_failed = True
 
 
 def shadow_log(feature: str, data: Dict[str, Any]):
@@ -53,6 +68,9 @@ def shadow_log(feature: str, data: Dict[str, Any]):
               'shadow' values so humans can compare.
     """
     _ensure_handler()
+    if _shadow_handler is None:
+        # Setup failed; skip silently rather than polluting the root logger.
+        return
     entry = {
         "ts": time.time(),
         "feature": feature,

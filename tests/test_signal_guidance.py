@@ -111,7 +111,7 @@ def test_dashboard_signal_detail_includes_guidance(monkeypatch):
 
     monkeypatch.setattr("data.database.db.get_signal", AsyncMock(return_value=sig))
     monkeypatch.setattr("web.app._json_response", lambda data, status=200: data)
-    sys.modules["tg.bot"] = types.SimpleNamespace(telegram_bot=types.SimpleNamespace(_by_signal_id={}))
+    monkeypatch.setitem(sys.modules, "tg.bot", types.SimpleNamespace(telegram_bot=types.SimpleNamespace(_by_signal_id={})))
 
     app = DashboardApp()
     request = types.SimpleNamespace(match_info={"id": "11"})
@@ -140,8 +140,8 @@ def test_dashboard_signals_list_includes_guidance(monkeypatch):
 
     monkeypatch.setattr("data.database.db.get_recent_signals", AsyncMock(return_value=[sig]))
     monkeypatch.setattr("web.app._json_response", lambda data, status=200: data)
-    sys.modules["core.execution_engine"] = types.SimpleNamespace(execution_engine=types.SimpleNamespace(_tracked={}))
-    sys.modules["tg.bot"] = types.SimpleNamespace(telegram_bot=types.SimpleNamespace(_by_signal_id={}))
+    monkeypatch.setitem(sys.modules, "core.execution_engine", types.SimpleNamespace(execution_engine=types.SimpleNamespace(_tracked={})))
+    monkeypatch.setitem(sys.modules, "tg.bot", types.SimpleNamespace(telegram_bot=types.SimpleNamespace(_by_signal_id={})))
 
     app = DashboardApp()
     request = types.SimpleNamespace(rel_url=types.SimpleNamespace(query={}))

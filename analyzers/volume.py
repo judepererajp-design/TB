@@ -213,6 +213,10 @@ class VolumeAnalyzer:
 
         # Value Area — 70% of total volume centered around POC
         total_volume = volume_at_price.sum()
+        # No traded volume means the profile is empty; leave the default
+        # POC/VA fields untouched instead of fabricating levels from zero bins.
+        if total_volume <= 0:
+            return
         target_volume = total_volume * self._value_area_pct
 
         va_volume = volume_at_price[poc_bin]
@@ -237,13 +241,17 @@ class VolumeAnalyzer:
         data.price_in_value_area = data.val <= current_price <= data.vah
 
         # Annotate
-        poc_dist = (current_price - data.poc) / data.poc * 100
-        if abs(poc_dist) < 0.5:
-            data.notes.append(f"🎯 Price at POC ({fmt_price(data.poc)}) — high interest level")
-        elif current_price > data.vah:
-            data.notes.append(f"⬆️ Price above Value Area — breakout zone")
-        elif current_price < data.val:
-            data.notes.append(f"⬇️ Price below Value Area — potential bounce")
+        # AUDIT FIX: guard against zero POC (empty bins / flat-price edge
+        # case) before dividing — matches the `if data.poc > 0` guard used
+        # elsewhere in this file (see _analyze_volume_score).
+        if data.poc > 0:
+            poc_dist = (current_price - data.poc) / data.poc * 100
+            if abs(poc_dist) < 0.5:
+                data.notes.append(f"🎯 Price at POC ({fmt_price(data.poc)}) — high interest level")
+            elif current_price > data.vah:
+                data.notes.append(f"⬆️ Price above Value Area — breakout zone")
+            elif current_price < data.val:
+                data.notes.append(f"⬇️ Price below Value Area — potential bounce")
 
     def _analyze_volume_trend(self, df: pd.DataFrame, data: VolumeData):
         """Detect volume trend and spikes"""

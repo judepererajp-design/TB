@@ -47,7 +47,13 @@ class SectorData:
     symbols: List[str] = field(default_factory=list)
     avg_change_24h: float = 0.0
     avg_change_7d: float = 0.0
-    volume_change_24h: float = 0.0    # Volume vs 7-day average
+    # AUDIT FIX: the previous docstring promised "Volume vs 7-day average"
+    # but _fetch_sector_data was storing the absolute mean quoteVolume here
+    # (a USD figure, not a %), silently mis-typed downstream.  Renaming to
+    # an explicit absolute field prevents any future consumer from treating
+    # this as a ratio.  Kept as a float so existing consumers see a 0.0
+    # default and not a KeyError.
+    avg_quote_volume_24h: float = 0.0   # Average 24h quote volume (USD)
     status: SectorStatus = SectorStatus.NEUTRAL
     score: float = 50.0               # 0-100, used for signal adjustment
     momentum: float = 0.0             # Rate of change of score
@@ -202,9 +208,16 @@ class AltcoinRotationTracker:
 
         sd = self._sectors[sector]
 
-        # Sector score → weight (50 = neutral 1.0, 0 = cold 0.6, 100 = hot 1.35)
-        weight = 0.6 + (sd.score / 100.0) * 0.75  # Maps 0-100 → 0.6-1.35
-        weight = round(max(0.6, min(1.35, weight)), 3)
+        # AUDIT FIX: center the mapping on score=50 → weight=1.00 so a
+        # NEUTRAL sector imparts no systematic drag.  Previous formula
+        # 0.6 + score/100*0.75 made score=50 map to 0.975 (-2.5% silent
+        # penalty on every neutral-sector signal).
+        # New: 50 → 1.00, 0 → 0.65, 100 → 1.35 (linear on each side).
+        if sd.score >= 50:
+            weight = 1.0 + (sd.score - 50) / 50.0 * 0.35    # 50→1.00, 100→1.35
+        else:
+            weight = 1.0 - (50 - sd.score) / 50.0 * 0.35    # 50→1.00, 0→0.65
+        weight = round(max(0.65, min(1.35, weight)), 3)
 
         # Direction alignment penalty/bonus
         if direction == "LONG" and sd.status in (SectorStatus.COLD, SectorStatus.COOL):
@@ -319,7 +332,7 @@ class AltcoinRotationTracker:
 
             if changes_24h:
                 sector_data.avg_change_24h = float(np.mean(changes_24h))
-                sector_data.volume_change_24h = float(np.mean(volumes)) if volumes else 0
+                sector_data.avg_quote_volume_24h = float(np.mean(volumes)) if volumes else 0
                 sector_data.leader = best_symbol
                 sector_data.laggard = worst_symbol
                 sector_data.last_updated = time.time()
@@ -328,15 +341,31 @@ class AltcoinRotationTracker:
         """Classify each sector's status based on performance + momentum"""
         hot_threshold = cfg.analyzers.rotation.get('hot_sector_gain', 5.0)
         cold_threshold = cfg.analyzers.rotation.get('cold_sector_loss', -3.0)
+        # AUDIT FIX (HOT/WARM hysteresis): without an exit band, a sector
+        # oscillating around the 5 % boundary flip-flops between HOT and WARM
+        # each refresh, causing rotation-weight thrashing in sideways markets.
+        # Add an asymmetric exit band so HOT only drops back to WARM once the
+        # sector cools ~1 pp below the hot threshold.
+        hot_exit_threshold = max(1.0, hot_threshold - 1.0)
 
         for sector_name, sector_data in self._sectors.items():
             change = sector_data.avg_change_24h
+            was_hot = sector_data.status == SectorStatus.HOT
 
             # Calculate momentum (acceleration): how fast is the score changing?
             old_score = sector_data.score
             if change >= hot_threshold:
                 sector_data.status = SectorStatus.HOT
                 sector_data.score = min(100, 70 + (change - hot_threshold) * 3)
+            elif was_hot and change >= hot_exit_threshold:
+                # Hysteresis: stay HOT until we fall clearly below the entry
+                # band.  Score from a reduced anchor (hot_exit_threshold) so a
+                # sector sitting in the hysteresis band doesn't end up scoring
+                # LOWER than at its HOT entry point (which would happen if we
+                # still subtracted hot_threshold here — change-hot_threshold
+                # goes negative in the band).
+                sector_data.status = SectorStatus.HOT
+                sector_data.score = min(100, 70 + (change - hot_exit_threshold) * 3)
             elif change >= 1.0:
                 sector_data.status = SectorStatus.WARM
                 # BUG-2 FIX: cap at 69.9 — without cap, WARM near the HOT threshold

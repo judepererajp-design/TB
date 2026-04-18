@@ -132,6 +132,16 @@ class ExecutionQualityGate:
         Returns ExecutionAssessment with block/penalize decision and full breakdown.
         """
         result = ExecutionAssessment()
+        # AUDIT FIX (execution_gate locals antipattern): these positioning
+        # fields used to be assigned only inside the `if context:` block,
+        # which forced the call below to `locals().get(...)` as a safety
+        # net.  Initialize them to neutral defaults up-front so callers can
+        # be referenced directly and it's clear what defaults apply when
+        # no context is supplied.
+        derivatives_score = 50.0
+        sentiment_score = 50.0
+        funding_rate = 0.0
+        oi_change_24h = 0.0
         if context:
             session_ctx = dict((context or {}).get("session") or {})
             trigger_ctx = dict((context or {}).get("trigger") or {})
@@ -250,10 +260,10 @@ class ExecutionQualityGate:
         # ── 7. Positioning / derivatives score ────────────────────
         positioning_score = self._score_positioning(
             direction=direction,
-            derivatives_score=locals().get("derivatives_score", 50.0),
-            sentiment_score=locals().get("sentiment_score", 50.0),
-            funding_rate=locals().get("funding_rate", 0.0),
-            oi_change_24h=locals().get("oi_change_24h", 0.0),
+            derivatives_score=derivatives_score,
+            sentiment_score=sentiment_score,
+            funding_rate=funding_rate,
+            oi_change_24h=oi_change_24h,
         )
         result.factors['positioning'] = positioning_score
         if positioning_score <= EG.BAD_FACTOR_THRESHOLD:

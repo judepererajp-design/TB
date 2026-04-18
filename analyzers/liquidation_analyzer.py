@@ -238,8 +238,17 @@ class LiquidationAnalyzer:
 
     async def stop(self):
         self._running = False
+        # AUDIT FIX: await the cancelled task before closing the session so
+        # any in-flight ``_get``/``_post`` finishes tearing down cleanly.
+        # Previously this produced "Task was destroyed but it is pending"
+        # warnings and sporadic "Session is closed" errors on shutdown.
         if self._task:
             self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._task = None
         if self._session and not self._session.closed:
             await self._session.close()
 
@@ -261,9 +270,13 @@ class LiquidationAnalyzer:
         for coin, ci in self._cache.items():
             if ci.is_stale:
                 continue
+            # AUDIT FIX: ``CoinIntelligence`` has ``total_oi_usd`` and
+            # ``by_exchange``/``exchange_count`` — not ``oi_usd``/``exchanges``.
+            # The previous attribute names would raise AttributeError on
+            # every dashboard refresh, taking the liquidation panel down.
             result.append({
                 "coin":          coin,
-                "oi_usd":        ci.oi_usd,
+                "oi_usd":        ci.total_oi_usd,
                 "funding_rate":  ci.funding_rate,
                 "long_ratio":    ci.long_ratio,
                 "short_ratio":   1.0 - ci.long_ratio,
@@ -272,7 +285,7 @@ class LiquidationAnalyzer:
                 "liq_above":     [[p, u] for p, u in (ci.liq_above or [])[:5]],
                 "liq_below":     [[p, u] for p, u in (ci.liq_below or [])[:5]],
                 "current_price": ci.current_price,
-                "exchanges":     ci.exchanges,
+                "exchanges":     list((ci.by_exchange or {}).keys()),
                 "fetched_at":    ci.fetched_at,
             })
         return sorted(result, key=lambda x: x["oi_usd"], reverse=True)
@@ -973,9 +986,17 @@ class LiquidationAnalyzer:
             if est_price <= 0:
                 continue
 
-            # Round to nearest bucket
-            bucket = round(est_price / (est_price * bucket_pct)) * (est_price * bucket_pct)
-            bucket = round(bucket / (current_price * bucket_pct)) * (current_price * bucket_pct)
+            # AUDIT FIX: round the *historical* OI injection point into a
+            # price bucket sized relative to the *current* price so clusters
+            # aggregated over time share a consistent grid.  The prior two
+            # lines compounded two rounding passes that systematically
+            # inflated the bucket by ~``bucket_pct/2`` (≈0.75 % at default
+            # bucket_pct=0.015), shifting every long/short liq estimate
+            # away from price by roughly half a bucket.
+            bucket_size = current_price * bucket_pct
+            if bucket_size <= 0:
+                continue
+            bucket = round(est_price / bucket_size) * bucket_size
 
             price_buckets[bucket] += abs(oi_delta)
 

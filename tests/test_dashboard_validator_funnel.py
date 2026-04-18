@@ -8,11 +8,11 @@ from unittest.mock import AsyncMock
 def test_signal_funnel_uses_windowed_validator_counts(monkeypatch):
     from web.app import DashboardApp
 
-    sys.modules["data.database"] = types.SimpleNamespace(
+    monkeypatch.setitem(sys.modules, "data.database", types.SimpleNamespace(
         db=types.SimpleNamespace(
             get_signal_funnel=AsyncMock(return_value={"published": 4, "taken": 2})
         )
-    )
+    ))
     monkeypatch.setattr("web.app._json_response", lambda data, status=200: data)
     monkeypatch.setattr("time.time", lambda: 1_000.0)
 
@@ -25,15 +25,15 @@ def test_signal_funnel_uses_windowed_validator_counts(monkeypatch):
             {"kill_reason": "RR_FLOOR", "ts": 975.0},
         ])
     )
-    sys.modules["core.diagnostic_engine"] = types.SimpleNamespace(
+    monkeypatch.setitem(sys.modules, "core.diagnostic_engine", types.SimpleNamespace(
         diagnostic_engine=diagnostic_engine
-    )
-    sys.modules["config.feature_flags"] = types.SimpleNamespace(
+    ))
+    monkeypatch.setitem(sys.modules, "config.feature_flags", types.SimpleNamespace(
         ff=types.SimpleNamespace(get_state=lambda name: "live")
-    )
-    sys.modules["signals.signal_validator"] = types.SimpleNamespace(
+    ))
+    monkeypatch.setitem(sys.modules, "signals.signal_validator", types.SimpleNamespace(
         signal_validator=types.SimpleNamespace(get_warning_count=lambda hours=None: 3)
-    )
+    ))
 
     app = DashboardApp()
     request = types.SimpleNamespace(rel_url=types.SimpleNamespace(query={"hours": "0"}))

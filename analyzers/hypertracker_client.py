@@ -183,8 +183,18 @@ class HyperTrackerClient:
 
     async def stop(self):
         self._running = False
+        # AUDIT FIX: previously we cancelled the task and then immediately
+        # closed the aiohttp session without awaiting the cancelled task.
+        # If `_poll_loop` was mid-request, the session could be closed
+        # underneath it, causing "Session is closed" errors and
+        # "Task was destroyed but it is pending" warnings at shutdown.
         if self._task:
             self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._task = None
         if self._session and not self._session.closed:
             await self._session.close()
 
@@ -310,15 +320,22 @@ class HyperTrackerClient:
                 latest = bias_list[0] if bias_list else {}
                 perp_bias = float(latest.get("bias") or 0.0)
 
-                # Map -1..1 to 0..100 score and label
+                # Map -1..1 to 0..100 score and label.
+                # AUDIT FIX: previous boundaries (±0.2, ±0.5) produced label/score
+                # mismatches — e.g. perp_bias=-0.2 → "Neutral" label but score=40,
+                # which format_signal_intel() later flagged as "against LONG"
+                # (its threshold is bias_score<45 for LONG / >55 for SHORT).
+                # New boundaries keep the "Neutral" band at scores 45..55 so a
+                # Neutral cohort never trips a directional penalty:
+                #   perp_bias ∈ (-0.10, +0.10)  →  score ∈ (45, 55)
                 bias_score = int((perp_bias + 1) / 2 * 100)
                 if perp_bias >= 0.5:
                     bias_raw = "Very Bullish"
-                elif perp_bias >= 0.2:
+                elif perp_bias >= 0.10:        # score ≥ 55 → Bullish
                     bias_raw = "Bullish"
-                elif perp_bias >= -0.2:
+                elif perp_bias > -0.10:        # score in (45, 55) → Neutral
                     bias_raw = "Neutral"
-                elif perp_bias >= -0.5:
+                elif perp_bias > -0.5:         # score ≤ 45 → Bearish
                     bias_raw = "Bearish"
                 else:
                     bias_raw = "Very Bearish"

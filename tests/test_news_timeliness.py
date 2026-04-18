@@ -9,7 +9,9 @@ The bot should:
 """
 
 import asyncio
+import sys
 import time
+import types
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -94,8 +96,14 @@ class TestStalenessGate:
         """Headlines within the gate should create context normally."""
         bni = BTCNewsIntelligence()
 
+        # Use a headline that independently scores above NEWS_GATING_MIN_CONFIDENCE
+        # after the news-batch-dilution fix (which removed the old 2× amplification
+        # of single-headline batches).  Multiple rule keywords ensure this.
         headlines = [
-            self._make_headline("Fed raises rates, recession fears grow — bitcoin crashes", 2),
+            self._make_headline(
+                "Recession looms as hawkish Fed rate hike triggers market panic",
+                2,
+            ),
         ]
         await bni.process_headlines(headlines)
         ctx = bni.get_event_context()
@@ -109,7 +117,10 @@ class TestStalenessGate:
 
         headlines = [
             self._make_headline("Old: Fed raises rates, recession fears", gate + 30),
-            self._make_headline("Fed raises rates, inflation surges — bitcoin drops to new low", 5),
+            self._make_headline(
+                "Banking crisis deepens: bank run triggers contagion, capital flight from risk assets",
+                5,
+            ),
         ]
         await bni.process_headlines(headlines)
         ctx = bni.get_event_context()
@@ -135,6 +146,86 @@ class TestStalenessGate:
     async def test_gate_is_configurable(self):
         """Verify the gate uses the constant value."""
         assert NewsIntelligence.STALE_HEADLINE_ALERT_GATE_MINUTES == 45
+
+
+@pytest.mark.asyncio
+async def test_news_scraper_stop_cancels_tracked_bni_tasks():
+    """Tracked background news-intelligence tasks should be cancelled on stop."""
+    from analyzers.news_scraper import NewsScraper
+
+    scraper = NewsScraper()
+    sleeper = asyncio.create_task(asyncio.sleep(60))
+    scraper._bni_tasks.add(sleeper)
+
+    await scraper.stop()
+
+    assert sleeper.cancelled()
+    assert scraper._bni_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_news_scraper_fetch_news_tracks_real_bni_dispatch_path():
+    """Fresh headlines should create and track the background BNI task via
+    the real _fetch_news dispatch path."""
+    from analyzers.news_scraper import NewsItem, NewsScraper
+    import analyzers.news_scraper as news_scraper_mod
+
+    class _Resp:
+        status = 200
+
+        async def text(self):
+            return "<rss />"
+
+    class _RespCtx:
+        async def __aenter__(self):
+            return _Resp()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class _Session:
+        def get(self, _url):
+            return _RespCtx()
+
+    blocker = asyncio.Event()
+    seen_batches = []
+
+    async def _process_headlines(batch):
+        seen_batches.append(batch)
+        await blocker.wait()
+
+    fake_bni_mod = types.SimpleNamespace(
+        btc_news_intelligence=types.SimpleNamespace(process_headlines=_process_headlines)
+    )
+    fake_narrative_mod = types.SimpleNamespace(
+        narrative_tracker=types.SimpleNamespace(process_headline=lambda *_args, **_kwargs: None)
+    )
+
+    scraper = NewsScraper()
+    scraper._news_ttl = 0.0
+
+    with patch.object(news_scraper_mod, "RSS_FEEDS", [("TestFeed", "https://example.test/rss")]), \
+         patch.object(scraper, "_get_session", AsyncMock(return_value=_Session())), \
+         patch.object(scraper, "_parse_rss", return_value=[
+             NewsItem(
+                 title="Fresh headline",
+                 source="TestFeed",
+                 url="https://example.test/story",
+                 published_at=time.time(),
+             )
+         ]), \
+         patch.object(scraper, "_fetch_free_crypto_news", AsyncMock(return_value=[])), \
+         patch.dict(sys.modules, {
+             "analyzers.btc_news_intelligence": fake_bni_mod,
+             "analyzers.narrative_tracker": fake_narrative_mod,
+         }):
+        await scraper._fetch_news()
+        await asyncio.sleep(0)
+        assert len(scraper._bni_tasks) == 1
+        assert seen_batches and seen_batches[0][0]["title"] == "Fresh headline"
+        await scraper.stop()
+
+    assert scraper._bni_tasks == set()
 
 
 # ─── Confidence decay tests ──────────────────────────────────────

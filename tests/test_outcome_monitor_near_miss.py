@@ -27,6 +27,7 @@ if 'core.price_cache' not in sys.modules:
     _pc_mod = types.ModuleType('core.price_cache')
     _pc_mod.price_cache = types.SimpleNamespace(
         get_prices=lambda: {},
+        get=lambda symbol: None,
         subscribe=lambda symbol: None,
         unsubscribe=lambda symbol: None,
     )
