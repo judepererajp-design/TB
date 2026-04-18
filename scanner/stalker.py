@@ -40,6 +40,15 @@ def _get_regime() -> str:
         return "UNKNOWN"
 
 
+def _regime_recently_changed(within_secs: int = 600) -> bool:
+    """Return True iff the regime changed within the last ``within_secs`` seconds."""
+    try:
+        from analyzers.regime import regime_analyzer
+        return regime_analyzer.is_recently_transitioned(within_secs)
+    except Exception:
+        return False
+
+
 class StalkerEngine:
     """
     Monitors potential pre-breakout setups and populates the watchlist.
@@ -65,15 +74,27 @@ class StalkerEngine:
             return None
 
         # Dynamic threshold — mirrors scanner.stalker_scan logic
+        # Hysteresis: damp by 25% within 10 min of a regime flip.
         _regime = _get_regime()
+        _recently_flipped = _regime_recently_changed(600)
         if _regime == "CHOPPY":
-            min_score = self._min_watch_score + 8
+            _raw_adj = 8
         elif _regime in ("VOLATILE", "VOLATILE_PANIC"):
-            min_score = self._min_watch_score + 5
+            _raw_adj = 5
         elif _regime in ("BULL_TREND", "BEAR_TREND"):
-            min_score = self._min_watch_score - 5
+            _raw_adj = -5
         else:
-            min_score = self._min_watch_score
+            _raw_adj = 0
+        if _recently_flipped:
+            _raw_adj = round(_raw_adj * 0.75)
+        min_score = self._min_watch_score + _raw_adj
+
+        # Regime-dependent dedup TTL (mirrors scanner.stalker_scan)
+        _base_dedup_ttl = 1800  # 30 min
+        if _regime in ("BULL_TREND", "BEAR_TREND"):
+            _dedup_ttl = _base_dedup_ttl        # 30 min — signals evolve slowly
+        else:
+            _dedup_ttl = _base_dedup_ttl // 2   # 15 min — allow re-entries in chop
 
         df = pd.DataFrame(ohlcv_1h, columns=['ts','open','high','low','close','volume'])
         df = df.astype({'open': float,'high': float,'low': float,'close': float,'volume': float})
@@ -130,15 +151,14 @@ class StalkerEngine:
 
         # Cross-path dedup: consult scanner singleton's shared dedup dict so
         # that StalkerEngine and scanner.stalker_scan don't both fire for the
-        # same symbol within the dedup TTL window.
+        # same symbol within the regime-dependent dedup TTL window.
         setup_type = "pre_breakout"
         dedup_key  = (symbol, setup_type)
         now        = time.time()
         try:
             from scanner.scanner import scanner as _scanner_singleton
-            dedup     = _scanner_singleton._signal_dedup
-            dedup_ttl = _scanner_singleton._signal_dedup_ttl
-            if now - dedup.get(dedup_key, 0) < dedup_ttl:
+            dedup = _scanner_singleton._signal_dedup
+            if now - dedup.get(dedup_key, 0) < _dedup_ttl:
                 return None
             dedup[dedup_key] = now
         except Exception:

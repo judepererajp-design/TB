@@ -36,6 +36,15 @@ def _get_regime() -> str:
     except Exception:
         return "UNKNOWN"
 
+
+def _regime_recently_changed(within_secs: int = 600) -> bool:
+    """Return True iff the regime changed within the last ``within_secs`` seconds."""
+    try:
+        from analyzers.regime import regime_analyzer
+        return regime_analyzer.is_recently_transitioned(within_secs)
+    except Exception:
+        return False
+
 logger = logging.getLogger(__name__)
 
 
@@ -463,11 +472,16 @@ class Scanner:
 
                 # Single-level whale wall
                 if order_usd >= min_order_usd:
-                    # ── Persistence check ──────────────────────────
+                    # ── Persistence check (relative ratio) ─────────
+                    # Require prev_snapshot >= 50% of current snapshot so that the
+                    # persistence bar scales with order size rather than being
+                    # anchored to the fixed min_order_usd threshold.
+                    # This filters spoofed walls that vanish between polls while
+                    # still allowing genuine whales that grew since last snapshot.
                     prev = self._whale_snapshot.setdefault(symbol, {}).get(side, 0.0)
                     self._whale_snapshot[symbol][side] = order_usd
-                    if prev < min_order_usd * 0.5:
-                        # First sighting — record but don't fire yet (may be spoof)
+                    if prev == 0.0 or (prev / order_usd) < 0.5:
+                        # First sighting or too small relative to current — record but don't fire yet
                         logger.debug(
                             f"🐋 Whale candidate (first sighting): "
                             f"{symbol} {side} ${order_usd:,.0f} @ {price}"
@@ -494,11 +508,11 @@ class Scanner:
                 if abs(price - current_price) <= price_band:
                     cumulative_usd += order_usd
 
-            # Distributed / iceberg whale — same persistence check
+            # Distributed / iceberg whale — same relative persistence check
             if cumulative_usd >= min_order_usd:
                 prev = self._whale_snapshot.setdefault(symbol, {}).get(f"iceberg_{side}", 0.0)
                 self._whale_snapshot[symbol][f"iceberg_{side}"] = cumulative_usd
-                if prev < min_order_usd * 0.5:
+                if prev == 0.0 or (prev / cumulative_usd) < 0.5:
                     logger.debug(
                         f"🐋 Iceberg candidate (first sighting): "
                         f"{symbol} {side} ${cumulative_usd:,.0f} cumulative"
@@ -549,15 +563,29 @@ class Scanner:
 
         # Dynamic threshold: raise the bar in CHOPPY (signal flood risk),
         # lower it in trending regimes (signals are scarcer but higher quality).
+        # Hysteresis: damp adjustments 25% within 10 min of a regime flip to
+        # prevent violent over-correction right after a transition.
         _regime = _get_regime()
+        _recently_flipped = _regime_recently_changed(600)
         if _regime == "CHOPPY":
-            _min_score = 58   # +8 above base 50
+            _raw_adj = 8
         elif _regime in ("VOLATILE", "VOLATILE_PANIC"):
-            _min_score = 55   # +5
+            _raw_adj = 5
         elif _regime in ("BULL_TREND", "BEAR_TREND"):
-            _min_score = 45   # −5
+            _raw_adj = -5
         else:
-            _min_score = 50   # base
+            _raw_adj = 0
+        if _recently_flipped:
+            _raw_adj = round(_raw_adj * 0.75)   # damp by 25% during transition
+        _min_score = 50 + _raw_adj
+
+        # Regime-dependent dedup TTL:
+        # TREND → signals evolve slowly, 30 min window avoids duplicate noise.
+        # CHOPPY → signals flip quickly, 15 min window allows valid re-entries.
+        if _regime in ("BULL_TREND", "BEAR_TREND"):
+            _dedup_ttl = self._signal_dedup_ttl        # 30 min
+        else:
+            _dedup_ttl = self._signal_dedup_ttl // 2   # 15 min in chop/volatile
 
         df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
         df = df.astype({'open':float,'high':float,'low':float,'close':float,'volume':float})
@@ -635,11 +663,11 @@ class Scanner:
 
         if score >= _min_score:
             # Cross-path dedup: if stalker.StalkerEngine already raised this
-            # symbol / setup within the TTL window, don't double-fire.
+            # symbol / setup within the regime-dependent TTL window, don't double-fire.
             setup_type = "pre_breakout"
             dedup_key  = (symbol, setup_type)
             now        = time.time()
-            if now - self._signal_dedup.get(dedup_key, 0) < self._signal_dedup_ttl:
+            if now - self._signal_dedup.get(dedup_key, 0) < _dedup_ttl:
                 return None
 
             await db.upsert_watchlist(symbol, float(score), reasons)

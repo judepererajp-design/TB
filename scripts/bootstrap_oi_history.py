@@ -311,10 +311,16 @@ def build_clusters(
     # Sort by timestamp
     history = sorted(history, key=lambda x: x[0])
 
-    # Age-decay parameters
+    # Age-decay parameters — asset-aware:
+    # BTC/ETH are more structurally stable; OI from 30 days ago is still relevant.
+    # Alts cycle faster; use a 21-day τ so stale accumulation decays sooner.
     now_ts      = time.time()
-    tau_days    = 30.0                      # 30-day half-life
-    tau_secs    = tau_days * 24 * 3600.0
+    _coin_upper = coin.upper() if coin else ""
+    if any(_coin_upper.startswith(m) for m in ("BTC", "ETH")):
+        tau_days = 30.0
+    else:
+        tau_days = 21.0
+    tau_secs = tau_days * 24 * 3600.0
 
     # Bucket price levels (1% wide log-space buckets)
     bucket_pct = 0.01
