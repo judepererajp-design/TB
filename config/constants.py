@@ -730,6 +730,145 @@ class RegimeHysteresis:
 
 
 # ════════════════════════════════════════════════════════════════
+# 16e. FUNDING Z-SCORE
+# ════════════════════════════════════════════════════════════════
+
+class FundingZScore:
+    """
+    Per-asset z-score of current funding vs. its own recent history.
+
+    The existing absolute-level classifier (``EXTREMELY_HIGH``/``NEGATIVE``)
+    can't tell that BTC funding of 0.012 % is unremarkable while ALT
+    funding of 0.012 % is the highest reading of the week — every alt
+    has a different baseline. The z-score normalises by each asset's
+    own running mean/std so the same threshold catches the *relative*
+    extreme on any symbol.
+
+    History size is intentionally larger than the delta classifier
+    (5 samples) because z-score is meaningless on tiny samples.
+    """
+
+    HISTORY_MAX: int = 30                       # ~4 hours at 8-min poll cadence
+    MIN_SAMPLES_FOR_Z: int = 8                  # below this we return 0.0 (insufficient)
+
+    # |z| ≥ this → extreme. Standard ±2σ tail (~5 % of observations).
+    EXTREME_Z: float = 2.0
+    # |z| ≥ this → very extreme (~1 % tail). Used for stronger signals.
+    VERY_EXTREME_Z: float = 3.0
+
+    # Floor on std-dev to prevent a flat history from blowing up z-scores
+    # (e.g. all-zeros after a fresh deploy). 0.0001 pp = noise level.
+    MIN_STD: float = 1e-4
+
+
+# ════════════════════════════════════════════════════════════════
+# 16f. LIQUIDITY-SWEEP ESTIMATOR
+# ════════════════════════════════════════════════════════════════
+
+class LiqSweep:
+    """
+    Probability that price is set up to sweep nearby resting liquidity
+    before continuing in the signal direction. Two cheap proxies are
+    combined:
+
+      * proximity to a recent swing high/low (resting stops cluster
+        just beyond local extremes)
+      * proximity to a round number (resting stops cluster on
+        psychologically obvious price levels)
+
+    A LONG entry whose stop sits just *below* a recent swing low or
+    a round number is at high risk of being swept first, then
+    rallying — a classic "stop hunt then real move" pattern.
+    """
+
+    # How close (as a fraction of price) to the swing/round level
+    # the stop must be before we consider it "in the sweep zone".
+    PROXIMITY_PCT: float = 0.005                 # 0.5 % of price
+
+    # Look-back bars on whatever timeframe is supplied for swing detection.
+    SWING_LOOKBACK_BARS: int = 20
+
+    # Round-number granularities by price magnitude. We pick the
+    # smallest granularity whose absolute value is ≥ 1 % of price
+    # so the level is meaningful (e.g. on BTC at $60 000 the round
+    # numbers we care about are $1 000 ticks; on a $0.05 alt they
+    # are $0.001 ticks).
+    ROUND_NUMBER_FRACTIONS: tuple = (1.0, 0.5, 0.1, 0.05, 0.01, 0.005, 0.001)
+
+    # Probability weights for the two proxies (must sum ≤ 1.0).
+    SWING_WEIGHT: float = 0.6
+    ROUND_WEIGHT: float = 0.4
+
+    # Confidence penalty applied at full sweep probability (=1.0).
+    # Linearly scaled by the actual probability.
+    MAX_CONFIDENCE_PENALTY: float = 4.0          # points
+    # Probability above which we *log* the warning (no hard block).
+    WARN_PROBABILITY: float = 0.6
+
+
+# ════════════════════════════════════════════════════════════════
+# 16g. WEEKEND CHOP / SESSION SPREAD
+# ════════════════════════════════════════════════════════════════
+
+class WeekendChop:
+    """
+    Weekend liquidity is 20–30 % lower with materially wider spreads
+    on most perp venues. The existing ``signals.time_filter.TimeFilter``
+    already applies grade-aware confidence penalties on Saturday/Sunday,
+    but two effects are not modelled:
+
+      1. Spread expectation — execution gate sees the *snapshot* spread
+         from `volume_quality`, but a 5-bps quote on Saturday morning
+         can blow out to 25 bps in a sweep. The filter now publishes
+         a session-aware multiplier the aggregator can apply when no
+         live spread sample is available.
+      2. Aggregate min-confidence floor — alongside the per-signal
+         penalty, raise the *floor* during the worst weekend windows
+         so even high-grade signals must clear a higher bar.
+    """
+
+    # Multipliers applied to spread_bps based on the active session.
+    # 1.0 = no change, 1.5 = expect 50 % wider than observed.
+    SPREAD_MULT_KILLZONE: float = 1.0            # London/NY open — best quotes
+    SPREAD_MULT_OFF_SESSION: float = 1.1
+    SPREAD_MULT_ASIA: float = 1.2
+    SPREAD_MULT_DEAD_ZONE: float = 1.3
+    SPREAD_MULT_SATURDAY: float = 1.5
+    SPREAD_MULT_SUNDAY_EARLY: float = 1.7        # Sunday 00:00–08:00 UTC
+
+    # Aggregator min-confidence floor bump during weekend chop.
+    # Stacks on top of TimeFilter's per-signal penalty.
+    WEEKEND_CONF_FLOOR_BUMP: int = 3
+    # Sunday-early window gets a bigger bump (worst liquidity all week).
+    SUNDAY_EARLY_CONF_FLOOR_BUMP: int = 5
+
+
+# ════════════════════════════════════════════════════════════════
+# 16h. PARTIAL-FILL TRACKER
+# ════════════════════════════════════════════════════════════════
+
+class PartialFill:
+    """
+    Bookkeeping for partial fills.
+
+    The slippage tracker today records the *last* fill price as if it
+    were the entry. When a 10 000-USD order fills in three legs at
+    increasingly worse prices, the recorded slippage understates
+    reality. The partial-fill tracker computes a true VWAP across all
+    legs of the same `signal_id` and feeds that into the slippage
+    tracker once the fill is complete.
+    """
+
+    # Maximum partial fills retained per signal (most exchanges cap
+    # at well below this; we keep generous slack for adversarial
+    # microstructure that fragments aggressively).
+    MAX_LEGS_PER_SIGNAL: int = 64
+
+    # How long to retain a closed signal's fill record before purge.
+    RETENTION_HOURS: int = 48
+
+
+# ════════════════════════════════════════════════════════════════
 # 17. ENRICHMENT PIPELINE (additive confidence guardrails)
 # ════════════════════════════════════════════════════════════════
 

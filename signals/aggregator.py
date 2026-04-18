@@ -1097,12 +1097,26 @@ class SignalAggregator:
                     + volume_quality.confidence_delta
                 )
                 self._extend_unique_confluence(signal, volume_quality.notes[:2])
+                # Session-aware spread expectation (PR4 #9): weekend / dead-zone
+                # quotes are tighter than the realised spread under load, so the
+                # observed snapshot understates execution cost. Inflate by the
+                # current session's multiplier before propagating to the gate.
+                _observed_spread = volume_quality.spread_bps
+                _adj_spread = _observed_spread
+                try:
+                    from signals.time_filter import time_filter as _tf
+                    _spread_mult = _tf.expected_spread_multiplier()
+                    if _spread_mult and _spread_mult > 1.0 and _observed_spread > 0:
+                        _adj_spread = _observed_spread * _spread_mult
+                except Exception:
+                    pass
                 signal.raw_data.update({
                     "volume_trade_type": _trade_type,
                     "volume_quality_score": volume_quality.quality_score,
                     "volume_quality_label": volume_quality.quality_label,
                     "volume_quality_context": volume_quality.context_label,
-                    "spread_bps": volume_quality.spread_bps,
+                    "spread_bps": _adj_spread,
+                    "spread_bps_observed": _observed_spread,
                     "volume_quality_dry_volume": volume_quality.dry_volume,
                     "volume_quality_delta": volume_quality.confidence_delta,
                 })
@@ -1140,6 +1154,36 @@ class SignalAggregator:
                 signal.raw_data.setdefault("trigger_quality_label", "LOW")
         except Exception:
             pass
+
+        # ── Liq-sweep proximity (PR4 #8) ──────────────────────
+        # Advisory penalty when the stop is parked just beyond a recent
+        # swing extreme or round number — exactly the prices where
+        # resting stops get hunted before the real move begins.
+        try:
+            from analyzers.liq_sweep import liq_sweep_estimator
+            _entry_mid_ls = (signal.entry_low + signal.entry_high) / 2
+            _ohlcv_1h = (signal.raw_data or {}).get("ohlcv_1h")
+            _sweep = liq_sweep_estimator.estimate(
+                direction=direction_str,
+                entry=_entry_mid_ls,
+                stop=signal.stop_loss,
+                ohlcv=_ohlcv_1h,
+            )
+            if _sweep and _sweep.probability > 0:
+                _sweep_penalty = liq_sweep_estimator.confidence_penalty(_sweep.probability)
+                if _sweep_penalty > 0:
+                    signal.confidence = max(0.0, signal.confidence - _sweep_penalty)
+                signal.raw_data.update({
+                    "liq_sweep_probability": _sweep.probability,
+                    "liq_sweep_swing": _sweep.swing_proximity,
+                    "liq_sweep_round": _sweep.round_proximity,
+                    "liq_sweep_level_kind": _sweep.level_kind,
+                    "liq_sweep_penalty": _sweep_penalty,
+                })
+                if _sweep.notes:
+                    self._extend_unique_confluence(signal, _sweep.notes[:1])
+        except Exception as _ls_err:
+            logger.debug(f"liq_sweep estimator skipped: {_ls_err}")
 
         # Derivatives score
         if scored.derivatives_data:
@@ -1473,6 +1517,24 @@ class SignalAggregator:
                 min_conf = _bumped
         except Exception as _rh_err:
             logger.debug(f"regime hysteresis bump skipped: {_rh_err}")
+
+        # ── Weekend / Sunday-early floor bump (PR4 #10) ───────
+        # TimeFilter.evaluate() already applies a per-signal confidence
+        # penalty, but during the worst weekend windows the *floor*
+        # should also rise so even high-grade signals must clear a
+        # tougher bar (book is thinner, slippage worse).
+        try:
+            from signals.time_filter import time_filter as _tf_wc
+            _weekend_bump = _tf_wc.weekend_chop_floor_bump()
+            if _weekend_bump:
+                _w_bumped = min_conf + _weekend_bump
+                logger.info(
+                    f"📅 Weekend chop: min_conf {min_conf:.1f}→{_w_bumped:.1f} "
+                    f"(+{_weekend_bump} pts during weekend low-liquidity window)"
+                )
+                min_conf = _w_bumped
+        except Exception as _wc_err:
+            logger.debug(f"weekend chop floor bump skipped: {_wc_err}")
 
         # BUG-2 FIX: Only record scores that passed the AGG_THRESHOLD gate.
         # Previously appended BEFORE the gate, poisoning the adaptive floor percentile

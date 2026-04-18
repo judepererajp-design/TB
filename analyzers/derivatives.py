@@ -33,6 +33,12 @@ class DerivativesData:
     # come from acceleration, not absolute level — a flat-but-high funding is
     # already priced in, whereas a rapidly RISING funding signals crowd entry.
     funding_delta_trend: str = "FLAT"  # RISING | FALLING | FLAT
+    # AUDIT FIX (funding z-score): per-asset normalised funding extreme.
+    # Same threshold catches the relative tail on any symbol because the
+    # normalisation uses each asset's own mean/std. 0.0 = baseline /
+    # insufficient history.
+    funding_z: float = 0.0
+    funding_z_trend: str = "NORMAL"    # NORMAL | EXTREME_HOT | EXTREME_COLD | VERY_HOT | VERY_COLD
     open_interest: float = 0.0         # Current OI in USD
     oi_change_24h: float = 0.0         # OI change % in 24h
     oi_trend: str = "NEUTRAL"          # INCREASING | DECREASING | NEUTRAL
@@ -75,8 +81,13 @@ class DerivativesAnalyzer:
         # rates used to classify rate-of-change (RISING / FALLING / FLAT).  Five
         # samples is enough to smooth a single outlier while still reacting
         # within ~an hour on a venue that polls at 8-minute intervals.
+        # FUNDING-Z UPGRADE: history bumped to 30 samples so we can also derive a
+        # per-asset z-score (mean + std) without exhausting the deque after a
+        # short warmup. The delta classifier still uses only first-vs-last, so
+        # the larger buffer has no impact on its semantics.
+        from config.constants import FundingZScore as _FZ
         self._funding_history: Dict[str, Deque[float]] = {}
-        self._funding_history_max = 5
+        self._funding_history_max = max(_FZ.HISTORY_MAX, 5)
         # Delta threshold (in percentage-points, same scale as funding_rate).
         # 0.005 pp ≈ a clear regime shift on most perps whose typical funding
         # sits in ±0.01 %.  Keeps FLAT noisy in calm markets.
@@ -106,6 +117,8 @@ class DerivativesAnalyzer:
             data.funding_rate = float(funding.get('fundingRate') or 0) * 100  # Convert to %
             data.funding_trend = self._classify_funding_trend(data.funding_rate)
             data.funding_delta_trend = self._classify_funding_delta(symbol, data.funding_rate)
+            # FUNDING-Z: compute *after* delta so the latest sample is in history.
+            data.funding_z, data.funding_z_trend = self._compute_funding_z(symbol)
 
         # Parse open interest
         # AUDIT FIX: compute a real 24h % change from in-memory OI history
@@ -215,6 +228,44 @@ class DerivativesAnalyzer:
         elif delta < -self._funding_delta_threshold:
             return "FALLING"
         return "FLAT"
+
+    def _compute_funding_z(self, symbol: str) -> Tuple[float, str]:
+        """
+        Compute the per-asset z-score of the latest funding sample relative
+        to its own recent history. Returns ``(z, trend_label)``.
+
+        Trend labels:
+          * ``NORMAL``        — |z| < EXTREME_Z (or insufficient history)
+          * ``EXTREME_HOT``   — z ≥ EXTREME_Z (longs paying unusually high)
+          * ``EXTREME_COLD``  — z ≤ -EXTREME_Z (shorts paying unusually high)
+          * ``VERY_HOT``      — z ≥ VERY_EXTREME_Z (~1 % tail)
+          * ``VERY_COLD``     — z ≤ -VERY_EXTREME_Z
+
+        We require at least ``MIN_SAMPLES_FOR_Z`` observations before
+        emitting a non-zero z; below that the std-dev is too noisy to
+        be meaningful and we'd produce false extremes on warm-up.
+        """
+        from config.constants import FundingZScore as _FZ
+        history = self._funding_history.get(symbol)
+        if not history or len(history) < _FZ.MIN_SAMPLES_FOR_Z:
+            return 0.0, "NORMAL"
+
+        samples = list(history)
+        n = len(samples)
+        mean = sum(samples) / n
+        variance = sum((x - mean) ** 2 for x in samples) / n
+        std = max(variance ** 0.5, _FZ.MIN_STD)
+        z = (samples[-1] - mean) / std
+
+        if z >= _FZ.VERY_EXTREME_Z:
+            return z, "VERY_HOT"
+        if z <= -_FZ.VERY_EXTREME_Z:
+            return z, "VERY_COLD"
+        if z >= _FZ.EXTREME_Z:
+            return z, "EXTREME_HOT"
+        if z <= -_FZ.EXTREME_Z:
+            return z, "EXTREME_COLD"
+        return z, "NORMAL"
 
     def _classify_oi_trend(self, oi_change: float) -> str:
         """Classify OI change"""
