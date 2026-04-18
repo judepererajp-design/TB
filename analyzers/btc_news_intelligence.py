@@ -344,9 +344,17 @@ class NewsClassifier:
         if not headlines:
             return BTCEventType.UNKNOWN, "NEUTRAL", 0.0, "", False
 
-        votes: Dict[BTCEventType, float] = {}
+        # AUDIT FIX (news batch dilution): the previous aggregation normalized by
+        # `len(headlines)` which meant a single high-confidence risk-off headline
+        # in a batch of 10 unrelated items was diluted from ~0.9 down to ~0.18,
+        # silently suppressing real risk-off events.  We now use the MAX confidence
+        # per event type as the base and add a small support bonus (capped at
+        # +0.25) for additional headlines supporting the winning type.  This:
+        #   • preserves strong single-headline signals,
+        #   • still rewards consensus across multiple supporting headlines,
+        #   • prevents weak-headline spam from amplifying past the cap.
+        type_entries: Dict[BTCEventType, List[Tuple[float, str]]] = {}
         vote_dirs: Dict[BTCEventType, Set[str]] = {}
-        best_headline = ""
         any_mixed = False
 
         for h in headlines:
@@ -354,18 +362,21 @@ class NewsClassifier:
             if is_mixed:
                 any_mixed = True
             if etype != BTCEventType.UNKNOWN and conf > 0:
-                votes[etype]     = votes.get(etype, 0) + conf
-                if etype not in vote_dirs:
-                    vote_dirs[etype] = set()
-                vote_dirs[etype].add(direction)
-                if conf > 0.2:
-                    best_headline = h
+                type_entries.setdefault(etype, []).append((conf, h))
+                vote_dirs.setdefault(etype, set()).add(direction)
 
-        if not votes:
+        if not type_entries:
             return BTCEventType.UNKNOWN, "NEUTRAL", 0.0, "", False
 
-        winner = max(votes, key=lambda k: votes[k])
-        norm_conf = min(1.0, votes[winner] / max(1, len(headlines)) * 2)
+        # Winner = event type with the single highest-confidence headline.
+        winner = max(type_entries, key=lambda k: max(e[0] for e in type_entries[k]))
+        entries_sorted = sorted(type_entries[winner], key=lambda x: x[0], reverse=True)
+        base_conf, best_headline = entries_sorted[0]
+        # Support bonus from other headlines of the same type (clip each at 0.6
+        # so a spam of near-duplicate weak headlines can't drown out quality).
+        support_sum = sum(min(c, 0.6) for c, _ in entries_sorted[1:])
+        bonus = min(0.25, support_sum * 0.2)
+        norm_conf = min(1.0, base_conf + bonus)
 
         # Pick dominant direction for the winning type
         # If multiple directions seen for one type, that's already mixed
@@ -688,6 +699,10 @@ class BTCNewsIntelligence:
         # least EVENT_REPLACE_CONF_RATIO × current confidence.  Prevents a weak
         # BTC_TECHNICAL headline from clobbering an active high-confidence
         # EXCHANGE_EVENT / MACRO_RISK_OFF block just because the type differs.
+        # AUDIT FIX (cross-type decay): when the event type changes we additionally
+        # require STRICT superiority over the current confidence.  Without this,
+        # a 0.77 headline could replace an active 0.9 context (0.77 ≥ 0.9×0.85)
+        # causing gradual signal decay via type-swap rather than via TTL expiry.
         async with self._ctx_lock:
             _should_update = False
             if not self._current_ctx.is_active:
@@ -698,7 +713,10 @@ class BTCNewsIntelligence:
                 _min_replace = (
                     self._current_ctx.confidence * NewsIntelligence.EVENT_REPLACE_CONF_RATIO
                 )
-                _should_update = conf >= _min_replace
+                _should_update = (
+                    conf >= _min_replace
+                    and conf > self._current_ctx.confidence
+                )
             if _should_update:
                 base_ttl = self._context_ttl.get(etype, 3600)
 

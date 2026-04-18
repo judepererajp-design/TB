@@ -341,13 +341,24 @@ class AltcoinRotationTracker:
         """Classify each sector's status based on performance + momentum"""
         hot_threshold = cfg.analyzers.rotation.get('hot_sector_gain', 5.0)
         cold_threshold = cfg.analyzers.rotation.get('cold_sector_loss', -3.0)
+        # AUDIT FIX (HOT/WARM hysteresis): without an exit band, a sector
+        # oscillating around the 5 % boundary flip-flops between HOT and WARM
+        # each refresh, causing rotation-weight thrashing in sideways markets.
+        # Add an asymmetric exit band so HOT only drops back to WARM once the
+        # sector cools ~1 pp below the hot threshold.
+        hot_exit_threshold = max(1.0, hot_threshold - 1.0)
 
         for sector_name, sector_data in self._sectors.items():
             change = sector_data.avg_change_24h
+            was_hot = sector_data.status == SectorStatus.HOT
 
             # Calculate momentum (acceleration): how fast is the score changing?
             old_score = sector_data.score
             if change >= hot_threshold:
+                sector_data.status = SectorStatus.HOT
+                sector_data.score = min(100, 70 + (change - hot_threshold) * 3)
+            elif was_hot and change >= hot_exit_threshold:
+                # Hysteresis: stay HOT until we fall clearly below the entry band.
                 sector_data.status = SectorStatus.HOT
                 sector_data.score = min(100, 70 + (change - hot_threshold) * 3)
             elif change >= 1.0:

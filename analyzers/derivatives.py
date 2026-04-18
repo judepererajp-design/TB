@@ -28,7 +28,11 @@ logger = logging.getLogger(__name__)
 class DerivativesData:
     symbol: str
     funding_rate: float = 0.0          # Current funding rate (%)
-    funding_trend: str = "NEUTRAL"     # RISING | FALLING | NEUTRAL
+    funding_trend: str = "NEUTRAL"     # Level classifier: EXTREMELY_HIGH | HIGH | NEGATIVE | NEUTRAL
+    # AUDIT FIX (funding delta): separate rate-of-change classifier.  Squeezes
+    # come from acceleration, not absolute level — a flat-but-high funding is
+    # already priced in, whereas a rapidly RISING funding signals crowd entry.
+    funding_delta_trend: str = "FLAT"  # RISING | FALLING | FLAT
     open_interest: float = 0.0         # Current OI in USD
     oi_change_24h: float = 0.0         # OI change % in 24h
     oi_trend: str = "NEUTRAL"          # INCREASING | DECREASING | NEUTRAL
@@ -65,6 +69,16 @@ class DerivativesAnalyzer:
         self._oi_history: Dict[str, Deque[Tuple[float, float]]] = {}
         # Retain ~26h of samples to survive a stale fetch or two.
         self._oi_history_max = 60
+        # AUDIT FIX (funding delta): per-symbol short history of recent funding
+        # rates used to classify rate-of-change (RISING / FALLING / FLAT).  Five
+        # samples is enough to smooth a single outlier while still reacting
+        # within ~an hour on a venue that polls at 8-minute intervals.
+        self._funding_history: Dict[str, Deque[float]] = {}
+        self._funding_history_max = 5
+        # Delta threshold (in percentage-points, same scale as funding_rate).
+        # 0.005 pp ≈ a clear regime shift on most perps whose typical funding
+        # sits in ±0.01 %.  Keeps FLAT noisy in calm markets.
+        self._funding_delta_threshold = 0.005
 
     async def analyze(self, symbol: str) -> DerivativesData:
         """
@@ -89,6 +103,7 @@ class DerivativesAnalyzer:
         if isinstance(funding, dict) and funding:
             data.funding_rate = float(funding.get('fundingRate') or 0) * 100  # Convert to %
             data.funding_trend = self._classify_funding_trend(data.funding_rate)
+            data.funding_delta_trend = self._classify_funding_delta(symbol, data.funding_rate)
 
         # Parse open interest
         # AUDIT FIX: compute a real 24h % change from in-memory OI history
@@ -172,6 +187,32 @@ class DerivativesAnalyzer:
             return "NEGATIVE"        # Shorts paying → long fuel
         else:
             return "NEUTRAL"
+
+    def _classify_funding_delta(self, symbol: str, rate: float) -> str:
+        """
+        Classify funding rate-of-change across the last few polls.
+
+        AUDIT FIX: the level classifier above tells us where funding IS.  Squeezes
+        come from acceleration — a rapidly RISING funding rate means the crowd is
+        piling in (squeeze fuel building), even if the absolute level still looks
+        moderate.  Conversely, a rapidly FALLING funding rate means positioning
+        is being unwound and the squeeze pressure is releasing.
+
+        Uses a short per-symbol history (deque) and compares newest vs oldest
+        sample.  Returns "FLAT" until we have at least 2 samples.
+        """
+        history = self._funding_history.setdefault(
+            symbol, deque(maxlen=self._funding_history_max)
+        )
+        history.append(rate)
+        if len(history) < 2:
+            return "FLAT"
+        delta = history[-1] - history[0]
+        if delta > self._funding_delta_threshold:
+            return "RISING"
+        elif delta < -self._funding_delta_threshold:
+            return "FALLING"
+        return "FLAT"
 
     def _classify_oi_trend(self, oi_change: float) -> str:
         """Classify OI change"""

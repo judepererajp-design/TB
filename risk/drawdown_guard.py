@@ -81,6 +81,13 @@ class DrawdownGuard:
     # Maximum same-sector positions before blocking
     MAX_SECTOR_POSITIONS = 3
 
+    # AUDIT FIX (cross-beta clustering): sector labels alone don't capture
+    # BTC-correlated risk — 5 "different sector" alts can all be high-beta to
+    # BTC and blow up together.  Block when 3+ open positions have a cached
+    # BTC correlation above this threshold, regardless of sector.
+    HIGH_BTC_CORR_THRESHOLD: float = 0.80
+    MAX_HIGH_BTC_CORR_POSITIONS: int = 3
+
     # Equity drawdown thresholds for position heat management
     HEAT_LEVELS = [
         (0.03, 0.75),   # 3% drawdown → 75% sizing
@@ -124,25 +131,54 @@ class DrawdownGuard:
         """
         target_sector = get_sector(symbol)
 
-        if target_sector in ("btc", "eth", "other"):
-            # BTC/ETH are standalone sectors — don't block them
-            return False, ""
+        # BTC/ETH are standalone sectors — don't apply sector-count blocking
+        # to them, but still evaluate the cross-BTC-correlation cluster check
+        # below so a BTC long on top of 3 high-corr alt longs still blocks.
+        sector_blocking_enabled = target_sector not in ("btc", "eth", "other")
 
-        same_sector_count = 0
-        same_sector_symbols = []
-        for pos in open_positions:
-            pos_symbol = pos.get("symbol", "")
-            if get_sector(pos_symbol) == target_sector:
-                same_sector_count += 1
-                same_sector_symbols.append(pos_symbol)
+        if sector_blocking_enabled:
+            same_sector_count = 0
+            same_sector_symbols = []
+            for pos in open_positions:
+                pos_symbol = pos.get("symbol", "")
+                if get_sector(pos_symbol) == target_sector:
+                    same_sector_count += 1
+                    same_sector_symbols.append(pos_symbol)
 
-        if same_sector_count >= self.MAX_SECTOR_POSITIONS:
-            reason = (
-                f"🚫 Sector concentration: {same_sector_count} open {target_sector} "
-                f"positions ({', '.join(same_sector_symbols[:3])}). "
-                f"Max {self.MAX_SECTOR_POSITIONS} per sector."
-            )
-            return True, reason
+            if same_sector_count >= self.MAX_SECTOR_POSITIONS:
+                reason = (
+                    f"🚫 Sector concentration: {same_sector_count} open {target_sector} "
+                    f"positions ({', '.join(same_sector_symbols[:3])}). "
+                    f"Max {self.MAX_SECTOR_POSITIONS} per sector."
+                )
+                return True, reason
+
+        # AUDIT FIX (cross-beta clustering): even if sectors differ, if many open
+        # positions are all highly correlated to BTC we're effectively stacking
+        # the same bet.  Check cached Pearson correlation from the correlation
+        # analyzer and block when too many crowd above HIGH_BTC_CORR_THRESHOLD.
+        try:
+            from analyzers.correlation import correlation_analyzer  # local import to avoid cycles
+            target_corr = correlation_analyzer.get_cached_correlation(symbol)
+            if target_corr > self.HIGH_BTC_CORR_THRESHOLD:
+                high_corr_syms: List[str] = []
+                for pos in open_positions:
+                    pos_symbol = pos.get("symbol", "")
+                    if not pos_symbol or pos_symbol == symbol:
+                        continue
+                    if correlation_analyzer.get_cached_correlation(pos_symbol) > self.HIGH_BTC_CORR_THRESHOLD:
+                        high_corr_syms.append(pos_symbol)
+                if len(high_corr_syms) >= self.MAX_HIGH_BTC_CORR_POSITIONS:
+                    reason = (
+                        f"🚫 BTC-beta cluster: {len(high_corr_syms)} open positions "
+                        f"with BTC corr > {self.HIGH_BTC_CORR_THRESHOLD:.2f} "
+                        f"({', '.join(high_corr_syms[:3])}). "
+                        f"Max {self.MAX_HIGH_BTC_CORR_POSITIONS} high-corr positions."
+                    )
+                    return True, reason
+        except Exception:
+            # Correlation analyzer unavailable / not yet populated — fall through.
+            pass
 
         return False, ""
 

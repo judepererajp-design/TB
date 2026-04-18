@@ -94,8 +94,14 @@ class TestStalenessGate:
         """Headlines within the gate should create context normally."""
         bni = BTCNewsIntelligence()
 
+        # Use a headline that independently scores above NEWS_GATING_MIN_CONFIDENCE
+        # after the news-batch-dilution fix (which removed the old 2× amplification
+        # of single-headline batches).  Multiple rule keywords ensure this.
         headlines = [
-            self._make_headline("Fed raises rates, recession fears grow — bitcoin crashes", 2),
+            self._make_headline(
+                "Recession looms as hawkish Fed rate hike triggers market panic",
+                2,
+            ),
         ]
         await bni.process_headlines(headlines)
         ctx = bni.get_event_context()
@@ -109,7 +115,10 @@ class TestStalenessGate:
 
         headlines = [
             self._make_headline("Old: Fed raises rates, recession fears", gate + 30),
-            self._make_headline("Fed raises rates, inflation surges — bitcoin drops to new low", 5),
+            self._make_headline(
+                "Banking crisis deepens: bank run triggers contagion, capital flight from risk assets",
+                5,
+            ),
         ]
         await bni.process_headlines(headlines)
         ctx = bni.get_event_context()
