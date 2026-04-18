@@ -39,6 +39,23 @@ def round_trip_friction_pct() -> float:
     return 2.0 * (Backtester.DEFAULT_COMMISSION_PCT + Backtester.DEFAULT_SLIPPAGE_PCT)
 
 
+def predicted_round_trip_friction_pct(signal: Any) -> float:
+    """Round-trip friction using the *predictive* slippage model when
+    enough microstructure data is on the signal, else the static default.
+
+    Returns the same units as ``round_trip_friction_pct`` (decimal fraction
+    of price). Used by ``fee_adjusted_rr`` so the fee-adjusted RR gate
+    rejects setups whose *predicted* (rather than historical-average)
+    friction would eat the edge.
+    """
+    try:
+        from analyzers.expected_slippage import estimate_slippage_pct_from_signal
+        slip_pct = estimate_slippage_pct_from_signal(signal)
+    except Exception:
+        slip_pct = Backtester.DEFAULT_SLIPPAGE_PCT
+    return 2.0 * (Backtester.DEFAULT_COMMISSION_PCT + slip_pct)
+
+
 def _format_level(level: float) -> str:
     if level >= 1000:
         text = f"{level:.2f}"
@@ -63,7 +80,10 @@ def fee_adjusted_rr(signal: Any) -> Optional[float]:
 
     stop_loss = float(stop_loss)
     target = float(target)
-    friction = entry_mid * round_trip_friction_pct()
+    # Use the predictive friction estimator: pulls spread/depth/vol off the
+    # signal's raw_data when available, falls back to the static backtester
+    # default otherwise. Same units as the original round-trip number.
+    friction = entry_mid * predicted_round_trip_friction_pct(signal)
     if direction == "LONG":
         risk = entry_mid - stop_loss
         reward = target - entry_mid

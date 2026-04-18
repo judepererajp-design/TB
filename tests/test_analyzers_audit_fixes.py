@@ -84,6 +84,125 @@ def test_funding_delta_classifier_flat_with_single_sample():
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# derivatives.funding_z_trend wiring (PR5 #1)
+# ──────────────────────────────────────────────────────────────────────────
+def test_funding_z_very_hot_with_long_heavy_flips_bias_to_bearish():
+    """VERY_HOT z-score + long-heavy book → fade bias even if absolute level
+    classifier hasn't tripped EXTREMELY_HIGH yet (alts have low baselines)."""
+    analyzer = DerivativesAnalyzer()
+    data = DerivativesData(
+        symbol="ALT/USDT",
+        funding_trend="HIGH",          # not yet EXTREMELY_HIGH
+        funding_delta_trend="FLAT",
+        funding_z=3.5,
+        funding_z_trend="VERY_HOT",
+        lsr_trend="LONG_HEAVY",
+        oi_trend="NEUTRAL",
+    )
+    assert analyzer._classify_signal_bias(data) == "BEARISH"
+    assert any("VERY_HOT" in n for n in data.notes)
+
+
+def test_funding_z_very_cold_with_short_heavy_flips_bias_to_bullish():
+    """VERY_COLD z-score + short-heavy book → squeeze bias."""
+    analyzer = DerivativesAnalyzer()
+    data = DerivativesData(
+        symbol="ALT/USDT",
+        funding_trend="NEUTRAL",
+        funding_delta_trend="FLAT",
+        funding_z=-3.2,
+        funding_z_trend="VERY_COLD",
+        lsr_trend="SHORT_HEAVY",
+        oi_trend="NEUTRAL",
+    )
+    assert analyzer._classify_signal_bias(data) == "BULLISH"
+    assert any("VERY_COLD" in n for n in data.notes)
+
+
+def test_funding_z_modifies_score_symmetrically():
+    """VERY_HOT pushes the 0–100 score down; VERY_COLD pushes it up."""
+    analyzer = DerivativesAnalyzer()
+    base = DerivativesData(symbol="X/USDT", funding_trend="NEUTRAL",
+                           lsr_trend="BALANCED", oi_trend="NEUTRAL")
+    hot = DerivativesData(symbol="X/USDT", funding_trend="NEUTRAL",
+                          lsr_trend="BALANCED", oi_trend="NEUTRAL",
+                          funding_z=3.5, funding_z_trend="VERY_HOT")
+    cold = DerivativesData(symbol="X/USDT", funding_trend="NEUTRAL",
+                           lsr_trend="BALANCED", oi_trend="NEUTRAL",
+                           funding_z=-3.5, funding_z_trend="VERY_COLD")
+    s_base = analyzer._calculate_score(base)
+    s_hot = analyzer._calculate_score(hot)
+    s_cold = analyzer._calculate_score(cold)
+    assert s_hot < s_base, f"VERY_HOT should reduce score (got {s_hot} vs {s_base})"
+    assert s_cold > s_base, f"VERY_COLD should raise score (got {s_cold} vs {s_base})"
+
+
+def test_funding_z_squeeze_alignment_increases_risk():
+    """VERY_COLD z-score aligned with short-heavy book should add squeeze fuel."""
+    analyzer = DerivativesAnalyzer()
+    base = DerivativesData(symbol="X/USDT", funding_trend="NEGATIVE",
+                           lsr_trend="SHORT_HEAVY", oi_trend="NEUTRAL")
+    aligned = DerivativesData(symbol="X/USDT", funding_trend="NEGATIVE",
+                              lsr_trend="SHORT_HEAVY", oi_trend="NEUTRAL",
+                              funding_z=-3.5, funding_z_trend="VERY_COLD")
+    order = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+    assert order[analyzer._assess_squeeze_risk(aligned)] >= \
+        order[analyzer._assess_squeeze_risk(base)]
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Funding-carry magnitude-aware adjustment (PR5 #3)
+# ──────────────────────────────────────────────────────────────────────────
+def test_expected_carry_long_pays_positive_funding():
+    """LONG into +0.0005 (5 bps) per cycle, 16h hold = 2 cycles → pays 10 bps."""
+    a = DerivativesAnalyzer()
+    carry = a._expected_carry_pct(0.0005, "LONG", hold_hours=16.0)
+    assert carry < 0, "LONG with positive funding must be negative carry"
+    assert abs(carry - (-0.001)) < 1e-9
+
+
+def test_expected_carry_short_earns_positive_funding():
+    """Mirror: SHORT into +0.0005 (5 bps) per cycle for 16h earns +10 bps."""
+    a = DerivativesAnalyzer()
+    carry = a._expected_carry_pct(0.0005, "SHORT", hold_hours=16.0)
+    assert carry > 0
+    assert abs(carry - 0.001) < 1e-9
+
+
+def test_assess_entry_validity_applies_carry_penalty_for_long_with_extreme_funding():
+    """An alt with +0.05 % per 8h funding should get an additional carry
+    penalty for LONGs on top of the level-based -12."""
+    a = DerivativesAnalyzer()
+    extreme = DerivativesData(symbol="ALT/USDT", funding_rate=0.0005,
+                              funding_trend="EXTREMELY_HIGH",
+                              lsr_trend="LONG_HEAVY", oi_trend="NEUTRAL")
+    mild = DerivativesData(symbol="MAJ/USDT", funding_rate=0.00005,
+                           funding_trend="EXTREMELY_HIGH",
+                           lsr_trend="LONG_HEAVY", oi_trend="NEUTRAL")
+    _, adj_extreme, _ = a.assess_entry_validity(extreme, "LONG")
+    _, adj_mild, _ = a.assess_entry_validity(mild, "LONG")
+    assert adj_extreme < adj_mild, (
+        f"Extreme-funding LONG should be punished more than mild "
+        f"(extreme={adj_extreme}, mild={adj_mild})"
+    )
+
+
+def test_assess_entry_validity_applies_carry_boost_for_short_into_high_funding():
+    """A SHORT into HIGH funding earns positive carry — should get a small
+    additional boost on top of the +5 level-based bonus."""
+    a = DerivativesAnalyzer()
+    aligned = DerivativesData(symbol="ALT/USDT", funding_rate=0.0005,
+                              funding_trend="HIGH", lsr_trend="LONG_HEAVY",
+                              oi_trend="NEUTRAL")
+    flat = DerivativesData(symbol="ALT/USDT", funding_rate=0.00001,
+                           funding_trend="HIGH", lsr_trend="LONG_HEAVY",
+                           oi_trend="NEUTRAL")
+    _, adj_aligned, _ = a.assess_entry_validity(aligned, "SHORT")
+    _, adj_flat, _ = a.assess_entry_validity(flat, "SHORT")
+    assert adj_aligned > adj_flat
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # execution_gate — no more locals().get() antipattern
 # ──────────────────────────────────────────────────────────────────────────
 def test_execution_gate_evaluate_without_context_uses_defaults():

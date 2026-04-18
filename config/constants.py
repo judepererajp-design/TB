@@ -614,6 +614,38 @@ class FeeModel:
     MIN_FEE_ADJUSTED_RR: float = 1.0
 
 
+class ExpectedSlippage:
+    """
+    Predictive slippage model coefficients (see analyzers/expected_slippage.py).
+
+    The model is intentionally first-principles, not learned, so the
+    coefficients are explicit and tunable from one place. They are calibrated
+    against typical Binance perp microstructure: 5 bps spread, $50k–500k
+    top-of-book depth, ATR/price ~1–3 % per day on majors.
+
+    Formula: slip = spread_bps/2/1e4 + K_IMPACT*sqrt(size/depth) + K_VOL*atr_pct
+    """
+
+    # Square-root market-impact coefficient. K=0.0006 means a trade equal in
+    # size to top-book depth pays ~6 bps of impact on top of half-spread.
+    K_IMPACT: float = 0.0006
+
+    # Volatility surcharge: in fast tape (ATR/price = 3 %), add ~3 bps.
+    K_VOL: float = 0.001
+
+    # Cap on size/depth ratio so a thin quote doesn't blow up the estimate
+    # to nonsense (50 % slip). 5x book = the trade walks ~5 levels.
+    MAX_DEPTH_RATIO: float = 5.0
+
+    # Lower / upper bounds on the final number.
+    FLOOR_PCT: float = 0.0002          # 2 bps minimum (matches backtester default)
+    CEILING_PCT: float = 0.005         # 50 bps cap
+
+    # Default trade size used when a signal doesn't yet know its sizing.
+    # Kept conservative so we don't under-estimate impact for typical fills.
+    DEFAULT_SIZE_USD: float = 5000.0
+
+
 # ════════════════════════════════════════════════════════════════
 # 16. FUNDING RATE INTEGRATION
 # ════════════════════════════════════════════════════════════════
@@ -634,6 +666,37 @@ class FundingIntegration:
     # Binance perps pay funding every 8 hours. Accrued funding is
     # cumulative rate * (hours_held / cycle_hours).
     ACCRUAL_CYCLE_HOURS: float = 8.0                  # Binance perp default
+
+
+class FundingCarry:
+    """
+    Magnitude-aware funding-carry adjustment (PR5 #3).
+
+    The level-based penalties in ``DerivativesAnalyzer.assess_entry_validity``
+    (e.g. -8 for SHORT into NEGATIVE funding) are stepwise — they don't
+    distinguish a major at +0.012 % from an alt at +0.05 %, even though the
+    alt's expected funding paid over the hold horizon is 4× worse.
+
+    This converts the *actual* per-cycle rate into expected carry over the
+    typical hold horizon and applies a graduated, symmetric boost/penalty.
+    """
+
+    # Default expected hold horizon for the carry calculation. Most intraday
+    # signals hold 8–24 h; 16 h ≈ 2 funding cycles, a reasonable midpoint.
+    HOLD_HOURS_DEFAULT: float = 16.0
+
+    # Carry magnitudes (in basis points of notional) at which the
+    # adjustment kicks in. Below the threshold the level-based logic
+    # already covers it, so no double-counting.
+    PENALTY_THRESHOLD_BPS: float = 5.0
+    BOOST_THRESHOLD_BPS: float = 5.0
+
+    # Confidence points per basis point of carry. 0.5 → 10 bps carry → 5 pts.
+    PTS_PER_BP: float = 0.5
+
+    # Hard caps so a single extreme funding print can't dominate confidence.
+    MAX_PENALTY_PTS: float = 8.0
+    MAX_BOOST_PTS: float = 6.0
 
 
 # ════════════════════════════════════════════════════════════════

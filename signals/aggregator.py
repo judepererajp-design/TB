@@ -1120,6 +1120,41 @@ class SignalAggregator:
                     "volume_quality_dry_volume": volume_quality.dry_volume,
                     "volume_quality_delta": volume_quality.confidence_delta,
                 })
+                # PR5 #5: expose top-book USD depth from the order book
+                # already fetched above. Predictive slippage model
+                # (analyzers.expected_slippage) consumes this without an
+                # extra API round-trip. ~25 bps band around mid keeps the
+                # number meaningful for typical retail clip sizes.
+                try:
+                    if isinstance(order_book, dict) and order_book:
+                        _bids = order_book.get('bids', [])
+                        _asks = order_book.get('asks', [])
+                        if _bids and _asks:
+                            _best_bid = float(_bids[0][0])
+                            _best_ask = float(_asks[0][0])
+                            _mid = (_best_bid + _best_ask) / 2.0
+                            if _mid > 0:
+                                _band = _mid * 0.0025  # 25 bps
+                                _bid_usd = sum(
+                                    float(p) * float(q) for p, q in _bids
+                                    if float(p) >= _mid - _band
+                                )
+                                _ask_usd = sum(
+                                    float(p) * float(q) for p, q in _asks
+                                    if float(p) <= _mid + _band
+                                )
+                                signal.raw_data["top_book_depth_usd"] = _bid_usd + _ask_usd
+                except Exception:
+                    pass
+                # Surface ATR-as-percent so the slippage model can use it
+                # without re-deriving it from raw_data['atr_proxy'].
+                try:
+                    _atr = signal.raw_data.get("atr_proxy") or signal.raw_data.get("atr")
+                    _entry_mid_for_atr = (signal.entry_low + signal.entry_high) / 2.0
+                    if _atr and _entry_mid_for_atr > 0:
+                        signal.raw_data["atr_pct"] = float(_atr) / float(_entry_mid_for_atr)
+                except Exception:
+                    pass
             except Exception:
                 pass
         else:
