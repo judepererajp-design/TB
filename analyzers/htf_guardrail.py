@@ -149,10 +149,16 @@ class HTFWeeklyGuardrail:
             # Weak weekly trend — don't hard block, soft penalty handles it
             return False, f"HTF weak counter-trend (ADX={self._weekly_adx:.0f}<{_dyn_adx})"
 
-        # Context-aware threshold: 4h bounce provides structure for counter-trend longs
-        # (price already bouncing off support confirms the counter-trend long has backing)
+        # Context-aware threshold: 4h structural pattern provides backing for counter-trend signals
+        # - LONG vs BEARISH weekly when BTC 4h is bouncing (higher-lows/BOS up)
+        # - SHORT vs BULLISH weekly when BTC 4h is resuming down (lower-highs, no BOS up)
+        # AUDIT FIX: previously `_btc_4h_resuming_down` was computed but never read,
+        # so counter-trend shorts into a weekly-bull regime had no structural tailwind.
         if signal_direction == "LONG" and self._weekly_bias == "BEARISH" and self._btc_4h_bouncing:
             # 4h bounce validates counter-trend long — require 78 (down from ~86)
+            base_threshold = 78.0
+        elif signal_direction == "SHORT" and self._weekly_bias == "BULLISH" and self._btc_4h_resuming_down:
+            # 4h resuming-down validates counter-trend short
             base_threshold = 78.0
         else:
             # No bounce support: standard formula, capped at 88 (not 93 — too restrictive)
@@ -203,7 +209,7 @@ class HTFWeeklyGuardrail:
             f"🚫 HTF weekly guardrail: {signal_direction} blocked — "
             f"weekly {self._weekly_bias} (ADX={self._weekly_adx:.0f}). "
             f"Need {effective_threshold:.0f}+ confidence "
-            f"({'4h bounce active — lower bar' if self._btc_4h_bouncing else 'no bounce support'})."
+            f"({'4h bounce active — lower bar' if self._btc_4h_bouncing else ('4h resuming down — lower bar' if self._btc_4h_resuming_down and signal_direction == 'SHORT' else 'no structural support')})."
         )
         # Increment session block counters for Sentinel dashboard
         if signal_direction == "LONG":

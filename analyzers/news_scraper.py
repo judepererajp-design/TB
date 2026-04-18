@@ -210,6 +210,10 @@ class NewsScraper:
         self._session: Optional[aiohttp.ClientSession] = None
         self._running = False
         self._task = None
+        # AUDIT FIX (news_scraper fire-and-forget): keep strong references to
+        # background dispatch tasks so they aren't garbage collected mid-run
+        # and any failure is visible via the done-callback installed at spawn.
+        self._bni_tasks: set = set()
 
         # Feature 3: Title dedup — tracks clusters of similar headlines
         self._dedup_clusters: List[Dict] = []  # [{titles: set, source_count: int, first_seen: float}]
@@ -332,9 +336,30 @@ class NewsScraper:
                     ]
                     for n in fresh:
                         narrative_tracker.process_headline(n.title, n.published_at)
-                    asyncio.create_task(btc_news_intelligence.process_headlines(fresh_dicts))
-                except Exception:
-                    pass
+                    # AUDIT FIX (news_scraper fire-and-forget): track the
+                    # spawned task and log any failure from the background
+                    # coroutine.  Previously `create_task(...)` with bare
+                    # `except Exception: pass` swallowed both spawn errors
+                    # AND downstream coroutine errors silently.
+                    _bni_task = asyncio.create_task(
+                        btc_news_intelligence.process_headlines(fresh_dicts),
+                        name="btc_news_intelligence.process_headlines",
+                    )
+                    self._bni_tasks.add(_bni_task)
+
+                    def _bni_done(t: asyncio.Task) -> None:
+                        self._bni_tasks.discard(t)
+                        if t.cancelled():
+                            return
+                        exc = t.exception()
+                        if exc is not None:
+                            logger.warning(
+                                "btc_news_intelligence.process_headlines failed: %s", exc
+                            )
+
+                    _bni_task.add_done_callback(_bni_done)
+                except Exception as _bni_err:
+                    logger.warning("btc_news_intelligence dispatch failed: %s", _bni_err)
 
         self._news_last_fetch = time.time()
 

@@ -167,6 +167,10 @@ class LiquidityAnalyzer:
                     last_open = opens[-1]
                     bullish_close = last_close > last_open
                     
+                    # AUDIT FIX: guard against zero ATR (from flat/padded
+                    # candles) before dividing.
+                    if atr <= 0:
+                        return LiquidityReaction()
                     recovery = (current_price - recent_low) / atr
                     reaction_strength = min(1.0, recovery / 1.5)
                     
@@ -194,6 +198,9 @@ class LiquidityAnalyzer:
                     last_open = opens[-1]
                     bearish_close = last_close < last_open
                     
+                    # AUDIT FIX: guard against zero ATR before dividing.
+                    if atr <= 0:
+                        return LiquidityReaction()
                     recovery = (recent_high - current_price) / atr
                     reaction_strength = min(1.0, recovery / 1.5)
                     

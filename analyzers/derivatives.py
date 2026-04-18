@@ -246,6 +246,7 @@ class DerivativesAnalyzer:
         fade them.
         """
         funding_trend = data.funding_trend
+        funding_delta = data.funding_delta_trend
         lsr = data.lsr_trend
         oi = data.oi_trend
 
@@ -257,6 +258,17 @@ class DerivativesAnalyzer:
         # Extreme short positioning → bullish bias (shorts will be squeezed)
         if funding_trend == "NEGATIVE" and lsr == "EXTREME_SHORT":
             data.notes.append("🚀 Extreme short positioning — short squeeze potential")
+            return "BULLISH"
+
+        # AUDIT FIX (funding delta wiring): rapidly RISING funding on an
+        # already-HIGH level means the crowd is still piling long — fade
+        # bias even if L/S hasn't hit EXTREME yet.  Symmetrically, rapidly
+        # FALLING funding while NEGATIVE means shorts are piling in.
+        if funding_trend == "HIGH" and funding_delta == "RISING" and lsr in ("LONG_HEAVY", "EXTREME_LONG"):
+            data.notes.append("⚠️ Funding rising into HIGH — crowd still entering longs")
+            return "BEARISH"
+        if funding_trend == "NEGATIVE" and funding_delta == "FALLING" and lsr in ("SHORT_HEAVY", "EXTREME_SHORT"):
+            data.notes.append("🚀 Funding falling while negative — shorts piling in")
             return "BULLISH"
 
         # OI rising + price rising = real momentum, support long
@@ -290,6 +302,9 @@ class DerivativesAnalyzer:
         - Many shorts (low L/S ratio)
         - Negative funding (shorts paying)
         - OI high (lots of positions to squeeze)
+        - AUDIT FIX (funding delta wiring): funding rapidly falling toward
+          zero/negative from a prior positive level = squeeze fuel building
+          faster than the level classifier alone captures.
         """
         score = 0
         if data.lsr_trend == "EXTREME_SHORT":
@@ -299,6 +314,9 @@ class DerivativesAnalyzer:
         if data.funding_trend == "NEGATIVE":
             score += 2
         if data.oi_trend in ("INCREASE", "STRONG_INCREASE"):
+            score += 1
+        # Rate-of-change adds conviction when it agrees with positioning
+        if data.funding_delta_trend == "FALLING" and data.lsr_trend in ("SHORT_HEAVY", "EXTREME_SHORT"):
             score += 1
 
         if score >= 4:
