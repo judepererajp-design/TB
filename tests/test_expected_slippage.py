@@ -95,7 +95,7 @@ def test_signal_bridge_uses_top_level_position_size():
         "atr_pct": 0.01,
         "top_book_depth_usd": 250_000,
     })
-    sig.position_size = 20_000
+    sig.position_size_usdt = 20_000
 
     pct = estimate_slippage_pct_from_signal(sig)
     expected = estimate_slippage(

@@ -38,7 +38,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import Mapping, Optional
 
 from config.constants import Backtester, ExpectedSlippage as _ES
 
@@ -135,7 +135,10 @@ def estimate_slippage_pct_from_signal(signal) -> float:
 
     Always returns a number (never None) — uses Backtester default on miss.
     """
-    raw = getattr(signal, "raw_data", None) or {}
+    if isinstance(signal, Mapping):
+        raw = signal.get("raw_data", None) or {}
+    else:
+        raw = getattr(signal, "raw_data", None) or {}
     spread_bps = raw.get("spread_bps")
     atr_pct = raw.get("atr_pct")
     if atr_pct is None:
@@ -147,10 +150,13 @@ def estimate_slippage_pct_from_signal(signal) -> float:
             if mid > 0:
                 atr_pct = float(atr) / mid
     top_book_depth_usd = raw.get("top_book_depth_usd")
+    top_level = signal if isinstance(signal, Mapping) else {}
     size_usd = (
         raw.get("intended_size_usd")
         or raw.get("position_size")
         or raw.get("position_size_usdt")
+        or top_level.get("position_size")
+        or top_level.get("position_size_usdt")
         or getattr(signal, "position_size", None)
         or getattr(signal, "position_size_usdt", None)
         or _ES.DEFAULT_SIZE_USD

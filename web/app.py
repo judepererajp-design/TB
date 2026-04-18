@@ -1211,13 +1211,14 @@ class DashboardApp:
             from analyzers.ai_analyst import ai_analyst
             from analyzers.veto_system import veto_system
             from collections import Counter
+            from itertools import islice
 
             stats = diagnostic_engine.get_stats_summary()
             # FIX #22: Use get_death_breakdown() for aggregated, sorted kill reason data
             death_breakdown = diagnostic_engine.get_death_breakdown(hours=24)
             kill_reasons = death_breakdown["by_reason"]
             strat_breakdown_agg = death_breakdown["by_strategy"]
-            death_log = diagnostic_engine._death_log[-200:]
+            death_log = list(islice(diagnostic_engine._death_log, max(0, len(diagnostic_engine._death_log) - 200), None))
             kill_reasons_raw = dict(Counter(d.get("kill_reason","?") for d in death_log).most_common(8))
             strat_breakdown = {}
             for d in death_log:
