@@ -31,6 +31,7 @@ from typing import Dict, Optional, Set
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL = 10  # seconds — faster than any individual monitor was polling
+STALE_THRESHOLD_SECS = 120  # seconds before price considered stale (covers most maintenance windows)
 
 
 class PriceCache:
@@ -46,7 +47,7 @@ class PriceCache:
         self._subscribers: Dict[str, int] = {}       # symbol → subscriber count
         self._running = False
         self._task: Optional[asyncio.Task] = None
-        self._stale_threshold = 120                  # seconds before price considered stale
+        self._stale_threshold = STALE_THRESHOLD_SECS  # seconds before price considered stale
         # EC4: During exchange maintenance windows (can last 10-30 min),
         # callers should check get_age() before trusting SL/TP decisions.
         # Use get_with_age() to get price + staleness together.
@@ -120,11 +121,11 @@ class PriceCache:
             return
         logger.info(f"📡 PriceCache warming up {len(symbols)} symbols...")
         batch_size = 20
-        now = __import__('time').time()
+        now = time.time()
         for i in range(0, len(symbols), batch_size):
             batch = symbols[i:i+batch_size]
             tasks = {sym: api.fetch_ticker(sym) for sym in batch}
-            results = await __import__('asyncio').gather(*tasks.values(), return_exceptions=True)
+            results = await asyncio.gather(*tasks.values(), return_exceptions=True)
             for sym, result in zip(tasks.keys(), results):
                 if not isinstance(result, Exception) and result and "last" in result:
                     self._prices[sym] = float(result["last"])
@@ -146,6 +147,13 @@ class PriceCache:
 
         while self._running:
             symbols = list(self._subscribers.keys())
+
+            # Defensive: prune any cached entry whose subscription was dropped
+            # (e.g. if warm_up populated a symbol that was later unsubscribed).
+            subscribed = set(symbols)
+            for orphan in [s for s in self._prices if s not in subscribed]:
+                self._prices.pop(orphan, None)
+                self._timestamps.pop(orphan, None)
 
             if symbols:
                 # Fetch all subscribed symbols concurrently

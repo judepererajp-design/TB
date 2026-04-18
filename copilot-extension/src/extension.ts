@@ -155,28 +155,113 @@ interface BreakingNewsResponse {
 // Helpers
 // ---------------------------------------------------------------------------
 
+// Default per-request timeout (ms). Kept conservative so the chat UI never
+// hangs indefinitely on a flaky upstream.
+const DEFAULT_TIMEOUT_MS = 15_000;
+
 function getApiBase(): string {
   const config = vscode.workspace.getConfiguration("crypto");
-  return config.get<string>("apiUrl") || API_BASE;
+  const raw = (config.get<string>("apiUrl") || API_BASE).trim();
+  // Only accept http(s) schemes; fall back to the default otherwise to avoid
+  // arbitrary-scheme fetches (file://, data://, javascript:, ...).
+  let normalized: URL;
+  try {
+    normalized = new URL(raw);
+  } catch {
+    return API_BASE;
+  }
+  if (normalized.protocol !== "http:" && normalized.protocol !== "https:") {
+    return API_BASE;
+  }
+  // Strip trailing slash so concatenation with endpoints like "/api/news"
+  // never produces a double slash.
+  return raw.replace(/\/+$/, "");
 }
 
-async function fetchAPI<T = any>(
+/**
+ * Only accept http(s) URLs for rendering as markdown links. Anything else
+ * (javascript:, data:, vscode:, relative strings, etc.) is reduced to "#" so a
+ * malicious or malformed `link` field from the upstream API cannot be rendered
+ * as an active link in the chat stream.
+ */
+function safeUrl(link: string | undefined | null): string {
+  if (!link || typeof link !== "string") return "#";
+  const trimmed = link.trim();
+  try {
+    const u = new URL(trimmed);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return "#";
+    return u.toString();
+  } catch {
+    return "#";
+  }
+}
+
+/**
+ * Neutralize characters that would break a markdown table cell or let
+ * upstream-supplied text inject markdown structure. We only do this for table
+ * cells — regular prose keeps its formatting.
+ */
+function escapeTableCell(value: string | number | undefined | null): string {
+  if (value === undefined || value === null) return "—";
+  return String(value)
+    // Escape backslashes first so subsequent escapes aren't undone by a
+    // caller-supplied "\" turning our "\|" into a literal "\" + unescaped "|".
+    .replace(/\\/g, "\\\\")
+    .replace(/\|/g, "\\|")
+    .replace(/\r?\n/g, " ");
+}
+
+/** Format a number safely; returns `fallback` for undefined/NaN/non-finite. */
+function fmtNum(
+  value: number | undefined | null,
+  digits = 2,
+  fallback = "—",
+): string {
+  if (value === undefined || value === null) return fallback;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return n.toFixed(digits);
+}
+
+/** Format a USD amount with locale grouping; returns `fallback` when absent. */
+function fmtUsd(value: number | undefined | null, fallback = "N/A"): string {
+  if (value === undefined || value === null) return fallback;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return n.toLocaleString(undefined, { maximumFractionDigits: 8 });
+}
+
+async function fetchAPI<T = unknown>(
   endpoint: string,
   token?: vscode.CancellationToken,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS,
 ): Promise<T> {
   const baseUrl = getApiBase();
   const url = `${baseUrl}${endpoint}`;
 
   const controller = new AbortController();
-  token?.onCancellationRequested(() => controller.abort());
 
-  const response = await fetch(url, { signal: controller.signal });
-  if (!response.ok) {
-    throw new Error(
-      `API request failed (${response.status}): ${response.statusText}`,
-    );
+  // Honor an already-cancelled token (onCancellationRequested does not fire
+  // for tokens that were cancelled before the listener was attached).
+  if (token?.isCancellationRequested) {
+    controller.abort();
+  } else {
+    token?.onCancellationRequested(() => controller.abort());
   }
-  return response.json() as Promise<T>;
+
+  const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) {
+      throw new Error(
+        `API request failed (${response.status}): ${response.statusText}`,
+      );
+    }
+    return (await response.json()) as T;
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
 }
 
 function formatArticles(articles: NewsArticle[]): string {
@@ -192,22 +277,34 @@ function formatArticles(articles: NewsArticle[]): string {
       const desc = a.description
         ? `\n   > ${a.description.slice(0, 120)}…`
         : "";
-      return `${i + 1}. ${sentiment} **${a.title}**${desc}\n   📰 ${a.source} • ${a.timeAgo}\n   🔗 [Read more](${a.link})`;
+      return `${i + 1}. ${sentiment} **${a.title}**${desc}\n   📰 ${a.source} • ${a.timeAgo}\n   🔗 [Read more](${safeUrl(a.link)})`;
     })
     .join("\n\n");
 }
 
+/** Clamp a Fear/Greed-style value into `[0,100]` and default NaN to 50. */
+function clampFG(value: number | undefined | null): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 50;
+  if (n < 0) return 0;
+  if (n > 100) return 100;
+  return Math.round(n);
+}
+
 function fearGreedEmoji(value: number): string {
-  if (value < 25) return "😱";
-  if (value < 40) return "😨";
-  if (value < 60) return "😐";
-  if (value < 75) return "😀";
+  const v = clampFG(value);
+  if (v < 25) return "😱";
+  if (v < 40) return "😨";
+  if (v < 60) return "😐";
+  if (v < 75) return "😀";
   return "🤑";
 }
 
 function fearGreedBar(value: number): string {
-  const filled = Math.floor(value / 5);
-  return `\`${"█".repeat(filled)}${"░".repeat(20 - filled)}\` ${value}/100`;
+  const v = clampFG(value);
+  const filled = Math.max(0, Math.min(20, Math.floor(v / 5)));
+  const empty = 20 - filled;
+  return `\`${"█".repeat(filled)}${"░".repeat(empty)}\` ${v}/100`;
 }
 
 function sentimentEmoji(sentiment: string): string {
@@ -292,7 +389,7 @@ async function handleBreaking(
     const desc = a.description ? `\n   > ${a.description.slice(0, 140)}` : "";
 
     stream.markdown(
-      `${i + 1}. ${sentimentIcon}${badge} **${a.title}**${desc}\n   📰 ${a.source} • ${a.timeAgo}\n   🔗 [Read more](${a.link})\n\n`,
+      `${i + 1}. ${sentimentIcon}${badge} **${a.title}**${desc}\n   📰 ${a.source} • ${a.timeAgo}\n   🔗 [Read more](${safeUrl(a.link)})\n\n`,
     );
   }
 
@@ -335,11 +432,21 @@ async function handlePrice(
 
   for (const [symbol, info] of Object.entries(prices).slice(0, 10)) {
     const changeEmoji =
-      info.change24h > 0 ? "📈" : info.change24h < 0 ? "📉" : "➡️";
-    const cap = info.marketCap ? `$${(info.marketCap / 1e9).toFixed(2)}B` : "—";
-    const vol = info.volume24h ? `$${(info.volume24h / 1e9).toFixed(2)}B` : "—";
+      (info.change24h ?? 0) > 0
+        ? "📈"
+        : (info.change24h ?? 0) < 0
+          ? "📉"
+          : "➡️";
+    const cap =
+      info.marketCap !== undefined && Number.isFinite(info.marketCap)
+        ? `$${(info.marketCap / 1e9).toFixed(2)}B`
+        : "—";
+    const vol =
+      info.volume24h !== undefined && Number.isFinite(info.volume24h)
+        ? `$${(info.volume24h / 1e9).toFixed(2)}B`
+        : "—";
     stream.markdown(
-      `| ${symbol.toUpperCase()} | $${info.usd?.toLocaleString() ?? "N/A"} | ${changeEmoji} ${info.change24h?.toFixed(2) ?? 0}% | ${cap} | ${vol} |\n`,
+      `| ${escapeTableCell(symbol.toUpperCase())} | $${fmtUsd(info.usd)} | ${changeEmoji} ${fmtNum(info.change24h, 2, "0.00")}% | ${cap} | ${vol} |\n`,
     );
   }
 
@@ -357,15 +464,7 @@ async function handleMarket(
   stream.progress("Loading market data…");
 
   const [sentimentData, priceData, fgData] = await Promise.all([
-    fetchAPI<{
-      market: {
-        score: number;
-        label: string;
-        bullish: number;
-        bearish: number;
-        neutral: number;
-      };
-    }>("/api/sentiment", token).catch(() => null),
+    fetchAPI<SentimentResponse>("/api/sentiment", token).catch(() => null),
     fetchAPI<{ prices: Record<string, PriceInfo> }>(
       "/api/prices?limit=5",
       token,
@@ -375,7 +474,7 @@ async function handleMarket(
 
   // --- Fear & Greed section ---
   if (fgData?.current) {
-    const fgVal = fgData.current.value;
+    const fgVal = clampFG(fgData.current.value);
     const fgLabel = fgData.current.valueClassification || "Unknown";
     stream.markdown(`### Fear & Greed Index\n\n`);
     stream.markdown(`${fearGreedEmoji(fgVal)} **${fgVal}** — ${fgLabel}\n\n`);
@@ -387,8 +486,10 @@ async function handleMarket(
           : fgData.trend.direction === "worsening"
             ? "⬇️"
             : "➡️";
+      const c7 = fgData.trend.change7d ?? 0;
+      const c30 = fgData.trend.change30d ?? 0;
       stream.markdown(
-        `7d change: ${dir} ${fgData.trend.change7d > 0 ? "+" : ""}${fgData.trend.change7d} · 30d change: ${fgData.trend.change30d > 0 ? "+" : ""}${fgData.trend.change30d}\n\n`,
+        `7d change: ${dir} ${c7 > 0 ? "+" : ""}${c7} · 30d change: ${c30 > 0 ? "+" : ""}${c30}\n\n`,
       );
     }
   }
@@ -396,15 +497,32 @@ async function handleMarket(
   // --- Sentiment section ---
   if (sentimentData?.market) {
     const market = sentimentData.market;
-    const emoji = market.score > 60 ? "🟢" : market.score < 40 ? "🔴" : "🟡";
+    const score = Number(market.score);
+    const emoji = score > 20 ? "🟢" : score < -20 ? "🔴" : "🟡";
 
     stream.markdown(`### News Sentiment\n\n`);
     stream.markdown(
-      `**Overall:** ${emoji} ${market.label} (${market.score}/100)\n\n`,
+      `**Overall:** ${emoji} ${sentimentLabel(market.overall || "neutral")} (score: ${score > 0 ? "+" : ""}${Number.isFinite(score) ? score : 0}/100, confidence: ${market.confidence ?? 0}%)\n\n`,
     );
-    stream.markdown(`- 🟢 Bullish: ${market.bullish}%\n`);
-    stream.markdown(`- 🔴 Bearish: ${market.bearish}%\n`);
-    stream.markdown(`- ⚪ Neutral: ${market.neutral}%\n\n`);
+    if (market.summary) {
+      stream.markdown(`> ${market.summary}\n\n`);
+    }
+
+    // Use distribution counts if available
+    const dist = sentimentData.distribution;
+    if (dist) {
+      if (dist.very_bullish !== undefined)
+        stream.markdown(`- 🟢🟢 Very Bullish: ${dist.very_bullish}\n`);
+      if (dist.bullish !== undefined)
+        stream.markdown(`- 🟢 Bullish: ${dist.bullish}\n`);
+      if (dist.neutral !== undefined)
+        stream.markdown(`- ⚪ Neutral: ${dist.neutral}\n`);
+      if (dist.bearish !== undefined)
+        stream.markdown(`- 🔴 Bearish: ${dist.bearish}\n`);
+      if (dist.very_bearish !== undefined)
+        stream.markdown(`- 🔴🔴 Very Bearish: ${dist.very_bearish}\n`);
+      stream.markdown("\n");
+    }
   }
 
   // --- Top coins section ---
@@ -413,10 +531,10 @@ async function handleMarket(
     stream.markdown("### Top Coins\n\n");
     stream.markdown("| Coin | Price | 24h |\n|------|-------|-----|\n");
     for (const [symbol, info] of Object.entries(prices).slice(0, 5)) {
-      const arrow =
-        info.change24h > 0 ? "📈" : info.change24h < 0 ? "📉" : "➡️";
+      const change = info.change24h ?? 0;
+      const arrow = change > 0 ? "📈" : change < 0 ? "📉" : "➡️";
       stream.markdown(
-        `| ${symbol.toUpperCase()} | $${info.usd?.toLocaleString() ?? "N/A"} | ${arrow} ${info.change24h?.toFixed(2) ?? 0}% |\n`,
+        `| ${escapeTableCell(symbol.toUpperCase())} | $${fmtUsd(info.usd)} | ${arrow} ${fmtNum(info.change24h, 2, "0.00")}% |\n`,
       );
     }
   }
@@ -452,11 +570,14 @@ async function handleSentiment(
   // Market-level summary
   if (data.market) {
     const m = data.market;
+    const score = Number(m.score);
     stream.markdown(`### Overall Market Mood\n\n`);
     stream.markdown(
-      `${sentimentEmoji(m.overall)} **${sentimentLabel(m.overall)}** (score: ${m.score > 0 ? "+" : ""}${m.score}/100, confidence: ${m.confidence}%)\n\n`,
+      `${sentimentEmoji(m.overall)} **${sentimentLabel(m.overall)}** (score: ${score > 0 ? "+" : ""}${Number.isFinite(score) ? score : 0}/100, confidence: ${m.confidence ?? 0}%)\n\n`,
     );
-    stream.markdown(`> ${m.summary}\n\n`);
+    if (m.summary) {
+      stream.markdown(`> ${m.summary}\n\n`);
+    }
 
     if (m.keyDrivers && m.keyDrivers.length > 0) {
       stream.markdown("**Key Drivers:**\n");
@@ -472,12 +593,15 @@ async function handleSentiment(
     const d = data.distribution;
     stream.markdown("### Sentiment Distribution\n\n");
     stream.markdown("| Sentiment | Count |\n|-----------|-------|\n");
-    if (d.very_bullish)
+    if (d.very_bullish !== undefined)
       stream.markdown(`| 🟢🟢 Very Bullish | ${d.very_bullish} |\n`);
-    if (d.bullish) stream.markdown(`| 🟢 Bullish | ${d.bullish} |\n`);
-    if (d.neutral) stream.markdown(`| ⚪ Neutral | ${d.neutral} |\n`);
-    if (d.bearish) stream.markdown(`| 🔴 Bearish | ${d.bearish} |\n`);
-    if (d.very_bearish)
+    if (d.bullish !== undefined)
+      stream.markdown(`| 🟢 Bullish | ${d.bullish} |\n`);
+    if (d.neutral !== undefined)
+      stream.markdown(`| ⚪ Neutral | ${d.neutral} |\n`);
+    if (d.bearish !== undefined)
+      stream.markdown(`| 🔴 Bearish | ${d.bearish} |\n`);
+    if (d.very_bearish !== undefined)
       stream.markdown(`| 🔴🔴 Very Bearish | ${d.very_bearish} |\n`);
     stream.markdown("\n");
   }
@@ -490,8 +614,9 @@ async function handleSentiment(
   if (highImpact.length > 0) {
     stream.markdown("### High-Impact News\n\n");
     for (const article of highImpact.slice(0, 5)) {
+      const assets = (article.affectedAssets || []).join(", ");
       stream.markdown(
-        `- ${sentimentEmoji(article.sentiment)} **${article.title}**\n  ${article.reasoning}\n  ⏱ ${article.timeHorizon} · Affects: ${article.affectedAssets.join(", ")}\n  🔗 [Read](${article.link})\n\n`,
+        `- ${sentimentEmoji(article.sentiment)} **${article.title}**\n  ${article.reasoning}\n  ⏱ ${article.timeHorizon} · Affects: ${assets}\n  🔗 [Read](${safeUrl(article.link)})\n\n`,
       );
     }
   }
@@ -569,13 +694,13 @@ async function handleGas(
   stream.markdown("| Speed | Gwei | Est. USD |\n");
   stream.markdown("|-------|------|----------|\n");
   stream.markdown(
-    `| 🐢 Slow | ${gas.slow ?? "—"} gwei | ${gas.usdSlow ? "$" + gas.usdSlow.toFixed(2) : "—"} |\n`,
+    `| 🐢 Slow | ${fmtNum(gas.slow, 0)} gwei | ${gas.usdSlow !== undefined ? "$" + fmtNum(gas.usdSlow, 2) : "—"} |\n`,
   );
   stream.markdown(
-    `| 🚶 Standard | ${gas.standard ?? "—"} gwei | ${gas.usdStandard ? "$" + gas.usdStandard.toFixed(2) : "—"} |\n`,
+    `| 🚶 Standard | ${fmtNum(gas.standard, 0)} gwei | ${gas.usdStandard !== undefined ? "$" + fmtNum(gas.usdStandard, 2) : "—"} |\n`,
   );
   stream.markdown(
-    `| 🚀 Fast | ${gas.fast ?? "—"} gwei | ${gas.usdFast ? "$" + gas.usdFast.toFixed(2) : "—"} |\n`,
+    `| 🚀 Fast | ${fmtNum(gas.fast, 0)} gwei | ${gas.usdFast !== undefined ? "$" + fmtNum(gas.usdFast, 2) : "—"} |\n`,
   );
 
   stream.markdown(
@@ -591,80 +716,85 @@ async function handleFearGreed(
   stream.markdown("😱 **Fear & Greed Index**\n\n");
   stream.progress("Fetching index…");
 
-  // Try the structured endpoint first
-  try {
-    const data = await fetchAPI<FearGreedResponse>("/api/fear-greed", token);
+  // Single request — the endpoint may return either the structured response
+  // (with `current`) or the legacy flat shape (`value` + `classification`).
+  // We branch off the parsed payload rather than retrying on any failure, so
+  // a network error isn't silently duplicated into a second failing fetch.
+  const raw = await fetchAPI<Partial<FearGreedResponse> & Partial<FearGreedLegacy>>(
+    "/api/fear-greed",
+    token,
+  );
 
-    if (data.current) {
-      const value = data.current.value ?? 50;
-      const label = data.current.valueClassification || "Neutral";
+  if (raw && (raw as FearGreedResponse).current) {
+    const data = raw as FearGreedResponse;
+    const value = clampFG(data.current.value);
+    const label = data.current.valueClassification || "Neutral";
 
-      stream.markdown(
-        `**Current:** ${fearGreedEmoji(value)} **${value}** — ${label}\n\n`,
-      );
-      stream.markdown(`${fearGreedBar(value)}\n\n`);
+    stream.markdown(
+      `**Current:** ${fearGreedEmoji(value)} **${value}** — ${label}\n\n`,
+    );
+    stream.markdown(`${fearGreedBar(value)}\n\n`);
 
-      if (data.trend) {
-        const dir =
-          data.trend.direction === "improving"
-            ? "⬆️"
-            : data.trend.direction === "worsening"
-              ? "⬇️"
-              : "➡️";
-        stream.markdown(`**Trend:** ${dir} ${data.trend.direction}\n`);
-        stream.markdown(
-          `- 7-day change: ${data.trend.change7d > 0 ? "+" : ""}${data.trend.change7d}\n`,
-        );
-        stream.markdown(
-          `- 30-day change: ${data.trend.change30d > 0 ? "+" : ""}${data.trend.change30d}\n\n`,
-        );
-      }
-
-      if (data.breakdown) {
-        stream.markdown("### Breakdown\n\n");
-        stream.markdown(
-          "| Factor | Value | Weight |\n|--------|-------|--------|\n",
-        );
-        for (const [factor, info] of Object.entries(data.breakdown)) {
-          const name = factor
-            .replace(/([A-Z])/g, " $1")
-            .replace(/^./, (s) => s.toUpperCase());
-          stream.markdown(
-            `| ${name} | ${info.value} | ${(info.weight * 100).toFixed(0)}% |\n`,
-          );
-        }
-        stream.markdown("\n");
-      }
-
-      stream.markdown(`*Updated: ${data.lastUpdated || "Recently"}*\n`);
-      stream.markdown(
-        "\n---\n*Source: [cryptocurrency.cv](https://cryptocurrency.cv)*",
-      );
-      return { metadata: { command: "fear-greed" } };
+    if (data.trend) {
+      const dir =
+        data.trend.direction === "improving"
+          ? "⬆️"
+          : data.trend.direction === "worsening"
+            ? "⬇️"
+            : "➡️";
+      const c7 = data.trend.change7d ?? 0;
+      const c30 = data.trend.change30d ?? 0;
+      stream.markdown(`**Trend:** ${dir} ${data.trend.direction}\n`);
+      stream.markdown(`- 7-day change: ${c7 > 0 ? "+" : ""}${c7}\n`);
+      stream.markdown(`- 30-day change: ${c30 > 0 ? "+" : ""}${c30}\n\n`);
     }
-  } catch {
-    // Fall through to legacy format
+
+    if (data.breakdown) {
+      stream.markdown("### Breakdown\n\n");
+      stream.markdown(
+        "| Factor | Value | Weight |\n|--------|-------|--------|\n",
+      );
+      for (const [factor, info] of Object.entries(data.breakdown)) {
+        const name = factor
+          .replace(/([A-Z])/g, " $1")
+          .replace(/^./, (s) => s.toUpperCase());
+        const weight = Number.isFinite(Number(info.weight))
+          ? (Number(info.weight) * 100).toFixed(0)
+          : "—";
+        stream.markdown(
+          `| ${escapeTableCell(name)} | ${info.value} | ${weight}% |\n`,
+        );
+      }
+      stream.markdown("\n");
+    }
+
+    stream.markdown(`*Updated: ${data.lastUpdated || "Recently"}*\n`);
+    stream.markdown(
+      "\n---\n*Source: [cryptocurrency.cv](https://cryptocurrency.cv)*",
+    );
+    return { metadata: { command: "fear-greed" } };
   }
 
-  // Legacy fallback
-  const data = await fetchAPI<FearGreedLegacy>("/api/fear-greed", token);
-  const value = data.value ?? 50;
-  const label = data.classification || "Neutral";
+  // Legacy flat shape fallback
+  const legacy = raw as FearGreedLegacy;
+  const value = clampFG(legacy.value);
+  const label = legacy.classification || "Neutral";
 
   stream.markdown(
     `**Current:** ${fearGreedEmoji(value)} **${value}** — ${label}\n\n`,
   );
   stream.markdown(`${fearGreedBar(value)}\n\n`);
 
-  if (data.previous) {
-    const prev = data.previous;
-    const dir = prev.value < value ? "⬆️" : prev.value > value ? "⬇️" : "➡️";
+  if (legacy.previous) {
+    const prev = legacy.previous;
+    const prevVal = clampFG(prev.value);
+    const dir = prevVal < value ? "⬆️" : prevVal > value ? "⬇️" : "➡️";
     stream.markdown(
-      `**Previous:** ${prev.value} — ${prev.classification} ${dir}\n\n`,
+      `**Previous:** ${prevVal} — ${prev.classification} ${dir}\n\n`,
     );
   }
 
-  stream.markdown(`*Updated: ${data.timestamp || "Recently"}*\n`);
+  stream.markdown(`*Updated: ${legacy.timestamp || "Recently"}*\n`);
   stream.markdown(
     "\n---\n*Source: [cryptocurrency.cv](https://cryptocurrency.cv)*",
   );
@@ -831,15 +961,16 @@ async function handleResearch(
   // Price data if available
   if (report.priceData) {
     const p = report.priceData;
-    const ch24 = p.change24h > 0 ? "📈" : p.change24h < 0 ? "📉" : "➡️";
+    const c24 = p.change24h ?? 0;
+    const ch24 = c24 > 0 ? "📈" : c24 < 0 ? "📉" : "➡️";
     stream.markdown(
-      `**Price:** $${p.price.toLocaleString()} ${ch24} ${p.change24h?.toFixed(2)}% (24h)`,
+      `**Price:** $${fmtUsd(p.price)} ${ch24} ${fmtNum(p.change24h, 2, "0.00")}% (24h)`,
     );
     if (p.change7d !== undefined) {
-      stream.markdown(` · ${p.change7d?.toFixed(2)}% (7d)`);
+      stream.markdown(` · ${fmtNum(p.change7d, 2, "0.00")}% (7d)`);
     }
     stream.markdown("\n");
-    if (report.marketCap) {
+    if (report.marketCap !== undefined && Number.isFinite(report.marketCap)) {
       stream.markdown(
         `**Market Cap:** $${(report.marketCap / 1e9).toFixed(2)}B\n`,
       );
@@ -960,11 +1091,13 @@ const chatHandler: vscode.ChatRequestHandler = async (
         );
         return { metadata: { command: "help" } };
     }
-  } catch (error: any) {
-    const message =
-      error.name === "AbortError"
-        ? "Request was cancelled."
-        : error.message || "An unknown error occurred.";
+  } catch (error: unknown) {
+    let message = "An unknown error occurred.";
+    if (error instanceof Error) {
+      message = error.name === "AbortError"
+        ? "Request was cancelled or timed out."
+        : error.message || message;
+    }
     stream.markdown(`\n\n❌ **Error:** ${message}\n\nPlease try again later.`);
     return { metadata: { command: command ?? "unknown", error: true } };
   }
@@ -1001,7 +1134,12 @@ export function activate(context: vscode.ExtensionContext) {
         "cryptoDashboard",
         "Crypto Dashboard",
         vscode.ViewColumn.One,
-        { enableScripts: true },
+        {
+          // Panel is purely static informational content — no scripts needed.
+          enableScripts: false,
+          // Restrict the webview to this extension's own resources.
+          localResourceRoots: [context.extensionUri],
+        },
       );
       panel.webview.html = getDashboardHTML();
     }),
@@ -1011,9 +1149,15 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 function getDashboardHTML(): string {
+  // Strict CSP: inline styles only (the page ships with an inline <style>
+  // block), no scripts, no remote loads. Webview is also created with
+  // enableScripts: false and a restricted localResourceRoots.
   return `<!DOCTYPE html>
 <html>
 <head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';" />
+  <title>Crypto Dashboard</title>
   <style>
     body { font-family: system-ui; padding: 20px; background: #1e1e1e; color: #fff; }
     h1 { color: #ffffff; }

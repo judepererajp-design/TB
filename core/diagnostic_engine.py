@@ -622,9 +622,25 @@ In 1-2 sentences: should they approve or wait? Start with "Approve" or "Wait —
                         for _s in _recent_sigs:
                             try:
                                 import datetime
-                                _st = str(_s.get('created_at',''))[:19]
-                                _dt = datetime.datetime.strptime(_st, '%Y-%m-%d %H:%M:%S')
-                                if _dt.timestamp() < _cutoff_ts:
+                                _ca = _s.get('created_at')
+                                _dt_ts = None
+                                if isinstance(_ca, (int, float)):
+                                    _dt_ts = float(_ca)
+                                elif _ca is not None:
+                                    _st = str(_ca)[:19]
+                                    try:
+                                        _dt_ts = datetime.datetime.strptime(
+                                            _st, '%Y-%m-%d %H:%M:%S'
+                                        ).timestamp()
+                                    except ValueError:
+                                        # Try ISO 8601 with 'T' separator
+                                        try:
+                                            _dt_ts = datetime.datetime.fromisoformat(
+                                                str(_ca).replace('Z', '+00:00')
+                                            ).timestamp()
+                                        except ValueError:
+                                            _dt_ts = None
+                                if _dt_ts is not None and _dt_ts < _cutoff_ts:
                                     _aged.append(_s)
                             except Exception:
                                 pass

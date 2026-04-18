@@ -43,6 +43,12 @@ DEFAULT_BETA_PRIOR_ALPHA = 2.6
 DEFAULT_BETA_PRIOR_BETA = 2.4
 DEFAULT_BETA_PRIOR_MASS = DEFAULT_BETA_PRIOR_ALPHA + DEFAULT_BETA_PRIOR_BETA
 
+# Calibration tuning constants
+CALIBRATION_CORRECTION_RATE = 0.30   # fraction of composite bias applied per cycle
+CALIBRATION_LR_FLOOR_POS = 0.01      # min magnitude for positive likelihood ratios
+CALIBRATION_LR_FLOOR_NEG = -0.01     # max magnitude for negative likelihood ratios
+CALIBRATION_BASELINE_RESTORE = 0.02  # restoration nudge per cycle toward baseline
+
 
 # ── Data Classes ──────────────────────────────────────────────
 
@@ -328,7 +334,7 @@ class ProbabilityEngine:
         # p_win toward actual reality instead of ignoring the measurement.
         # Uses 50% correction factor — conservative enough to avoid
         # over-shooting while still closing the calibration gap.
-        _cal_bin_key = str(round(p_win, 1))
+        _cal_bin_key = f"{p_win:.1f}"
         if _cal_bin_key in self._calibration_bins:
             _cal_data = self._calibration_bins[_cal_bin_key]
             _cal_count = _cal_data.get('count', 0)
@@ -696,14 +702,21 @@ class ProbabilityEngine:
             total_weight += w
 
         if total_weight == 0:
-            # No qualifying bins — still apply soft restoration so LRs drift back
+            # No qualifying bins — still apply soft restoration so LRs drift back.
+            # Re-apply the sign-aware floor afterwards so a near-zero current LR
+            # cannot drift across the ±0.01 boundary.
             for ev_name, baseline_lr in self._likelihood_ratios_baseline.items():
                 current = self._likelihood_ratios.get(ev_name, baseline_lr)
-                self._likelihood_ratios[ev_name] = current + 0.02 * (baseline_lr - current)
+                restored = current + CALIBRATION_BASELINE_RESTORE * (baseline_lr - current)
+                if baseline_lr >= 0:
+                    restored = max(CALIBRATION_LR_FLOOR_POS, restored)
+                else:
+                    restored = min(CALIBRATION_LR_FLOOR_NEG, restored)
+                self._likelihood_ratios[ev_name] = restored
             return
 
         net_bias = weighted_bias / total_weight   # signed composite error
-        correction_factor = abs(net_bias) * 0.3   # 30% of the composite error
+        correction_factor = abs(net_bias) * CALIBRATION_CORRECTION_RATE
 
         # ── Step 2: single correction pass ───────────────────────────────────
         tuned = 0
@@ -711,20 +724,27 @@ class ProbabilityEngine:
             if net_bias > 0 and lr > 0:
                 # Net over-confident → dampen positive LRs
                 new_lr = lr * (1.0 - correction_factor)
-                self._likelihood_ratios[ev_name] = max(0.01, new_lr)
+                self._likelihood_ratios[ev_name] = max(CALIBRATION_LR_FLOOR_POS, new_lr)
                 tuned += 1
             elif net_bias < 0 and lr < 0:
                 # Net under-confident → dampen negative LRs (make them less negative)
                 new_lr = lr * (1.0 - correction_factor)
-                self._likelihood_ratios[ev_name] = min(-0.01, new_lr)
+                self._likelihood_ratios[ev_name] = min(CALIBRATION_LR_FLOOR_NEG, new_lr)
                 tuned += 1
 
         # ── Step 3: soft restoration toward baseline (M2-FIX) ────────────────
         # 2% nudge per calibration cycle prevents indefinite LR decay when the
         # composite correction factor is smaller than the restoration rate.
+        # Re-apply the sign-aware floor so restoration cannot drift across the
+        # ±0.01 boundary that the correction step enforced.
         for ev_name, baseline_lr in self._likelihood_ratios_baseline.items():
             current = self._likelihood_ratios.get(ev_name, baseline_lr)
-            self._likelihood_ratios[ev_name] = current + 0.02 * (baseline_lr - current)
+            restored = current + CALIBRATION_BASELINE_RESTORE * (baseline_lr - current)
+            if baseline_lr >= 0:
+                restored = max(CALIBRATION_LR_FLOOR_POS, restored)
+            else:
+                restored = min(CALIBRATION_LR_FLOOR_NEG, restored)
+            self._likelihood_ratios[ev_name] = restored
 
         if tuned > 0:
             logger.info(
@@ -760,7 +780,7 @@ class ProbabilityEngine:
 
     def _get_calibration_error(self, p_win: float) -> float:
         """Get calibration error for a given prediction level"""
-        bin_key = str(round(p_win, 1))
+        bin_key = f"{p_win:.1f}"
         if bin_key in self._calibration_bins:
             return self._calibration_bins[bin_key].get('error', 0.0)
         return 0.0  # No data yet

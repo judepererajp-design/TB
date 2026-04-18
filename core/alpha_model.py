@@ -123,6 +123,14 @@ class StrategyBayesianWeight:
         self.alpha = max(1.5, self.alpha * decay)
         self.beta = max(1.5, self.beta * decay)
 
+        # Defensive: pnl_r may arrive as None from upstream; treat as 0 R.
+        if pnl_r is None:
+            pnl_r = 0.0
+        try:
+            pnl_r = float(pnl_r)
+        except (TypeError, ValueError):
+            pnl_r = 0.0
+
         if won:
             self.alpha += 1
             if pnl_r > 0:
@@ -317,15 +325,28 @@ class AlphaModel:
         }
 
     def load_weights(self, data: Dict[str, dict]):
-        """Load strategy weights from persistence"""
+        """Load strategy weights from persistence (defensive against corrupt files)."""
+        if not isinstance(data, dict):
+            logger.warning(f"alpha_model.load_weights: expected dict, got {type(data).__name__}; skipping")
+            return
+
+        loaded = 0
         for name, vals in data.items():
-            sw = StrategyBayesianWeight(name=name)
-            sw.alpha = vals.get('alpha', 2.0)
-            sw.beta = vals.get('beta', 2.0)
-            sw.avg_win_r = vals.get('avg_win_r', 2.0)
-            sw.avg_loss_r = vals.get('avg_loss_r', 1.0)
+            if not isinstance(name, str) or not isinstance(vals, dict):
+                logger.warning(f"alpha_model.load_weights: skipping malformed entry for {name!r}")
+                continue
+            try:
+                sw = StrategyBayesianWeight(name=name)
+                sw.alpha = max(0.5, float(vals.get('alpha', 2.0)))
+                sw.beta = max(0.5, float(vals.get('beta', 2.0)))
+                sw.avg_win_r = max(0.1, float(vals.get('avg_win_r', 2.0)))
+                sw.avg_loss_r = max(0.1, float(vals.get('avg_loss_r', 1.0)))
+            except (TypeError, ValueError) as e:
+                logger.warning(f"alpha_model.load_weights: skipping {name!r} due to bad value: {e}")
+                continue
             self._strategy_weights[name] = sw
-        logger.info(f"Loaded {len(data)} strategy weights")
+            loaded += 1
+        logger.info(f"Loaded {loaded} strategy weights")
 
     def bootstrap_priors(self):
         """

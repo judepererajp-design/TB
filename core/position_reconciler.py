@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 # Max age for recovery — signals older than this are expired, not recovered
 RECOVERY_MAX_AGE_HOURS: int = DBC.SIGNAL_MAX_AGE_RECOVERY_HOURS
+ACTIVE_RECOVERY_STATES: tuple = ("PENDING", "ACTIVE", "TP1_HIT", "BE_ACTIVE")
 
 
 @dataclass
@@ -138,7 +139,7 @@ class PositionReconciler:
 
     async def _fetch_active_signals(self, db: object) -> List[dict]:
         """Query DB for signals in active states."""
-        active_states = ("PENDING", "ACTIVE", "TP1_HIT", "BE_ACTIVE")
+        active_states = ACTIVE_RECOVERY_STATES
         placeholders = ",".join("?" for _ in active_states)
         sql = (
             f"SELECT * FROM tracked_signals_v1 "

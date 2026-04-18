@@ -88,6 +88,28 @@ class LearningLoop:
 
         # Calibration buffer
         self._calibration_buffer: List[Tuple[float, bool]] = []
+        # Track fire-and-forget background tasks so exceptions are logged
+        # and tasks are not GC'd prematurely.
+        self._bg_tasks: "set[asyncio.Task]" = set()
+
+    def _spawn_bg(self, coro, *, label: str) -> None:
+        """Schedule a fire-and-forget coroutine, retain a reference, and log failures."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # not in an async context
+        task = loop.create_task(coro)
+        self._bg_tasks.add(task)
+
+        def _done(t: asyncio.Task) -> None:
+            self._bg_tasks.discard(t)
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                logger.warning(f"learning_loop background task {label!r} failed: {exc}")
+
+        task.add_done_callback(_done)
 
 
     def start(self):
@@ -218,15 +240,16 @@ class LearningLoop:
         if not _is_expired:
             self._calibration_buffer.append((p_win_predicted, won))
             if len(self._calibration_buffer) >= 15:
+                # Snapshot then clear, so the same observations cannot be
+                # re-calibrated on the next call. (Previously kept the last 5
+                # as "rolling overlap", which double-counted them.)
+                _batch = list(self._calibration_buffer)
+                self._calibration_buffer.clear()
                 try:
                     from core.probability_engine import probability_engine
-                    probability_engine.calibrate(self._calibration_buffer)
-                    # FIX 9: clear buffer after calibrate() — previously it was never
-                    # cleared here, so once it hit 15 entries, calibrate() fired on
-                    # every single trade call redundantly. Keep last 5 as rolling overlap.
-                    self._calibration_buffer = self._calibration_buffer[-5:]
-                except Exception:
-                    pass
+                    probability_engine.calibrate(_batch)
+                except Exception as _cal_err:
+                    logger.warning(f"calibrate() failed on batch of {len(_batch)}: {_cal_err}")
 
         # 4. Track evidence effectiveness
         if evidence:
@@ -247,11 +270,7 @@ class LearningLoop:
         # Without this, the only save path was _analysis_loop() every hour,
         # meaning any crash within an hour loses all trade learning data.
         self._pending_save = True
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(self._maybe_save())
-        except RuntimeError:
-            pass  # Not in async context — will save on next analysis cycle
+        self._spawn_bg(self._maybe_save(), label="maybe_save")
 
         # ── Periodic analysis ─────────────────────────────────────
 
@@ -419,18 +438,20 @@ class LearningLoop:
                     )
                     # Fire Telegram alert
                     try:
-                        import asyncio as _asyncio
-                        from tg.bot import telegram_bot  # FIX 8: wrong module path
-                        _asyncio.create_task(telegram_bot.send_signals_text(
-                            text=(
-                                f"🚫 <b>Strategy Auto-Disabled</b>\n"
-                                f"<b>{strat}</b> has negative edge: "
-                                f"<b>{avg_r:+.3f}R</b> over {stats['raw_count']} trades\n"
-                                f"Manual re-enable required."
+                        from tg.bot import telegram_bot
+                        self._spawn_bg(
+                            telegram_bot.send_signals_text(
+                                text=(
+                                    f"🚫 <b>Strategy Auto-Disabled</b>\n"
+                                    f"<b>{strat}</b> has negative edge: "
+                                    f"<b>{avg_r:+.3f}R</b> over {stats['raw_count']} trades\n"
+                                    f"Manual re-enable required."
+                                ),
                             ),
-                        ))
-                    except Exception:
-                        pass
+                            label=f"telegram_auto_disable[{strat}]",
+                        )
+                    except Exception as _tg_err:
+                        logger.warning(f"Telegram auto-disable alert failed for {strat}: {_tg_err}")
                 except Exception as e:
                     logger.error(f"Auto-disable failed for {strat}: {e}")
 
@@ -448,17 +469,19 @@ class LearningLoop:
                 except Exception:
                     pass
                 try:
-                    import asyncio as _asyncio
-                    from tg.bot import telegram_bot  # FIX 8: wrong module path
-                    _asyncio.create_task(telegram_bot.send_signals_text(
-                        text=(
-                            f"⚠️ <b>Strategy Warning</b>\n"
-                            f"<b>{strat}</b>: avg_r={avg_r:+.3f}R over {stats['raw_count']} trades\n"
-                            f"Weight halved. If it continues, auto-disable will trigger."
+                    from tg.bot import telegram_bot
+                    self._spawn_bg(
+                        telegram_bot.send_signals_text(
+                            text=(
+                                f"⚠️ <b>Strategy Warning</b>\n"
+                                f"<b>{strat}</b>: avg_r={avg_r:+.3f}R over {stats['raw_count']} trades\n"
+                                f"Weight halved. If it continues, auto-disable will trigger."
+                            ),
                         ),
-                    ))
-                except Exception:
-                    pass
+                        label=f"telegram_strategy_warning[{strat}]",
+                    )
+                except Exception as _tg_err:
+                    logger.warning(f"Telegram strategy-warning failed for {strat}: {_tg_err}")
 
     # ── R8-F4: Regime-Adaptive Strategy Rotation ────────────────
 

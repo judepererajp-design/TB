@@ -330,6 +330,61 @@ class Engine:
         self._loss_cooldown: Dict[tuple, float] = {}
         self._reentry_cooldown_mins: int = cfg.system.get('reentry_cooldown_mins', 30)
         self._recent_symbol_direction: Dict[str, dict] = {}
+        # Periodic pruning of cooldown state — these dicts are written on every
+        # signal/loss but never trimmed, so on a long-running bot they grow with
+        # the cumulative symbol set. Bound them with a TTL well past their
+        # functional lifetime so live behaviour is unchanged.
+        self._last_cooldown_prune: float = 0.0
+        # Async lock guarding _loss_cooldown writes from outcome callbacks
+        # (which can land on different tasks than the scan loop). Lazily
+        # created on first use so __init__ does not require a running event loop.
+        self._loss_cooldown_lock: Optional[asyncio.Lock] = None
+
+    def _get_loss_cooldown_lock(self) -> asyncio.Lock:
+        if self._loss_cooldown_lock is None:
+            self._loss_cooldown_lock = asyncio.Lock()
+        return self._loss_cooldown_lock
+
+    def _prune_cooldown_state(self) -> None:
+        """Drop _loss_cooldown / _recent_symbol_direction entries past TTL.
+
+        TTL is the configured cooldown horizon × 4, which is far beyond any
+        functional use of the entry; we keep some slack to avoid log spam if
+        a stragler signal lands moments after expiry.
+        """
+        now = time.time()
+        loss_ttl = max(60, self._reentry_cooldown_mins * 60) * 4
+        recent_ttl = max(
+            Timing.OPPOSITE_SIGNAL_COOLDOWN_BY_SETUP.get("intraday", 1800),
+            Timing.OPPOSITE_SIGNAL_COOLDOWN_BY_SETUP.get("swing", 1800),
+        ) * 4
+
+        loss_pruned = 0
+        if self._loss_cooldown:
+            stale = [k for k, ts in self._loss_cooldown.items() if now - ts > loss_ttl]
+            for k in stale:
+                self._loss_cooldown.pop(k, None)
+            loss_pruned = len(stale)
+
+        recent_pruned = 0
+        if self._recent_symbol_direction:
+            stale_sym = [
+                s for s, d in self._recent_symbol_direction.items()
+                if now - float(d.get("ts", 0.0)) > recent_ttl
+            ]
+            for s in stale_sym:
+                self._recent_symbol_direction.pop(s, None)
+            recent_pruned = len(stale_sym)
+
+        # Surface prune activity so silent TTL expiry doesn't hide behaviour.
+        # Only log when we actually pruned something — avoids per-cycle noise.
+        if loss_pruned or recent_pruned:
+            logger.info(
+                f"⏱️  Cooldown TTL prune: loss_cooldown -{loss_pruned} "
+                f"(remaining={len(self._loss_cooldown)}), "
+                f"recent_symbol_direction -{recent_pruned} "
+                f"(remaining={len(self._recent_symbol_direction)})"
+            )
 
     @staticmethod
     def _rank_publish_candidates(
@@ -1309,48 +1364,54 @@ class Engine:
         try:
             from core.price_cache import price_cache
             await price_cache.stop()
-        except Exception:
-            pass
+        except Exception as _e:
+            logger.warning(f"Shutdown: price_cache.stop() failed: {_e}")
         # Stop outcome monitor
         try:
             from signals.outcome_monitor import outcome_monitor
             await outcome_monitor.stop()
-        except Exception:
-            pass
+        except Exception as _e:
+            logger.warning(f"Shutdown: outcome_monitor.stop() failed: {_e}")
         # Stop invalidation monitor
         try:
             await invalidation_monitor.stop()
-        except Exception:
-            pass
+        except Exception as _e:
+            logger.warning(f"Shutdown: invalidation_monitor.stop() failed: {_e}")
         # Stop learning loop
         try:
             await learning_loop.stop()
-        except Exception:
-            pass
+        except Exception as _e:
+            logger.warning(f"Shutdown: learning_loop.stop() failed: {_e}")
         # Stop adaptive weight manager
         try:
             from signals.adaptive_weights import adaptive_weight_manager
             await adaptive_weight_manager.stop()
-        except Exception:
-            pass
+        except Exception as _e:
+            logger.warning(f"Shutdown: adaptive_weight_manager.stop() failed: {_e}")
         # Stop execution engine
         try:
             from core.execution_engine import execution_engine
             await execution_engine.stop()
-        except Exception:
-            pass
+        except Exception as _e:
+            logger.warning(f"Shutdown: execution_engine.stop() failed: {_e}")
         # Stop network monitor
         try:
             from core.network_monitor import network_monitor
             await network_monitor.stop()
-        except Exception:
-            pass
+        except Exception as _e:
+            logger.warning(f"Shutdown: network_monitor.stop() failed: {_e}")
         try:
             await telegram_bot.stop()
-        except Exception:
-            pass
-        await api.close()
-        await db.close()
+        except Exception as _e:
+            logger.warning(f"Shutdown: telegram_bot.stop() failed: {_e}")
+        try:
+            await api.close()
+        except Exception as _e:
+            logger.warning(f"Shutdown: api.close() failed: {_e}")
+        try:
+            await db.close()
+        except Exception as _e:
+            logger.warning(f"Shutdown: db.close() failed: {_e}")
         logger.info("Shutdown complete.")
 
     # ── Main loop ─────────────────────────────────────────────
@@ -1409,6 +1470,14 @@ class Engine:
 
                 # ── Universe refresh ───────────────────────────
                 await scanner.build_universe()  # Internal TTL check
+
+                # ── Periodic cooldown-state prune ──────────────
+                # Bounds _loss_cooldown / _recent_symbol_direction memory growth.
+                # Cheap (just dict iteration) so safe to run every cycle, but
+                # actual mutation only happens for entries past TTL.
+                if now - self._last_cooldown_prune > 600:  # at most every 10 min
+                    self._prune_cooldown_state()
+                    self._last_cooldown_prune = now
 
                 # ── Daily summary ──────────────────────────────
                 await self._check_daily_summary()
@@ -4978,8 +5047,8 @@ class Engine:
 
             # PHASE 2 FIX (P3-B): Record loss time for re-entry cooldown
             if outcome == "LOSS" and symbol and direction:
-                import time as _time_cd
-                self._loss_cooldown[(symbol, direction)] = _time_cd.time()
+                async with self._get_loss_cooldown_lock():
+                    self._loss_cooldown[(symbol, direction)] = time.time()
                 logger.info(f"⏸️  Re-entry cooldown started: {symbol} {direction} for {self._reentry_cooldown_mins}min")
 
             # Pull execution-quality fields from DB so the performance tracker

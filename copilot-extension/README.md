@@ -6,7 +6,7 @@ Powered by the free [cryptocurrency.cv](https://cryptocurrency.cv) API. No API k
 
 ## Features
 
-- � **Breaking News** — Breaking crypto headlines with priority & sentiment indicators
+- 🚨 **Breaking News** — Breaking crypto headlines with priority & sentiment indicators
 - 📰 **Latest News** — Top crypto headlines from 200+ sources
 - 💰 **Live Prices** — Real-time coin prices with 24h change, market cap & volume
 - 📊 **Market Overview** — Prices, Fear & Greed Index, and news sentiment in one view

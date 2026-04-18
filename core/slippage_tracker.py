@@ -75,6 +75,12 @@ class SlippageTracker:
         """Record a fill event and compute slippage."""
         if expected_price <= 0:
             return
+        if direction not in ("LONG", "SHORT"):
+            logger.warning(
+                f"slippage_tracker.record_fill: invalid direction {direction!r} "
+                f"for {symbol} (signal {signal_id}); skipping"
+            )
+            return
 
         # Adverse slippage: paid more for LONG, received less for SHORT
         if direction == "LONG":
