@@ -50,6 +50,11 @@ class StalkerEngine:
         if not ohlcv_1h or len(ohlcv_1h) < 50:
             return None
 
+        # Check alert cooldown *before* any expensive computation
+        last_alert = self._watched.get(symbol, 0)
+        if time.time() - last_alert < self._alert_cooldown:
+            return None
+
         df = pd.DataFrame(ohlcv_1h, columns=['ts','open','high','low','close','volume'])
         df = df.astype({'open': float,'high': float,'low': float,'close': float,'volume': float})
 
@@ -101,11 +106,6 @@ class StalkerEngine:
                 reasons.append("⚡ 15m structure aligning with 1h")
 
         if score < self._min_watch_score or not reasons:
-            return None
-
-        # Check cooldown
-        last_alert = self._watched.get(symbol, 0)
-        if time.time() - last_alert < self._alert_cooldown:
             return None
 
         return {
@@ -173,8 +173,8 @@ class StalkerEngine:
                 trs.append(max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])))
             return np.mean(trs[-p:]) if trs else 0
 
-        recent_atr = atr(highs[-20:], lows[-20:], closes[-20:], period)
-        long_atr   = atr(highs[-60:], lows[-60:], closes[-60:], period)
+        recent_atr = atr(highs[-14:], lows[-14:], closes[-14:], period)
+        long_atr   = atr(highs[-60:], lows[-60:], closes[-60:], 59)   # average all 59 TRs
 
         if long_atr == 0:
             return False
@@ -212,14 +212,18 @@ class StalkerEngine:
             return False
 
         def rsi(c, p=14):
-            if len(c) < p+1:
+            if len(c) < p + 1:
                 return 50.0
-            d = np.diff(c[-(p+1):])
-            gains  = np.where(d > 0, d, 0)
-            losses = np.where(d < 0, -d, 0)
-            avg_g  = np.mean(gains)  or 1e-10
-            avg_l  = np.mean(losses) or 1e-10
-            return 100 - (100 / (1 + avg_g/avg_l))
+            d = np.diff(c)
+            gains  = np.where(d > 0, d, 0.0)
+            losses = np.where(d < 0, -d, 0.0)
+            # Seed with SMA, then apply Wilder's smoothing (matches standard charts)
+            avg_g = float(np.mean(gains[:p])) or 1e-10
+            avg_l = float(np.mean(losses[:p])) or 1e-10
+            for g, l in zip(gains[p:], losses[p:]):
+                avg_g = (avg_g * (p - 1) + float(g)) / p
+                avg_l = (avg_l * (p - 1) + float(l)) / p
+            return 100 - (100 / (1 + avg_g / avg_l))
 
         rsi_vals = [rsi(closes[:i]) for i in range(len(closes)-15, len(closes))]
         coiling  = all(40 < v < 60 for v in rsi_vals[-8:])
@@ -253,7 +257,7 @@ class StalkerEngine:
         volumes = df15['volume'].values
 
         avg_vol = np.mean(volumes[-20:])
-        cur_vol = volumes[-1]
+        cur_vol = volumes[-2]  # Use last completed (closed) candle; [-1] is still forming
 
         # Volume spike on recent bars
         vol_spike = cur_vol > avg_vol * 1.8

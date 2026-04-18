@@ -12,16 +12,19 @@ Manages the full scanning pipeline:
 
 import asyncio
 import logging
+import math
 import time
 from typing import Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 
 import numpy as np
+import pandas as pd
 
 from config.loader import cfg
 from data.api_client import api
 from data.database import db
+from utils.formatting import fmt_price
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +95,15 @@ class Scanner:
         Build/refresh the symbol universe from Binance.
         Called at startup and every hour.
         """
+        # Fast path: skip lock acquisition entirely when no refresh is due.
+        # Callers that arrive while a refresh is already running will get an
+        # early return here or on the second check inside the lock below.
+        if time.time() - self._last_universe_refresh < self._universe_ttl:
+            return
+
         async with self._lock:
+            # Re-check after acquiring the lock so a concurrent caller that was
+            # waiting does not trigger a redundant back-to-back refresh.
             now = time.time()
             if now - self._last_universe_refresh < self._universe_ttl:
                 return
@@ -175,6 +186,18 @@ class Scanner:
 
             self._symbols = new_symbols
             self._last_universe_refresh = now
+
+            # Prune cooldown entries that belong to symbols no longer in the
+            # universe so the dicts don't grow unboundedly on long-running instances.
+            active_symbols = set(new_symbols)
+            for _cd in (
+                self._whale_cooldown,
+                self._watchlist_cooldown,
+                self._ohlcv_fail_counts,
+                self._ohlcv_cooldown_until,
+            ):
+                for _k in [k for k in _cd if k not in active_symbols]:
+                    _cd.pop(_k, None)
 
             logger.info(
                 f"Universe built: {t1_count} T1 | {t2_count} T2 | {t3_count} T3 "
@@ -286,14 +309,25 @@ class Scanner:
         Check if a symbol should be promoted based on volume spike.
         Returns (from_tier, to_tier) if promoted, else None.
         """
-        if symbol not in self._symbols:
+        # Use .get() to avoid a TOCTOU race between the membership test and
+        # the dict lookup — build_universe() can replace _symbols concurrently.
+        state = self._symbols.get(symbol)
+        if state is None:
             return None
 
-        state = self._symbols[symbol]
         prom_cfg = self._scan_cfg.auto_promotion
 
         if not getattr(prom_cfg, 'enabled', True):
             return None
+
+        # Always update the volume MA *before* computing the spike ratio so it
+        # stays current whether or not a promotion fires this cycle.
+        # Use a time-weighted EMA so the effective half-life is ~7 days for all
+        # tiers (Tier-1 scans every 2 min, Tier-3 every 15 min).
+        elapsed = time.time() - state.last_scan if state.last_scan > 0 else 300.0
+        tau   = 7 * 24 * 3600.0   # 7-day time constant in seconds
+        alpha = 1.0 - math.exp(-elapsed / tau)
+        state.volume_ma = state.volume_ma * (1.0 - alpha) + current_volume * alpha
 
         vol_ma = state.volume_ma if state.volume_ma > 0 else current_volume
         vol_spike_mult = current_volume / vol_ma if vol_ma > 0 else 1.0
@@ -323,9 +357,6 @@ class Scanner:
             logger.info(f"🚀 {symbol} promoted: Tier {from_tier} → Tier {to_tier} ({vol_spike_mult:.1f}x volume)")
 
             return (from_tier, to_tier)
-
-        # Update volume MA (EMA with 7-day decay)
-        state.volume_ma = state.volume_ma * 0.9 + current_volume * 0.1
 
         return None
 
@@ -360,8 +391,8 @@ class Scanner:
 
         # Use last known price from order book or symbol state
         # order_book bids/asks have prices — use mid of best bid/ask
-        best_bid = float(order_book.get('bids', [[1]])[0][0]) if order_book.get('bids') else 0
-        best_ask = float(order_book.get('asks', [[1]])[0][0]) if order_book.get('asks') else 0
+        best_bid = float(order_book.get('bids', [[]])[0][0]) if order_book.get('bids') else 0.0
+        best_ask = float(order_book.get('asks', [[]])[0][0]) if order_book.get('asks') else 0.0
         if best_bid > 0 and best_ask > 0:
             current_price = (best_bid + best_ask) / 2
         elif best_bid > 0:
@@ -369,31 +400,53 @@ class Scanner:
         elif best_ask > 0:
             current_price = best_ask
         else:
-            # Fallback: derive from 24h volume and an approximate trade count
-            # volume_24h is in quote (USDT), so we can't get price without volume in base
-            # Use 1.0 — this will cause USD threshold to behave as if unit price, which is
-            # better than the previous (volume/86400) which gives tokens/second
-            current_price = 1.0  # last resort; whale detection may fire too often for low-price coins
+            # Cannot derive price from an empty order book — skip rather than
+            # using a bogus fallback that would corrupt USD threshold comparisons.
+            return None
 
         bids = order_book.get('bids', [])
         asks = order_book.get('asks', [])
 
+        # Check up to 50 levels.  Detect both concentrated single-level whale
+        # walls AND distributed / iceberg orders accumulated within 1% of mid.
+        price_band = current_price * 0.01
         for side, orders in [('buy', bids), ('sell', asks)]:
-            for price, qty in orders[:20]:
-                price = float(price)
-                qty   = float(qty)
+            cumulative_usd = 0.0
+            for price, qty in orders[:50]:
+                price     = float(price)
+                qty       = float(qty)
                 order_usd = price * qty
 
+                # Single-level whale wall
                 if order_usd >= min_order_usd:
                     self._whale_cooldown[symbol] = time.time()
-                    logger.info(f"🐋 Whale detected: {symbol} {side} ${order_usd:,.0f}")
+                    logger.info(f"🐋 Whale order: {symbol} {side} ${order_usd:,.0f} @ {price}")
                     return {
-                        'symbol': symbol,
-                        'side': side,
+                        'symbol':    symbol,
+                        'side':      side,
                         'order_usd': order_usd,
-                        'price': price,
-                        'qty': qty
+                        'price':     price,
+                        'qty':       qty,
                     }
+
+                # Accumulate within the 1% mid-price band to catch iceberg orders
+                if abs(price - current_price) <= price_band:
+                    cumulative_usd += order_usd
+
+            # Distributed / iceberg whale
+            if cumulative_usd >= min_order_usd:
+                self._whale_cooldown[symbol] = time.time()
+                logger.info(
+                    f"🐋 Iceberg whale: {symbol} {side} "
+                    f"${cumulative_usd:,.0f} cumulative within 1% band"
+                )
+                return {
+                    'symbol':    symbol,
+                    'side':      side,
+                    'order_usd': cumulative_usd,
+                    'price':     current_price,
+                    'qty':       cumulative_usd / current_price,
+                }
 
         return None
 
@@ -408,14 +461,11 @@ class Scanner:
         if not ohlcv or len(ohlcv) < 30:
             return None
 
-        # Cooldown gate — StalkerEngine._watched was never consulted here,
-        # causing the same high-scoring symbol to alert every scan cycle.
-        import time as _time
+        # Cooldown gate — check before any expensive computation
         _last = self._watchlist_cooldown.get(symbol, 0)
-        if _time.time() - _last < self._watchlist_cooldown_secs:
+        if time.time() - _last < self._watchlist_cooldown_secs:
             return None
 
-        import pandas as pd
         df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
         df = df.astype({'open':float,'high':float,'low':float,'close':float,'volume':float})
 
@@ -433,7 +483,7 @@ class Scanner:
             window = closes[-bb_period:]
             bb_mean = np.mean(window)
             bb_std  = np.std(window)
-            bb_width = bb_std * 2 / bb_mean  # Relative bandwidth
+            bb_width = (bb_std * 4) / bb_mean if bb_mean > 0 else 0.0  # Standard Bollinger Bandwidth
 
             # Lowest bandwidth in 48 bars = squeeze
             if len(closes) >= 48:
@@ -441,7 +491,8 @@ class Scanner:
                 for i in range(len(closes) - 48, len(closes)):
                     w = closes[max(0,i-20):i]
                     if len(w) >= 10:
-                        widths_hist.append(np.std(w) / np.mean(w))
+                        m = np.mean(w)
+                        widths_hist.append((np.std(w) * 4) / m if m > 0 else 0.0)
                 if widths_hist and bb_width < np.percentile(widths_hist, 20):
                     score += 30
                     reasons.append("🌀 Bollinger squeeze — lowest volatility in 48 bars")
@@ -491,20 +542,25 @@ class Scanner:
 
         if score >= 50:
             await db.upsert_watchlist(symbol, float(score), reasons)
-            self._watchlist_cooldown[symbol] = _time.time()
+            self._watchlist_cooldown[symbol] = time.time()
             return {'symbol': symbol, 'score': score, 'reasons': reasons}
 
         return None
 
     @staticmethod
     def _quick_rsi(closes, period=14) -> float:
+        """RSI using Wilder's smoothed moving average (matches standard chart RSI)."""
         if len(closes) < period + 1:
             return 50.0
-        deltas = np.diff(closes[-(period+1):])
+        deltas = np.diff(closes)
         gains  = np.where(deltas > 0, deltas, 0.0)
         losses = np.where(deltas < 0, -deltas, 0.0)
-        avg_g  = np.mean(gains)
-        avg_l  = np.mean(losses)
+        # Seed with SMA of the first `period` bars, then apply Wilder's EMA
+        avg_g = float(np.mean(gains[:period]))
+        avg_l = float(np.mean(losses[:period]))
+        for g, l in zip(gains[period:], losses[period:]):
+            avg_g = (avg_g * (period - 1) + float(g)) / period
+            avg_l = (avg_l * (period - 1) + float(l)) / period
         if avg_l == 0:
             return 100.0
         return float(100 - 100 / (1 + avg_g / avg_l))
@@ -527,6 +583,3 @@ class Scanner:
 
 # ── Singleton ──────────────────────────────────────────────
 scanner = Scanner()
-
-from typing import Dict, List  # re-export for other modules
-from utils.formatting import fmt_price
