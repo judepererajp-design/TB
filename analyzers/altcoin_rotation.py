@@ -358,9 +358,14 @@ class AltcoinRotationTracker:
                 sector_data.status = SectorStatus.HOT
                 sector_data.score = min(100, 70 + (change - hot_threshold) * 3)
             elif was_hot and change >= hot_exit_threshold:
-                # Hysteresis: stay HOT until we fall clearly below the entry band.
+                # Hysteresis: stay HOT until we fall clearly below the entry
+                # band.  Score from a reduced anchor (hot_exit_threshold) so a
+                # sector sitting in the hysteresis band doesn't end up scoring
+                # LOWER than at its HOT entry point (which would happen if we
+                # still subtracted hot_threshold here — change-hot_threshold
+                # goes negative in the band).
                 sector_data.status = SectorStatus.HOT
-                sector_data.score = min(100, 70 + (change - hot_threshold) * 3)
+                sector_data.score = min(100, 70 + (change - hot_exit_threshold) * 3)
             elif change >= 1.0:
                 sector_data.status = SectorStatus.WARM
                 # BUG-2 FIX: cap at 69.9 — without cap, WARM near the HOT threshold
