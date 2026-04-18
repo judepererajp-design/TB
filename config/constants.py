@@ -795,6 +795,12 @@ class LiqSweep:
     # are $0.001 ticks).
     ROUND_NUMBER_FRACTIONS: tuple = (1.0, 0.5, 0.1, 0.05, 0.01, 0.005, 0.001)
 
+    # Maximum size of a "meaningful" round-number granularity, expressed
+    # as a fraction of price. We pick the largest power-of-10 slice ≤ this
+    # cap so the chosen level is materially close enough to the stop to be
+    # a credible hunt target.
+    ROUND_NUMBER_MAX_FRACTION_OF_PRICE: float = 0.05
+
     # Probability weights for the two proxies (must sum ≤ 1.0).
     SWING_WEIGHT: float = 0.6
     ROUND_WEIGHT: float = 0.4

@@ -219,9 +219,10 @@ class LiqSweepEstimator:
         # with mid-decade fractions for finer resolution.
         magnitude = 10 ** math.floor(math.log10(price))
         granularity = None
+        max_size = price * LSC.ROUND_NUMBER_MAX_FRACTION_OF_PRICE
         for frac in LSC.ROUND_NUMBER_FRACTIONS:
             candidate = magnitude * frac
-            if candidate > 0 and candidate <= price * 0.05:
+            if candidate > 0 and candidate <= max_size:
                 granularity = candidate
                 break
         if granularity is None or granularity <= 0:
