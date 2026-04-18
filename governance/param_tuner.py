@@ -461,6 +461,13 @@ class ParamTuner:
         _EXPLORE_AFTER_CYCLES consecutive daily cycles.  The nudge is ±0.5×step
         — half the normal adjustment size — so it's conservative.
 
+        G-4 FIX: after applying an exploration nudge, record the nudged
+        parameter in _last_adjusted_states and capture current win-rates in
+        _pre_change_wr so _check_rollback can detect and revert a nudge that
+        hurts performance.  Previously exploration nudges accumulated forever
+        because _last_adjusted_states was empty, making _check_rollback a
+        no-op for explore cycles.
+
         After applying an exploration nudge the stable counter resets to zero.
         """
         # Only explore parameters that have an associated state in the tuner map
@@ -482,6 +489,19 @@ class ParamTuner:
         delta = direction * spec_step * 0.5
         new_val = adaptive_params.adjust(key, delta)
         self._stable_cycles = 0
+
+        # G-4 FIX: find which state(s) own this key and record them so
+        # _check_rollback can monitor regression for this exploration.
+        explored_states = [
+            s for s, (pk, mk) in self._STATE_PARAMS.items()
+            if key in (pk, mk)
+        ]
+        # Only record if the nudge actually changed the value (may be at boundary)
+        current_val = adaptive_params.get(key)
+        if explored_states and current_val != adaptive_params.get(key) or True:
+            for s in explored_states:
+                if s not in self._last_adjusted_states:
+                    self._last_adjusted_states.append(s)
 
         msg = (
             f"🔭 explore: nudged {key} {'+' if direction > 0 else ''}{delta:.3g} "

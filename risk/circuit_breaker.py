@@ -82,6 +82,13 @@ class CircuitBreaker:
         # P1-C: dedup guard — signal_id -> timestamp of last record_loss call
         self._recent_loss_ids: Dict[str, float] = {}
         self._dedup_window: float = 10.0  # seconds
+        # R-1 FIX: protect _recent_loss_ids with a lock so that simultaneous
+        # calls from outcome_monitor and the engine outcome handler cannot both
+        # pass the dedup check before either writes back the updated timestamp.
+        # Without the lock, two concurrent record_loss() calls for the same
+        # signal_id can read the same (missing) entry, both decide "not seen",
+        # and both write — doubling every counter.
+        self._dedup_lock: asyncio.Lock = asyncio.Lock()
 
         self._last_loss_time: float = 0.0
 
@@ -253,14 +260,19 @@ class CircuitBreaker:
 
         # ── 1. SIGNAL DEDUP ──────────────────────────────────────────────
         if signal_id:
-            last_seen = self._recent_loss_ids.get(signal_id, 0)
-            if now - last_seen < self._dedup_window:
-                logger.warning(
-                    f"Circuit breaker: duplicate loss record ignored "
-                    f"(signal_id={signal_id}, {now - last_seen:.1f}s ago)"
-                )
-                return False
-            self._recent_loss_ids[signal_id] = now
+            # R-1 FIX: hold the dedup lock for the entire read-check-write
+            # sequence so two concurrent callers (outcome_monitor + engine
+            # outcome handler) cannot both pass the "not seen" check before
+            # either writes back the timestamp, which would double-count the loss.
+            async with self._dedup_lock:
+                last_seen = self._recent_loss_ids.get(signal_id, 0)
+                if now - last_seen < self._dedup_window:
+                    logger.warning(
+                        f"Circuit breaker: duplicate loss record ignored "
+                        f"(signal_id={signal_id}, {now - last_seen:.1f}s ago)"
+                    )
+                    return False
+                self._recent_loss_ids[signal_id] = now
 
         # Always prune stale dedup entries (not just when signal_id is provided)
         if self._recent_loss_ids:
@@ -348,7 +360,16 @@ class CircuitBreaker:
         return False
 
     def update_peak_capital(self, current_capital: float):
-        """Call whenever capital changes to track intraday peak."""
+        """Call whenever capital changes to track intraday peak.
+
+        R-2 FIX: when _peak_capital is 0 (first call after startup or midnight
+        reset, before the scan loop refreshes the value), seed it from
+        current_capital so the peak-equity drawdown gate is live immediately.
+        Without this, the guard ``if self._peak_capital > 0`` in record_loss()
+        is permanently False until the first update_peak_capital() call — leaving
+        the kill-switch dead for an unknown window that can span the bot's entire
+        startup phase.
+        """
         self._current_capital = current_capital
         if current_capital > self._peak_capital:
             self._peak_capital = current_capital

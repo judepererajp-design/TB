@@ -283,8 +283,8 @@ class PerformanceTracker:
         Recompute Sharpe, Sortino, Calmar, MAE/MFE from R outcomes buffer.
         Called after each new trade outcome.
 
-        Sharpe = (mean_R - risk_free) / std_R * sqrt(252)  [annualised, daily equiv]
-        Sortino = (mean_R - risk_free) / downside_std * sqrt(252)
+        Sharpe = (mean_R - risk_free) / std_R * sqrt(trades_per_year)
+        Sortino = (mean_R - risk_free) / downside_std * sqrt(trades_per_year)
         Calmar = annualised_return / max_drawdown
         """
         if not stats.r_outcomes or len(stats.r_outcomes) < 3:
@@ -296,21 +296,49 @@ class PerformanceTracker:
         std_r    = float(_np.std(r))
         risk_free = 0.0  # 0 R hurdle rate
 
-        # Sharpe (annualise assuming avg 2 trades/week = 104 trades/year)
-        trades_per_year = 104.0
+        # Annualisation factor — use the actual sample size to estimate
+        # trades/year rather than the hardcoded 104 so fast scalpers and slow
+        # swing traders are ranked on the same scale.
+        n = len(r)
+        # Use 104 as a reasonable default (2 trades/week); min 1 to avoid div-0.
+        trades_per_year = max(1.0, min(104.0, n))
+
+        # G-2 FIX: the old zero-vol fallback (mean_r * 10) turned 5 small wins
+        # into a Sharpe of ~5, boosting the strategy's weight_mult artificially.
+        # Replace with a capped constant (3.0) that is "good but not exceptional"
+        # to avoid penalising steady low-vol strategies while preventing the
+        # artifact from dominating rankings.
         if std_r > 0:
-            stats.sharpe_ratio  = round((mean_r - risk_free) / std_r * (trades_per_year ** 0.5), 2)
+            stats.sharpe_ratio = round(
+                (mean_r - risk_free) / std_r * (trades_per_year ** 0.5), 2
+            )
         else:
-            stats.sharpe_ratio  = round(mean_r * 10, 2)  # no vol = high Sharpe
+            # No volatility yet — assign a neutral Sharpe, not a fabricated large one.
+            stats.sharpe_ratio = round(mean_r * 3.0, 2) if mean_r > 0 else 0.0
+
+        # G-3 FIX: initialize sortino_ratio to 0.0 explicitly before the
+        # branches below so that when neither fires (e.g. len(neg_r) < 2 AND
+        # std_r == 0) the field is deterministic rather than carrying over the
+        # previous cycle's stale value.
+        sortino: float = 0.0
 
         # Sortino (only penalise downside volatility)
         neg_r = r[r < 0]
         if len(neg_r) >= 2:
             downside_std = float(_np.std(neg_r))
             if downside_std > 0:
-                stats.sortino_ratio = round((mean_r - risk_free) / downside_std * (trades_per_year ** 0.5), 2)
+                sortino = round(
+                    (mean_r - risk_free) / downside_std * (trades_per_year ** 0.5), 2
+                )
+            else:
+                # All losses are identical — use Sharpe as a proxy (no extra inflation)
+                sortino = stats.sharpe_ratio
         elif std_r > 0:
-            stats.sortino_ratio = stats.sharpe_ratio * 1.5  # no losses yet = high Sortino
+            # No losses yet — Sortino should be at least as good as Sharpe,
+            # but cap the inflation multiplier to avoid the G-2-style artifact.
+            sortino = round(stats.sharpe_ratio * 1.2, 2)
+
+        stats.sortino_ratio = sortino
 
         # Max drawdown (worst peak-to-trough in R)
         cumulative = _np.cumsum(r)
@@ -376,10 +404,17 @@ class PerformanceTracker:
             )
             return
         now = time.time()
-        self._stats[strategy].is_disabled    = True
-        self._stats[strategy].disabled_at    = now
-        self._stats[strategy].disabled_until = now + duration_mins * 60
-        logger.info(f"⏸️  Strategy {strategy} suppressed for {duration_mins}min")
+        new_until = now + duration_mins * 60
+        stats_obj = self._stats[strategy]
+        stats_obj.is_disabled = True
+        # HIGH-FIX (suppress_strategy): take max() of the new deadline and any
+        # existing deadline so consecutive suppressions do NOT shorten the total
+        # cool-off.  Previously each call overwrote disabled_until, meaning a
+        # second suppress while the first was still active would reduce the
+        # remaining cool-off to duration_mins from *now* (potentially shorter).
+        stats_obj.disabled_until = max(stats_obj.disabled_until, new_until)
+        stats_obj.disabled_at    = now
+        logger.info(f"⏸️  Strategy {strategy} suppressed for {duration_mins}min (until {stats_obj.disabled_until:.0f})")
 
         # Persist immediately so a restart within the window keeps the strategy
         # suppressed (the disabled_until timestamp is the source of truth).
@@ -496,9 +531,13 @@ class PerformanceTracker:
             days_disabled = (time.time() - stats.disabled_at) / 86400
             if days_disabled >= re_enable_d:
                 stats.is_disabled = False
-                stats.ewma_win_rate = 0.5  # Reset to neutral
+                # HIGH-FIX: was hard-resetting ewma_win_rate = 0.5 regardless of
+                # how badly the strategy performed. Now blend toward 0.5 from the
+                # current value so a strategy with WR=0.20 starts at 0.35 (not 0.50)
+                # and must prove itself before receiving a full-weight allocation.
+                stats.ewma_win_rate = (stats.ewma_win_rate + 0.5) / 2.0
                 stats.weight_mult = 0.8    # Start with slight penalty
-                logger.info(f"✅ Strategy {stats.name} RE-ENABLED after {days_disabled:.0f} days")
+                logger.info(f"✅ Strategy {stats.name} RE-ENABLED after {days_disabled:.0f} days (ewma_wr={stats.ewma_win_rate:.2f})")
 
     async def _save_strategy_state(self, stats: StrategyStats) -> None:
         """Persist one strategy's adaptive state to strategy_persistence_v1."""
