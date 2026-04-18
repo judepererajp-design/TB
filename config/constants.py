@@ -351,9 +351,9 @@ class HealthMonitor:
     PRICE_TOLERANCE: float = 0.30      # 30% drift tolerance
     CANDLE_ANOMALY_THRESHOLD: float = 0.05  # Wick/body anomaly ratio
 
-    # Memory (MB)
-    MEMORY_WARNING_MB: int = 1500
-    MEMORY_ALERT_MB: int = 800
+    # Memory (MB) — alert at the lower threshold, warn escalates at the upper
+    MEMORY_WARNING_MB: int = 800    # first (soft) warning threshold
+    MEMORY_ALERT_MB: int = 1500     # hard alert / escalation threshold
 
 
 # ════════════════════════════════════════════════════════════════

@@ -20,6 +20,16 @@ import logging
 import os
 from typing import Dict, Literal
 
+try:
+    from dotenv import load_dotenv
+    # Defensive: ensure .env is loaded even if feature_flags is imported before
+    # config.loader (which also calls load_dotenv). Without this, every
+    # TITANBOT_FF_* override silently falls back to the default because os.getenv
+    # sees nothing. load_dotenv is idempotent and cheap.
+    load_dotenv()
+except ImportError:  # pragma: no cover - tiny compatibility shim
+    pass
+
 logger = logging.getLogger(__name__)
 
 FlagState = Literal["off", "shadow", "live"]

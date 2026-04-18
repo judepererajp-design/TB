@@ -17,7 +17,6 @@ Usage:
 import json
 import logging
 import logging.handlers
-import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -49,9 +48,11 @@ def _ensure_handler():
         _logger.addHandler(handler)
         _logger.setLevel(logging.DEBUG)
         _logger.propagate = False   # don't echo to main titanbot.log / console
+        # Only mark installed on full success so a transient setup failure
+        # (missing logs/ dir, permission denied) can be retried next call.
+        _handler_installed = True
     except Exception:
         pass  # Fall back silently — don't crash the bot for a log setup issue
-    _handler_installed = True
 
 
 def fcn_log(

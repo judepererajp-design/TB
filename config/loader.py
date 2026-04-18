@@ -119,17 +119,32 @@ class Config:
         """
 
         def _resolve(value: Any) -> Any:
-            """Recursively resolve ${VAR} placeholders in string values."""
-            if isinstance(value, str) and value.startswith('${') and value.endswith('}'):
-                var_name = value[2:-1]
-                resolved = os.getenv(var_name, '')
-                if not resolved:
+            """Recursively resolve ${VAR} placeholders in string values.
+
+            Supports both exact matches (``"${VAR}"``) and embedded
+            interpolation (``"https://${HOST}:${PORT}/api"``). Missing
+            variables resolve to the empty string with a one-time warning
+            so we never silently ship a literal ``${...}`` to an external
+            service.
+            """
+            if isinstance(value, str) and "${" in value:
+                missing: list = []
+
+                def _sub(match: "re.Match[str]") -> str:
+                    var_name = match.group(1)
+                    resolved = os.getenv(var_name, "")
+                    if not resolved:
+                        missing.append(var_name)
+                    return resolved
+
+                new_value = re.sub(r"\$\{(\w+)\}", _sub, value)
+                for var_name in missing:
                     logger.warning(
                         f"Config: env var '{var_name}' is not set. "
                         f"Add it to your .env file. Functionality requiring "
                         f"this key will be disabled."
                     )
-                return resolved
+                return new_value
             if isinstance(value, dict):
                 return {k: _resolve(v) for k, v in value.items()}
             if isinstance(value, list):
@@ -152,9 +167,12 @@ class Config:
             _valid_ids = []
             for x in admin_ids_str.split(','):
                 x = x.strip()
-                if x.isdigit():
+                if not x:
+                    continue
+                # Accept negative IDs (group chats are negative in Telegram).
+                try:
                     _valid_ids.append(int(x))
-                elif x:
+                except ValueError:
                     logger.warning(
                         f"TELEGRAM_ADMIN_IDS: skipping non-numeric entry '{x}'"
                     )
@@ -210,8 +228,14 @@ class Config:
             errors.extend(schema_errors)
 
         # ── Required secrets — fail fast with RuntimeError ───────────────
-        bot_token = self.telegram.get('bot_token', '')
-        chat_id   = self.telegram.get('chat_id', '')
+        telegram_cfg = getattr(self, 'telegram', None)
+        if telegram_cfg is None:
+            raise RuntimeError(
+                "settings.yaml is missing a 'telegram' section. "
+                "TitanBot cannot start without Telegram credentials."
+            )
+        bot_token = telegram_cfg.get('bot_token', '')
+        chat_id   = telegram_cfg.get('chat_id', '')
         if not bot_token:
             raise RuntimeError(
                 "TELEGRAM_BOT_TOKEN is not set. "
@@ -224,7 +248,7 @@ class Config:
             )
 
         # ── TELEGRAM_CHAT_ID format — must be an integer (optionally negative) ──
-        if not re.match(r'^-?\d+$', chat_id.strip()):
+        if not re.match(r'^-?\d+$', str(chat_id).strip()):
             errors.append(
                 f"TELEGRAM_CHAT_ID '{chat_id}' is not a valid Telegram chat ID "
                 f"(expected a numeric value, e.g. -1001234567890)"
@@ -246,24 +270,45 @@ class Config:
                 )
 
         # ── Symbol list must be non-empty ────────────────────────────────
-        scanner_cfg = getattr(self, 'scanner', None)
-        if scanner_cfg is not None:
-            symbols = scanner_cfg.get('symbols', None)
-            max_sym = scanner_cfg.get('max_symbols', 0)
-            if symbols is not None and len(symbols) == 0 and max_sym == 0:
+        # NOTE: the section is ``scanning`` (plural tiers), not ``scanner``.
+        # Every consumer in the repo uses ``cfg.scanning.tier{1,2,3}``.
+        scanning_cfg = getattr(self, 'scanning', None)
+        if scanning_cfg is not None:
+            total_caps = 0
+            any_tier_enabled = False
+            for tier_name in ('tier1', 'tier2', 'tier3'):
+                tier = getattr(scanning_cfg, tier_name, None)
+                if tier is None:
+                    continue
+                enabled = bool(tier.get('enabled', False))
+                cap = int(tier.get('max_symbols', 0) or 0)
+                if enabled:
+                    any_tier_enabled = True
+                    total_caps += cap
+            if not any_tier_enabled:
                 errors.append(
-                    "scanner.symbols is empty and max_symbols=0 — "
+                    "scanning: no tier is enabled — the bot will not scan any symbols."
+                )
+            elif total_caps == 0:
+                errors.append(
+                    "scanning: every enabled tier has max_symbols=0 — "
                     "the bot will not scan any symbols."
                 )
 
         # ── Aggregator weights must sum to ~1.0 ──────────────────────────
-        weights = self.aggregator.weights
-        total = sum([
-            getattr(weights, k, 0) for k in
-            ['technical', 'volume', 'orderflow', 'derivatives', 'sentiment', 'correlation']
-        ])
-        if abs(total - 1.0) > 0.01:
-            errors.append(f"Aggregator weights sum to {total:.3f}, must be 1.0")
+        agg_cfg = getattr(self, 'aggregator', None)
+        if agg_cfg is not None:
+            weights = getattr(agg_cfg, 'weights', None)
+            if weights is not None:
+                total = sum([
+                    float(getattr(weights, k, 0) or 0) for k in
+                    ['technical', 'volume', 'orderflow', 'derivatives',
+                     'sentiment', 'correlation']
+                ])
+                if abs(total - 1.0) > 0.01:
+                    errors.append(
+                        f"Aggregator weights sum to {total:.3f}, must be 1.0"
+                    )
 
         if errors:
             for err in errors:

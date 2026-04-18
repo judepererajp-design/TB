@@ -48,9 +48,12 @@ def _ensure_handler():
         _logger.addHandler(handler)
         _logger.setLevel(logging.DEBUG)
         _logger.propagate = False   # don't echo to main titanbot.log / console
+        # Only mark the handler installed when every step above succeeded —
+        # otherwise a single transient failure (e.g. permission denied on
+        # logs/) would permanently disable execution-gate logging.
+        _handler_installed = True
     except Exception:
         pass  # Fall back silently — don't crash the bot for a log setup issue
-    _handler_installed = True
 
 
 def exec_gate_log(
@@ -104,7 +107,14 @@ def exec_gate_log(
 
     # Factor breakdown on same line for grep-ability
     if factors:
-        parts = [f"{k}={v:.0f}" for k, v in factors.items()]
+        parts = []
+        for k, v in factors.items():
+            if isinstance(v, (int, float)):
+                parts.append(f"{k}={v:.0f}")
+            else:
+                # Don't crash the bot on a malformed factor entry —
+                # the log is diagnostic, not authoritative.
+                parts.append(f"{k}={v}")
         line += f" | {' '.join(parts)}"
 
     if reason:
