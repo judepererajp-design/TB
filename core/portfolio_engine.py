@@ -202,7 +202,11 @@ class PortfolioEngine:
             try:
                 from analyzers.correlation import correlation_analyzer as _ca
                 correlation_to_btc = _ca.get_cached_correlation(symbol)
-            except Exception:
+            except Exception as _ca_err:
+                logger.warning(
+                    f"correlation lookup failed for {symbol}: {_ca_err}; "
+                    f"using conservative 0.7 default (BTC-correlation gate may be inaccurate)"
+                )
                 correlation_to_btc = 0.7  # conservative crypto default
 
         # FIX 12: use effective capital (accounts for unrealized losses on open positions)
@@ -629,18 +633,38 @@ class PortfolioEngine:
         revenge-trade psychology in code (oversizing into a hole to "recover").
         The new floor is a fixed absolute minimum (10% of starting balance),
         ensuring that in a severe drawdown, sizing shrinks to near-zero rather
-        than being propped up by a relative floor that itself has shrunk."""
+        than being propped up by a relative floor that itself has shrunk.
+
+        BUG-FIX: The floor itself was previously allowed to exceed current
+        capital (e.g. initial=$100k, current=$5k → floor=$10k > equity), which
+        produced phantom sizing on capital that no longer exists. Cap the floor
+        at current capital so sizing always tracks real equity from below.
+        """
         unrealized_loss = sum(
             min(0, p.unrealized_pnl) for p in self._positions.values()
         )
-        return max(self._initial_capital * 0.10, self._capital + unrealized_loss)
+        cur_capital = max(0.0, self._capital)
+        initial_floor = min(self._initial_capital * 0.10, cur_capital)
+        return max(initial_floor, cur_capital + unrealized_loss)
 
     async def update_unrealized(self, signal_id: int, pnl_usdt: float):
-        """V13: Update unrealized P&L for an open position."""
+        """V13: Update unrealized P&L for an open position.
+
+        Defensive clamp: a malformed exchange response (e.g. -1e9) would otherwise
+        corrupt get_effective_capital() and freeze the entire sizing pipeline.
+        """
         async with self._lock:
             pos = self._positions.get(signal_id)
             if pos:
-                pos.unrealized_pnl = pnl_usdt
+                try:
+                    pnl = float(pnl_usdt)
+                except (TypeError, ValueError):
+                    return
+                # Clamp to ±10× position size — a real fill cannot lose more than
+                # the notional, and even with leverage 10× notional is the absolute
+                # ceiling for any realistic instrument.
+                bound = max(1.0, pos.size_usdt) * 10.0
+                pos.unrealized_pnl = max(-bound, min(bound, pnl))
 
 
     def get_all_positions(self) -> list:

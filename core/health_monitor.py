@@ -319,12 +319,18 @@ class HealthMonitor:
         try:
             loop = asyncio.get_running_loop()
             self._watchdog_task = loop.create_task(self._watchdog_loop())
-            self._watchdog_task.add_done_callback(
-                lambda t: t.exception() if not t.cancelled() else None
-            )
+            self._watchdog_task.add_done_callback(self._log_watchdog_exception)
             logger.info("🔍 Health monitor started (watchdog every 5min)")
         except RuntimeError:
             logger.warning("HealthMonitor.start(): no running loop — watchdog not started")
+
+    @staticmethod
+    def _log_watchdog_exception(task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("Health monitor watchdog crashed", exc_info=exc)
 
     def stop(self):
         if self._watchdog_task and not self._watchdog_task.done():

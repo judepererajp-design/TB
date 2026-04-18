@@ -292,11 +292,74 @@ class ExecutionEngine:
         self.on_stage_change: Optional[Callable] = None
         self._stage_msg_sent: Dict[int, set] = {}  # V10: signal_id -> set of states already messaged
 
+    @staticmethod
+    def _validate_levels(direction, entry_low, entry_high, stop_loss,
+                         tp1, tp2, tp3) -> Optional[str]:
+        """Validate that stop-loss and TPs are on the correct side of the zone.
+
+        Returns an error string if invalid, ``None`` otherwise. Catching this
+        before track() stores the signal prevents a corrupted record from
+        silently turning into a guaranteed loss once price moves.
+        """
+        try:
+            entry_low = float(entry_low)
+            entry_high = float(entry_high)
+            stop_loss = float(stop_loss)
+        except (TypeError, ValueError):
+            return f"non-numeric levels (entry_low={entry_low}, entry_high={entry_high}, stop_loss={stop_loss})"
+        if not (entry_low > 0 and entry_high > 0 and stop_loss > 0):
+            return f"non-positive levels (entry_low={entry_low}, entry_high={entry_high}, stop_loss={stop_loss})"
+        if entry_low > entry_high:
+            return f"entry_low {entry_low} > entry_high {entry_high}"
+
+        tps = []
+        for label, value in (("tp1", tp1), ("tp2", tp2), ("tp3", tp3)):
+            if value in (None, 0, 0.0):
+                continue
+            try:
+                tps.append((label, float(value)))
+            except (TypeError, ValueError):
+                return f"non-numeric {label}={value}"
+
+        if direction == "LONG":
+            if stop_loss >= entry_low:
+                return f"LONG stop {stop_loss} not below entry_low {entry_low}"
+            for label, v in tps:
+                if v <= entry_high:
+                    return f"LONG {label} {v} not above entry_high {entry_high}"
+            for (la, va), (lb, vb) in zip(tps, tps[1:]):
+                if vb <= va:
+                    return f"LONG {lb} {vb} not above {la} {va}"
+        elif direction == "SHORT":
+            if stop_loss <= entry_high:
+                return f"SHORT stop {stop_loss} not above entry_high {entry_high}"
+            for label, v in tps:
+                if v >= entry_low:
+                    return f"SHORT {label} {v} not below entry_low {entry_low}"
+            for (la, va), (lb, vb) in zip(tps, tps[1:]):
+                if vb >= va:
+                    return f"SHORT {lb} {vb} not below {la} {va}"
+        else:
+            return f"unknown direction {direction!r}"
+        return None
+
     def track(self, signal_id, symbol, direction, strategy,
               entry_low, entry_high, stop_loss, confidence,
               tp1=0.0, tp2=0.0, tp3=None, rr_ratio=0.0, message_id=None,
               grade: str = "B", staleness_data: Optional[dict] = None,
               setup_class: str = "intraday"):
+        # Stop-loss / take-profit side sanity check: catches corrupted records
+        # before they enter the tracker (e.g. SHORT with stop below entry would
+        # silently lose the entire move once price moves the "wrong" way).
+        _sides_err = self._validate_levels(
+            direction, entry_low, entry_high, stop_loss, tp1, tp2, tp3
+        )
+        if _sides_err:
+            logger.error(
+                f"ExecutionEngine.track: rejecting signal #{signal_id} {symbol} "
+                f"{direction}: {_sides_err}"
+            )
+            return
         # FIX #3 (AUDIT): setup_class parameter added so callers can pass the
         # signal's actual setup class (scalp/intraday/swing/positional) through
         # to TrackedExecution. Previously this was always the dataclass default
@@ -403,8 +466,9 @@ class ExecutionEngine:
         )
         self._tracked[signal_id].TRIGGER_WINDOW_SECS = _get_trigger_window_secs(setup_class)
         price_cache.subscribe(symbol)
-        # Persist immediately so a crash/restart before the first state change
-        # doesn't lose this signal entirely.
+        # Persist (best-effort, fire-and-forget) so a crash/restart shortly after
+        # track() doesn't lose this signal. Errors are surfaced via the
+        # _safe_ensure_future done-callback rather than swallowed.
         try:
             from data.database import db as _ee_db
             _safe_ensure_future(
@@ -420,8 +484,11 @@ class ExecutionEngine:
                 ),
                 context=f"save_tracked APPROVED #{signal_id}",
             )
-        except Exception:
-            pass
+        except Exception as _persist_err:
+            logger.warning(
+                f"ExecutionEngine.track: scheduling persistence failed for "
+                f"#{signal_id} {symbol}: {_persist_err}"
+            )
 
     def invalidate_regime_cache(self):
         """FIX L2: Called by engine when regime changes to clear stale regime stats."""
@@ -442,8 +509,11 @@ class ExecutionEngine:
                     _ee_db.delete_tracked_signal(signal_id),
                     context=f"delete_tracked #{signal_id}",
                 )
-            except Exception:
-                pass
+            except Exception as _persist_err:
+                logger.warning(
+                    f"ExecutionEngine.untrack: scheduling DB delete failed for "
+                    f"#{signal_id}: {_persist_err}"
+                )
 
     async def restore(self) -> None:
         """Reload pre-fill signals from tracked_signals_v1 on startup.
@@ -705,9 +775,15 @@ class ExecutionEngine:
             # from "zone reached but trigger failed" (trigger quality issue).
             try:
                 from data.database import db
-                asyncio.create_task(db.write_zone_reached(sig.signal_id))
-            except Exception:
-                pass
+                _safe_ensure_future(
+                    db.write_zone_reached(sig.signal_id),
+                    context=f"write_zone_reached #{sig.signal_id}",
+                )
+            except Exception as _zr_err:
+                logger.warning(
+                    f"ExecutionEngine: scheduling write_zone_reached failed for "
+                    f"#{sig.signal_id}: {_zr_err}"
+                )
 
         elif sig.state in (SignalState.ENTRY_ZONE, SignalState.ALMOST):
             await self._check_triggers(sig, price, market_state)  # Fix E3: pass pre-computed state

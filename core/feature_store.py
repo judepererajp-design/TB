@@ -21,6 +21,7 @@ import logging
 import time
 from typing import Dict, Optional
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 import numpy as np
 
@@ -155,6 +156,75 @@ class FeatureSet:
             'counter_regime':      self.counter_regime,        # LR=-0.15  FIXED
             'strategy_cold_streak': self.strategy_on_cold_streak,  # LR=-0.15  FIXED
         }
+
+    # ── Mutual-information weights per evidence key ──────────────────
+    # Magnitudes drawn from the documented likelihood-ratio comments in
+    # to_evidence_dict above. Keys missing from this map fall back to 0.10.
+    MI_WEIGHTS: ClassVar[Dict[str, float]] = {
+        'volume_confirmation':   0.10,
+        'low_volume':            0.08,
+        'volume_spike':          0.15,
+        'killzone_active':       0.12,
+        'dead_zone_time':        0.12,
+        'weekend':               0.05,
+        'high_correlation':      0.10,
+        'funding_favorable':     0.12,
+        'vwap_alignment':        0.10,
+        'premium_discount_zone': 0.12,
+        'rsi_extreme':           0.10,
+        'strong_trend':          0.12,
+        'weak_trend':            0.08,
+        'ema_bullish_cross':     0.10,
+        'ema_bearish_cross':     0.10,
+        'above_ema50':           0.08,
+        'below_ema50':           0.08,
+        'obv_rising':            0.08,
+        'obv_falling':           0.08,
+        'vol_expanding':         0.10,
+        'vol_contracting':       0.10,
+        'htf_alignment':         0.15,
+        'mtf_alignment':         0.10,
+        'ob_fvg_confluence':     0.20,
+        'liquidity_sweep':       0.18,
+        'liq_cluster_overlap':   0.22,
+        'bar_confirmation':      0.08,
+        'multi_strategy_agree':  0.25,
+        'counter_regime':        0.15,
+        'strategy_cold_streak':  0.15,
+    }
+
+    def weighted_evidence_score(self) -> float:
+        """
+        Compute a single MI-weighted evidence score in [0, 1].
+
+        Information-theoretic equivalent of confidence: how much the current
+        feature set predicts a winning trade, weighted by each feature's
+        mutual information with outcomes.
+        """
+        evidence = self.to_evidence_dict()
+        total_mi = 0.0
+        weighted_sum = 0.0
+        for key, present in evidence.items():
+            mi = self.MI_WEIGHTS.get(key, 0.10)
+            total_mi += mi
+            if present:
+                weighted_sum += mi
+        return weighted_sum / total_mi if total_mi > 0 else 0.5
+
+    def regime_adjusted_score(self, regime: str) -> float:
+        """Adjust the evidence score based on which features matter in this regime."""
+        base = self.weighted_evidence_score()
+        evidence = self.to_evidence_dict()
+        regime_bonuses = {
+            "BULL_TREND":     {'htf_alignment': 0.15, 'strong_trend': 0.12, 'volume_confirmation': 0.10},
+            "BEAR_TREND":     {'htf_alignment': 0.15, 'strong_trend': 0.12, 'volume_confirmation': 0.10},
+            "CHOPPY":         {'vwap_alignment': 0.15, 'killzone_active': 0.12, 'rsi_extreme': 0.10},
+            "VOLATILE":       {'volume_spike': 0.15, 'funding_favorable': 0.12},
+            "VOLATILE_PANIC": {'killzone_active': 0.10, 'funding_favorable': 0.15},
+        }
+        bonuses = regime_bonuses.get(regime, {})
+        bonus_sum = sum(v for k, v in bonuses.items() if evidence.get(k, False))
+        return min(1.0, base + bonus_sum * 0.3)
 
 
 class FeatureStore:
@@ -486,53 +556,5 @@ class FeatureStore:
 
 
 # ── Singleton ─────────────────────────────────────────────────
-
-    def weighted_evidence_score(self) -> float:
-        """
-        Compute a single MI-weighted evidence score in [0, 1].
-
-        This is the information-theoretic equivalent of confidence:
-        it measures how much the current feature set predicts a winning trade,
-        weighted by each feature's mutual information with outcomes.
-
-        Returns a float in [0, 1] where:
-          0.0 = no informative features present
-          0.5 = neutral / mixed evidence
-          1.0 = all high-MI features strongly present (theoretical max)
-        """
-        evidence = self.to_evidence_dict()
-        total_mi = 0.0
-        weighted_sum = 0.0
-
-        for key, present in evidence.items():
-            mi = self.MI_WEIGHTS.get(key, 0.10)  # Default MI for unmapped features
-            total_mi += mi
-            if present:
-                weighted_sum += mi
-
-        return weighted_sum / total_mi if total_mi > 0 else 0.5
-
-    def regime_adjusted_score(self, regime: str) -> float:
-        """
-        Adjust the evidence score based on which features matter in this regime.
-        Uses a simplified regime-feature interaction matrix.
-        """
-        base = self.weighted_evidence_score()
-        evidence = self.to_evidence_dict()
-
-        # Regime-specific feature bonuses (additive to MI weights)
-        regime_bonuses = {
-            "BULL_TREND":  {'htf_aligned': 0.15, 'trend_aligned': 0.12, 'oi_rising': 0.10},
-            "BEAR_TREND":  {'htf_aligned': 0.15, 'trend_aligned': 0.12, 'oi_rising': 0.10},
-            "CHOPPY":      {'vwap_alignment': 0.15, 'killzone_active': 0.12, 'rsi_not_extreme': 0.10},
-            "VOLATILE":    {'volume_spike': 0.15, 'funding_favorable': 0.12},
-            "VOLATILE_PANIC": {'killzone_active': 0.10, 'funding_favorable': 0.15},
-        }
-        bonuses = regime_bonuses.get(regime, {})
-        bonus_sum = sum(v for k, v in bonuses.items() if evidence.get(k, False))
-
-        return min(1.0, base + bonus_sum * 0.3)  # Cap at 1.0
-
-
 
 feature_store = FeatureStore()
