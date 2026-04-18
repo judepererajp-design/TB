@@ -124,6 +124,10 @@ class InvalidationMonitor:
         self._approaching_symbol_cooldown: Dict[str, float] = {}
         self._approaching_cooldown_secs: int = 1800  # 30 min cooldown per symbol
 
+        # FIX: persist conflict-callback task refs so they can't be GC-cancelled
+        # mid-execution (asyncio only holds weak references to unrooted tasks).
+        self._bg_tasks: Set[asyncio.Task] = set()
+
         # Callbacks
         self.on_invalidated: Optional[Callable] = None   # (signal_id, reason, message_id)
         self.on_entry_reached: Optional[Callable] = None  # (signal_id, price, message_id)
@@ -225,18 +229,23 @@ class InvalidationMonitor:
                 )
                 if self.on_conflict:
                     # FIX: was asyncio.create_task() — the task was unrooted and could
-                    # be silently cancelled mid-execution. notify_counter_signal() is
-                    # called from an async context (the engine scan loop), so we can
-                    # schedule a proper awaitable task via the event loop's call_soon_threadsafe
-                    # equivalent. Use create_task but store it to prevent GC cancellation.
+                    # be silently cancelled mid-execution. Store the task in an instance
+                    # set so it is strongly referenced until it finishes; the done-callback
+                    # removes it to avoid unbounded growth.
                     _conflict_task = asyncio.create_task(self._safe_callback(
                         self.on_conflict,
                         sig.signal_id, direction, sig.message_id
                     ))
-                    # Add a done-callback to log any unhandled exception from the task
-                    _conflict_task.add_done_callback(
-                        lambda t: logger.debug(f"Conflict callback error: {t.exception()}") if not t.cancelled() and t.exception() else None
-                    )
+                    self._bg_tasks.add(_conflict_task)
+
+                    def _on_done(t: asyncio.Task) -> None:
+                        self._bg_tasks.discard(t)
+                        if not t.cancelled():
+                            exc = t.exception()
+                            if exc is not None:
+                                logger.debug(f"Conflict callback error: {exc}")
+
+                    _conflict_task.add_done_callback(_on_done)
                 logger.info(
                     f"⚠️ Conflict: signal #{sig.signal_id} ({sig.symbol} {sig.direction}) "
                     f"vs new {direction} signal"

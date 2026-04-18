@@ -571,6 +571,15 @@ class SignalRanking:
     CORRELATION_THRESHOLD: float = 0.70   # Above this, filter correlated duplicates
     RR_NORMALIZATION_CAP: float = 5.0     # Cap RR at 5 for normalization
 
+    # ── BTC-concentration guard ───────────────────────────────────
+    # Most alts have ρ > 0.70 with BTC; the hardcoded 6-pair map only
+    # catches BTC/ETH/SOL/BNB. When the ranker admits 3 "independent"
+    # alts all correlated to BTC, a single BTC move drags them together.
+    # These thresholds feed the BTC-concentration filter added in
+    # signals/signal_ranker.py (same cycle, same direction).
+    BTC_CONCENTRATION_CORR_THRESHOLD: float = 0.70  # treat ρ_BTC≥this as BTC-proxy
+    BTC_CONCENTRATION_MAX_SAME_SIDE: int = 2         # 3rd same-side BTC-proxy is dropped
+
 
 # ════════════════════════════════════════════════════════════════
 # 15. SLIPPAGE TRACKING
@@ -584,6 +593,57 @@ class SlippageTracking:
     MAX_CONFIDENCE_REDUCTION: float = 0.10            # Never reduce more than 10%
     DEFAULT_WINDOW_HOURS: int = 24                    # Default lookback window
     NEUTRAL_THRESHOLD: float = 1e-4                   # ±0.01% — below this is "neutral" slippage
+
+
+class FeeModel:
+    """
+    Cost-model gate thresholds.
+
+    The aggregator's raw RR floor (``cfg_min_rr``) is calibrated in units of
+    entry→SL distance and does NOT subtract round-trip commission + slippage.
+    For a typical intraday setup with a 1.2R floor, round-trip friction of
+    ~0.14% translates to ~0.1–0.3R reduction, which can flip a 1.25R setup
+    into a net-losing trade. The ``fee_adjusted_rr`` helper already exists in
+    ``utils.signal_guidance`` — this constant set gives the aggregator a
+    canonical minimum below which a signal is rejected outright.
+    """
+
+    # A signal must clear this fee+slippage-adjusted RR floor or it is
+    # structurally incapable of covering its own costs. 1.0 = break-even
+    # after fees on reward vs. risk including cost adds to both sides.
+    MIN_FEE_ADJUSTED_RR: float = 1.0
+
+
+class ExpectedSlippage:
+    """
+    Predictive slippage model coefficients (see analyzers/expected_slippage.py).
+
+    The model is intentionally first-principles, not learned, so the
+    coefficients are explicit and tunable from one place. They are calibrated
+    against typical Binance perp microstructure: 5 bps spread, $50k–500k
+    top-of-book depth, ATR/price ~1–3 % per day on majors.
+
+    Formula: slip = spread_bps/2/1e4 + K_IMPACT*sqrt(size/depth) + K_VOL*atr_pct
+    """
+
+    # Square-root market-impact coefficient. K=0.0006 means a trade equal in
+    # size to top-book depth pays ~6 bps of impact on top of half-spread.
+    K_IMPACT: float = 0.0006
+
+    # Volatility surcharge: in fast tape (ATR/price = 3 %), add ~3 bps.
+    K_VOL: float = 0.001
+
+    # Cap on size/depth ratio so a thin quote doesn't blow up the estimate
+    # to nonsense (50 % slip). 5x book = the trade walks ~5 levels.
+    MAX_DEPTH_RATIO: float = 5.0
+
+    # Lower / upper bounds on the final number.
+    FLOOR_PCT: float = 0.0002          # 2 bps minimum (matches backtester default)
+    CEILING_PCT: float = 0.005         # 50 bps cap
+
+    # Default trade size used when a signal doesn't yet know its sizing.
+    # Kept conservative so we don't under-estimate impact for typical fills.
+    DEFAULT_SIZE_USD: float = 5000.0
 
 
 # ════════════════════════════════════════════════════════════════
@@ -601,6 +661,280 @@ class FundingIntegration:
     EXTREME_PENALTY_PTS: float = 15.0                 # Extreme funding opposition
     MAX_HISTORY_LENGTH: int = 24                      # 24 cycles (8h each on Binance)
     TREND_WINDOW: int = 3                             # Last 3 cycles for trend detection
+
+    # ── Funding accrual tracker (cumulative funding into PnL) ─────
+    # Binance perps pay funding every 8 hours. Accrued funding is
+    # cumulative rate * (hours_held / cycle_hours).
+    ACCRUAL_CYCLE_HOURS: float = 8.0                  # Binance perp default
+
+
+class FundingCarry:
+    """
+    Magnitude-aware funding-carry adjustment (PR5 #3).
+
+    The level-based penalties in ``DerivativesAnalyzer.assess_entry_validity``
+    (e.g. -8 for SHORT into NEGATIVE funding) are stepwise — they don't
+    distinguish a major at +0.012 % from an alt at +0.05 %, even though the
+    alt's expected funding paid over the hold horizon is 4× worse.
+
+    This converts the *actual* per-cycle rate into expected carry over the
+    typical hold horizon and applies a graduated, symmetric boost/penalty.
+    """
+
+    # Default expected hold horizon for the carry calculation. Most intraday
+    # signals hold 8–24 h; 16 h ≈ 2 funding cycles, a reasonable midpoint.
+    HOLD_HOURS_DEFAULT: float = 16.0
+
+    # Carry magnitudes (in basis points of notional) at which the
+    # adjustment kicks in. Below the threshold the level-based logic
+    # already covers it, so no double-counting.
+    PENALTY_THRESHOLD_BPS: float = 5.0
+    BOOST_THRESHOLD_BPS: float = 5.0
+
+    # Confidence points per basis point of carry. 0.5 → 10 bps carry → 5 pts.
+    PTS_PER_BP: float = 0.5
+
+    # Hard caps so a single extreme funding print can't dominate confidence.
+    MAX_PENALTY_PTS: float = 8.0
+    MAX_BOOST_PTS: float = 6.0
+
+
+# ════════════════════════════════════════════════════════════════
+# 16b. EXCHANGE HEALTH GATE
+# ════════════════════════════════════════════════════════════════
+
+class ExchangeHealth:
+    """
+    Early gate that suppresses new signals when the exchange API is
+    misbehaving. During outages, REST tickers freeze for several
+    minutes — strategies that key off "current price" then trip
+    breakout triggers that immediately invalidate when the feed
+    catches up. Suppressing publication during these windows avoids
+    catastrophic stop-outs at the moment connectivity returns.
+
+    Health is sampled from ``data.api_client.api.get_request_stats()``
+    plus a rolling consecutive-failure counter incremented by the
+    aggregator before publish.
+    """
+
+    # Latency: avg latency over recent calls (ms). Above this and the
+    # exchange is "DEGRADED"; double this and it is "UNHEALTHY".
+    DEGRADED_AVG_LATENCY_MS: float = 3000.0
+    UNHEALTHY_AVG_LATENCY_MS: float = 8000.0
+
+    # Error rate: total_errors / total_requests for the lifetime of
+    # the api client. Above this we consider the API unstable.
+    DEGRADED_ERROR_RATE: float = 0.05    # 5 %
+    UNHEALTHY_ERROR_RATE: float = 0.15   # 15 %
+
+    # Consecutive-failure counter (incremented by the gate when
+    # api.is_healthy is False, reset when True). When this trips we
+    # block regardless of latency/error-rate.
+    UNHEALTHY_CONSEC_FAILS: int = 3
+
+    # After a recovery (api.is_healthy flips back to True), keep the
+    # gate "DEGRADED" for this many seconds so a single ticker recovery
+    # doesn't immediately re-open the floodgate while feeds are still
+    # stabilising.
+    RECOVERY_GRACE_SECS: int = 60
+
+
+# ════════════════════════════════════════════════════════════════
+# 16c. STABLECOIN DEPEG GUARD
+# ════════════════════════════════════════════════════════════════
+
+class StablecoinDepeg:
+    """
+    Reject signals quoted in a depegged stablecoin. When USDT trades
+    at 0.985 instead of 1.000, every USDT-denominated chart is biased
+    by ~150 bps — entries, stops and targets are all systematically
+    wrong, and "breakouts" are often just stable-coin re-pegging.
+
+    Thresholds are absolute distance from $1.00 in fraction terms,
+    so 0.005 = 50 bps. Fail-open: if no quote is available the gate
+    treats it as healthy (we should not block trading on a missing
+    sanity check).
+    """
+
+    # 50 bps wobble from $1.00 → DEGRADED (allow but log)
+    # 200 bps wobble → UNHEALTHY (block new signals)
+    DEGRADED_DEVIATION: float = 0.005
+    UNHEALTHY_DEVIATION: float = 0.020
+
+    # How long a fetched stablecoin price is reused before re-fetching.
+    PRICE_CACHE_SECS: int = 60
+
+    # Stablecoins to monitor. The aggregator checks the *quote* asset
+    # of each signal against this map.
+    MONITORED_QUOTES: tuple = ("USDT", "USDC", "DAI", "FDUSD", "TUSD")
+
+
+# ════════════════════════════════════════════════════════════════
+# 16d. REGIME-TRANSITION HYSTERESIS
+# ════════════════════════════════════════════════════════════════
+
+class RegimeHysteresis:
+    """
+    The 2-cycle confirmation in ``RegimeAnalyzer._update_regime`` is
+    a *pre-commit* hysteresis (don't flip until the next regime is
+    confirmed). It does NOT cover the post-commit case where the
+    bot has already switched regimes but the market has not yet
+    settled — the first 5–15 min after a regime flip see the worst
+    fakeouts as price re-tests the prior regime's structures.
+
+    This adds a *post-commit* hysteresis: for ``TRANSITION_HYSTERESIS_SECS``
+    after the regime flip is committed, the aggregator's min-confidence
+    floor is bumped by ``TRANSITION_CONF_FLOOR_BUMP`` points so only
+    very-high-quality setups publish during the noisy window.
+    """
+
+    TRANSITION_HYSTERESIS_SECS: int = 600         # 10 min
+    TRANSITION_CONF_FLOOR_BUMP: int = 5           # +5 pts on min_confidence
+
+
+# ════════════════════════════════════════════════════════════════
+# 16e. FUNDING Z-SCORE
+# ════════════════════════════════════════════════════════════════
+
+class FundingZScore:
+    """
+    Per-asset z-score of current funding vs. its own recent history.
+
+    The existing absolute-level classifier (``EXTREMELY_HIGH``/``NEGATIVE``)
+    can't tell that BTC funding of 0.012 % is unremarkable while ALT
+    funding of 0.012 % is the highest reading of the week — every alt
+    has a different baseline. The z-score normalises by each asset's
+    own running mean/std so the same threshold catches the *relative*
+    extreme on any symbol.
+
+    History size is intentionally larger than the delta classifier
+    (5 samples) because z-score is meaningless on tiny samples.
+    """
+
+    HISTORY_MAX: int = 30                       # ~4 hours at 8-min poll cadence
+    MIN_SAMPLES_FOR_Z: int = 8                  # below this we return 0.0 (insufficient)
+
+    # |z| ≥ this → extreme. Standard ±2σ tail (~5 % of observations).
+    EXTREME_Z: float = 2.0
+    # |z| ≥ this → very extreme (~1 % tail). Used for stronger signals.
+    VERY_EXTREME_Z: float = 3.0
+
+    # Floor on std-dev to prevent a flat history from blowing up z-scores
+    # (e.g. all-zeros after a fresh deploy). 0.0001 pp = noise level.
+    MIN_STD: float = 1e-4
+
+
+# ════════════════════════════════════════════════════════════════
+# 16f. LIQUIDITY-SWEEP ESTIMATOR
+# ════════════════════════════════════════════════════════════════
+
+class LiqSweep:
+    """
+    Probability that price is set up to sweep nearby resting liquidity
+    before continuing in the signal direction. Two cheap proxies are
+    combined:
+
+      * proximity to a recent swing high/low (resting stops cluster
+        just beyond local extremes)
+      * proximity to a round number (resting stops cluster on
+        psychologically obvious price levels)
+
+    A LONG entry whose stop sits just *below* a recent swing low or
+    a round number is at high risk of being swept first, then
+    rallying — a classic "stop hunt then real move" pattern.
+    """
+
+    # How close (as a fraction of price) to the swing/round level
+    # the stop must be before we consider it "in the sweep zone".
+    PROXIMITY_PCT: float = 0.005                 # 0.5 % of price
+
+    # Look-back bars on whatever timeframe is supplied for swing detection.
+    SWING_LOOKBACK_BARS: int = 20
+
+    # Round-number granularities by price magnitude. We pick the
+    # smallest granularity whose absolute value is ≥ 1 % of price
+    # so the level is meaningful (e.g. on BTC at $60 000 the round
+    # numbers we care about are $1 000 ticks; on a $0.05 alt they
+    # are $0.001 ticks).
+    ROUND_NUMBER_FRACTIONS: tuple = (1.0, 0.5, 0.1, 0.05, 0.01, 0.005, 0.001)
+
+    # Maximum size of a "meaningful" round-number granularity, expressed
+    # as a fraction of price. We pick the largest power-of-10 slice ≤ this
+    # cap so the chosen level is materially close enough to the stop to be
+    # a credible hunt target.
+    ROUND_NUMBER_MAX_FRACTION_OF_PRICE: float = 0.05
+
+    # Probability weights for the two proxies (must sum ≤ 1.0).
+    SWING_WEIGHT: float = 0.6
+    ROUND_WEIGHT: float = 0.4
+
+    # Confidence penalty applied at full sweep probability (=1.0).
+    # Linearly scaled by the actual probability.
+    MAX_CONFIDENCE_PENALTY: float = 4.0          # points
+    # Probability above which we *log* the warning (no hard block).
+    WARN_PROBABILITY: float = 0.6
+
+
+# ════════════════════════════════════════════════════════════════
+# 16g. WEEKEND CHOP / SESSION SPREAD
+# ════════════════════════════════════════════════════════════════
+
+class WeekendChop:
+    """
+    Weekend liquidity is 20–30 % lower with materially wider spreads
+    on most perp venues. The existing ``signals.time_filter.TimeFilter``
+    already applies grade-aware confidence penalties on Saturday/Sunday,
+    but two effects are not modelled:
+
+      1. Spread expectation — execution gate sees the *snapshot* spread
+         from `volume_quality`, but a 5-bps quote on Saturday morning
+         can blow out to 25 bps in a sweep. The filter now publishes
+         a session-aware multiplier the aggregator can apply when no
+         live spread sample is available.
+      2. Aggregate min-confidence floor — alongside the per-signal
+         penalty, raise the *floor* during the worst weekend windows
+         so even high-grade signals must clear a higher bar.
+    """
+
+    # Multipliers applied to spread_bps based on the active session.
+    # 1.0 = no change, 1.5 = expect 50 % wider than observed.
+    SPREAD_MULT_KILLZONE: float = 1.0            # London/NY open — best quotes
+    SPREAD_MULT_OFF_SESSION: float = 1.1
+    SPREAD_MULT_ASIA: float = 1.2
+    SPREAD_MULT_DEAD_ZONE: float = 1.3
+    SPREAD_MULT_SATURDAY: float = 1.5
+    SPREAD_MULT_SUNDAY_EARLY: float = 1.7        # Sunday 00:00–08:00 UTC
+
+    # Aggregator min-confidence floor bump during weekend chop.
+    # Stacks on top of TimeFilter's per-signal penalty.
+    WEEKEND_CONF_FLOOR_BUMP: int = 3
+    # Sunday-early window gets a bigger bump (worst liquidity all week).
+    SUNDAY_EARLY_CONF_FLOOR_BUMP: int = 5
+
+
+# ════════════════════════════════════════════════════════════════
+# 16h. PARTIAL-FILL TRACKER
+# ════════════════════════════════════════════════════════════════
+
+class PartialFill:
+    """
+    Bookkeeping for partial fills.
+
+    The slippage tracker today records the *last* fill price as if it
+    were the entry. When a 10 000-USD order fills in three legs at
+    increasingly worse prices, the recorded slippage understates
+    reality. The partial-fill tracker computes a true VWAP across all
+    legs of the same `signal_id` and feeds that into the slippage
+    tracker once the fill is complete.
+    """
+
+    # Maximum partial fills retained per signal (most exchanges cap
+    # at well below this; we keep generous slack for adversarial
+    # microstructure that fragments aggressively).
+    MAX_LEGS_PER_SIGNAL: int = 64
+
+    # How long to retain a closed signal's fill record before purge.
+    RETENTION_HOURS: int = 48
 
 
 # ════════════════════════════════════════════════════════════════

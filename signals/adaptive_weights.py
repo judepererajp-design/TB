@@ -196,7 +196,10 @@ class AdaptiveWeightManager:
                     win_rate=short_score.win_rate if short_score.sample_count > 0 else long_score.win_rate,
                     avg_return=short_score.avg_return if short_score.sample_count > 0 else long_score.avg_return,
                     max_drawdown=short_score.max_drawdown if short_score.sample_count > 0 else long_score.max_drawdown,
-                    sample_count=short_score.sample_count + long_score.sample_count,
+                    # FIX: short_signals is a subset of long_signals (30d ⊂ 60d), so
+                    # short.sample_count + long.sample_count double-counts the overlap.
+                    # Report the long-window count as the authoritative sample size.
+                    sample_count=max(short_score.sample_count, long_score.sample_count),
                     score=blended_score,
                     adaptive_weight=weight,
                 )

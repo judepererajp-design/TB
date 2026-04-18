@@ -140,6 +140,72 @@ class TimeFilter:
             return "Dead Zone"
         return "Off-Session"
 
+    # ── Session-aware liquidity model (PR4 items 9 + 10) ──────
+
+    def expected_spread_multiplier(self) -> float:
+        """
+        Multiplier applied to *observed* ``spread_bps`` to model the
+        spread that should be **expected** during the current session.
+        Returns 1.0 in killzones (live spread is the best estimate)
+        and up to 1.7× during Sunday-early.
+
+        Rationale: a 5-bps quote on Saturday morning can blow out to
+        25 bps mid-sweep; using the snapshot under-states the true
+        execution cost. Aggregator multiplies the observed spread by
+        this factor before propagating to the execution gate.
+        """
+        try:
+            from config.constants import WeekendChop as _WC
+        except Exception:
+            return 1.0
+        now = datetime.now(timezone.utc)
+        weekday = now.weekday()
+        hour = now.hour
+        # Sunday early gets the worst multiplier
+        if weekday == 6 and hour < 8:
+            return _WC.SPREAD_MULT_SUNDAY_EARLY
+        # Full Saturday and rest of Sunday
+        if weekday >= 5:
+            return _WC.SPREAD_MULT_SATURDAY
+        # Weekday dead zone
+        if self.DEAD_ZONE_START <= hour < self.DEAD_ZONE_END:
+            return _WC.SPREAD_MULT_DEAD_ZONE
+        # Asia session
+        asia_start, asia_end = self.KILLZONES['asia_open']
+        if asia_start <= hour < asia_end:
+            return _WC.SPREAD_MULT_ASIA
+        # Killzone (any of London/NY)
+        for name, (start, end) in self.KILLZONES.items():
+            if name == 'asia_open':
+                continue
+            if start <= hour < end:
+                return _WC.SPREAD_MULT_KILLZONE
+        return _WC.SPREAD_MULT_OFF_SESSION
+
+    def weekend_chop_floor_bump(self) -> int:
+        """
+        Confidence-floor bump (in points) the aggregator should add
+        during weekend low-liquidity windows.
+
+        Stacks on top of TimeFilter.evaluate()'s per-signal penalty:
+        the per-signal penalty discourages weak signals from publishing,
+        the floor bump raises the bar even for high-grade signals so
+        only genuinely strong setups get through during Saturday/Sunday.
+        Returns 0 outside weekend windows.
+        """
+        try:
+            from config.constants import WeekendChop as _WC
+        except Exception:
+            return 0
+        now = datetime.now(timezone.utc)
+        weekday = now.weekday()
+        hour = now.hour
+        if weekday == 6 and hour < 8:
+            return _WC.SUNDAY_EARLY_CONF_FLOOR_BUMP
+        if weekday >= 5:
+            return _WC.WEEKEND_CONF_FLOOR_BUMP
+        return 0
+
 
 # ── Singleton ──────────────────────────────────────────────
 time_filter = TimeFilter()

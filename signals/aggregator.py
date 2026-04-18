@@ -450,6 +450,77 @@ class SignalAggregator:
         """
         self._check_day_rollover()  # FIX M5: reset daily counts at midnight
 
+        # ── -1. Infrastructure gates (exchange + stablecoin) ──────
+        # Cheapest possible early gates — no analyzer work happens until
+        # we know the underlying market data is trustworthy. Both gates
+        # fail-open on missing data and only block on confirmed UNHEALTHY.
+        try:
+            from signals.exchange_health import exchange_health as _eh
+            _eh_snap = _eh.check_health()
+            if _eh_snap.should_block:
+                logger.info(
+                    f"❌ Signal died (agg) | {signal.symbol} "
+                    f"{getattr(signal.direction, 'value', str(signal.direction))} "
+                    f"| reason=EXCHANGE_UNHEALTHY | {_eh_snap.reason}"
+                )
+                if _tl:
+                    _dir = getattr(signal.direction, 'value', str(signal.direction))
+                    _tl.signal(symbol=signal.symbol, direction=_dir, grade="?",
+                               confidence=signal.confidence,
+                               entry_low=signal.entry_low, entry_high=signal.entry_high,
+                               stop_loss=signal.stop_loss, tp1=signal.tp1, tp2=signal.tp2,
+                               rr=signal.rr_ratio, strategy=signal.strategy,
+                               regime="UNKNOWN",
+                               result=f"REJECTED(EXCHANGE_UNHEALTHY {_eh_snap.reason})")
+                try:
+                    from core.diagnostic_engine import diagnostic_engine
+                    diagnostic_engine.record_signal_death(
+                        symbol=signal.symbol,
+                        direction=getattr(signal.direction, 'value', str(signal.direction)),
+                        strategy=signal.strategy, kill_reason="EXCHANGE_UNHEALTHY",
+                        rr=getattr(signal, 'rr_ratio', 0.0),
+                        confidence=signal.confidence, regime="UNKNOWN",
+                        setup_class=getattr(signal, 'setup_class', 'intraday'),
+                    )
+                except Exception:
+                    pass
+                return None
+        except Exception as _eh_err:
+            logger.debug(f"exchange_health gate skipped: {_eh_err}")
+
+        try:
+            from signals.stablecoin_depeg import stablecoin_depeg_guard as _sd
+            if await _sd.should_block_symbol(signal.symbol):
+                logger.info(
+                    f"❌ Signal died (agg) | {signal.symbol} "
+                    f"{getattr(signal.direction, 'value', str(signal.direction))} "
+                    f"| reason=STABLECOIN_DEPEG"
+                )
+                if _tl:
+                    _dir = getattr(signal.direction, 'value', str(signal.direction))
+                    _tl.signal(symbol=signal.symbol, direction=_dir, grade="?",
+                               confidence=signal.confidence,
+                               entry_low=signal.entry_low, entry_high=signal.entry_high,
+                               stop_loss=signal.stop_loss, tp1=signal.tp1, tp2=signal.tp2,
+                               rr=signal.rr_ratio, strategy=signal.strategy,
+                               regime="UNKNOWN",
+                               result="REJECTED(STABLECOIN_DEPEG)")
+                try:
+                    from core.diagnostic_engine import diagnostic_engine
+                    diagnostic_engine.record_signal_death(
+                        symbol=signal.symbol,
+                        direction=getattr(signal.direction, 'value', str(signal.direction)),
+                        strategy=signal.strategy, kill_reason="STABLECOIN_DEPEG",
+                        rr=getattr(signal, 'rr_ratio', 0.0),
+                        confidence=signal.confidence, regime="UNKNOWN",
+                        setup_class=getattr(signal, 'setup_class', 'intraday'),
+                    )
+                except Exception:
+                    pass
+                return None
+        except Exception as _sd_err:
+            logger.debug(f"stablecoin_depeg gate skipped: {_sd_err}")
+
         # ── 0. Validate signal geometry + recompute R:R ──────
         # Never trust strategy math — recompute centrally using TP2 (primary target)
         entry_mid = (signal.entry_low + signal.entry_high) / 2
@@ -671,6 +742,50 @@ class SignalAggregator:
             except Exception:
                 pass
             return None
+
+        # ── Fee-adjusted RR floor (cost-model gate) ───────────────
+        # The raw RR floor above does not subtract round-trip commission +
+        # slippage. For marginal setups (rr ≈ floor) that friction can flip
+        # a nominally-profitable trade into a net-losing one. Reject signals
+        # whose fee-adjusted reward does not at least cover their fee-adjusted
+        # risk (i.e. adjusted_rr < 1.0). Uses the same formula as
+        # ``utils.signal_guidance.fee_adjusted_rr`` for consistency with what
+        # the dashboard and Telegram formatter already expose to the user.
+        try:
+            from utils.signal_guidance import fee_adjusted_rr as _fee_rr
+            from config.constants import FeeModel as _FM
+            _adj_rr = _fee_rr(signal)
+            if _adj_rr is not None and _adj_rr < _FM.MIN_FEE_ADJUSTED_RR:
+                logger.info(
+                    f"❌ Signal died (agg) | {signal.symbol} "
+                    f"{getattr(signal.direction, 'value', str(signal.direction))} "
+                    f"| reason=FEE_ADJUSTED_RR | raw_rr={signal.rr_ratio:.2f} "
+                    f"adj_rr={_adj_rr:.2f} < {_FM.MIN_FEE_ADJUSTED_RR:.2f}"
+                )
+                if _tl:
+                    _dir = getattr(signal.direction, 'value', str(signal.direction))
+                    _rr_regime = getattr(regime_analyzer.regime, 'value', 'UNKNOWN')
+                    _tl.signal(symbol=signal.symbol, direction=_dir, grade="?",
+                               confidence=signal.confidence,
+                               entry_low=signal.entry_low, entry_high=signal.entry_high,
+                               stop_loss=signal.stop_loss, tp1=signal.tp1, tp2=signal.tp2,
+                               rr=signal.rr_ratio, strategy=signal.strategy, regime=_rr_regime,
+                               result=f"REJECTED(FEE_ADJUSTED_RR adj={_adj_rr:.2f}<{_FM.MIN_FEE_ADJUSTED_RR:.2f})")
+                try:
+                    from core.diagnostic_engine import diagnostic_engine
+                    diagnostic_engine.record_signal_death(
+                        symbol=signal.symbol,
+                        direction=getattr(signal.direction, 'value', str(signal.direction)),
+                        strategy=signal.strategy, kill_reason="FEE_ADJUSTED_RR",
+                        rr=signal.rr_ratio, confidence=signal.confidence,
+                        regime=self._agg_cfg.get('regime', 'UNKNOWN') if hasattr(self._agg_cfg, 'get') else 'UNKNOWN',
+                        setup_class=getattr(signal, 'setup_class', 'intraday'),
+                    )
+                except Exception:
+                    pass
+                return None
+        except Exception as _fee_err:
+            logger.debug(f"fee_adjusted_rr gate skipped: {_fee_err}")
 
         # ── 0b. Signal data validation ("Skeptical LLM Mode") ────────
         # Dual-layer defense: Layer A (programmatic hard checks) catches
@@ -982,15 +1097,64 @@ class SignalAggregator:
                     + volume_quality.confidence_delta
                 )
                 self._extend_unique_confluence(signal, volume_quality.notes[:2])
+                # Session-aware spread expectation (PR4 #9): weekend / dead-zone
+                # quotes are tighter than the realised spread under load, so the
+                # observed snapshot understates execution cost. Inflate by the
+                # current session's multiplier before propagating to the gate.
+                _observed_spread = volume_quality.spread_bps
+                _adj_spread = _observed_spread
+                try:
+                    from signals.time_filter import time_filter as _tf
+                    _spread_mult = _tf.expected_spread_multiplier()
+                    if _spread_mult and _spread_mult > 1.0 and _observed_spread > 0:
+                        _adj_spread = _observed_spread * _spread_mult
+                except Exception:
+                    pass
                 signal.raw_data.update({
                     "volume_trade_type": _trade_type,
                     "volume_quality_score": volume_quality.quality_score,
                     "volume_quality_label": volume_quality.quality_label,
                     "volume_quality_context": volume_quality.context_label,
-                    "spread_bps": volume_quality.spread_bps,
+                    "spread_bps": _adj_spread,
+                    "spread_bps_observed": _observed_spread,
                     "volume_quality_dry_volume": volume_quality.dry_volume,
                     "volume_quality_delta": volume_quality.confidence_delta,
                 })
+                # PR5 #5: expose top-book USD depth from the order book
+                # already fetched above. Predictive slippage model
+                # (analyzers.expected_slippage) consumes this without an
+                # extra API round-trip. ~25 bps band around mid keeps the
+                # number meaningful for typical retail clip sizes.
+                try:
+                    if isinstance(order_book, dict) and order_book:
+                        _bids = order_book.get('bids', [])
+                        _asks = order_book.get('asks', [])
+                        if _bids and _asks:
+                            _best_bid = float(_bids[0][0])
+                            _best_ask = float(_asks[0][0])
+                            _mid = (_best_bid + _best_ask) / 2.0
+                            if _mid > 0:
+                                _band = _mid * 0.0025  # 25 bps
+                                _bid_usd = sum(
+                                    float(p) * float(q) for p, q in _bids
+                                    if float(p) >= _mid - _band
+                                )
+                                _ask_usd = sum(
+                                    float(p) * float(q) for p, q in _asks
+                                    if float(p) <= _mid + _band
+                                )
+                                signal.raw_data["top_book_depth_usd"] = _bid_usd + _ask_usd
+                except Exception:
+                    pass
+                # Surface ATR-as-percent so the slippage model can use it
+                # without re-deriving it from raw_data['atr_proxy'].
+                try:
+                    _atr = signal.raw_data.get("atr_proxy") or signal.raw_data.get("atr")
+                    _entry_mid_for_atr = (signal.entry_low + signal.entry_high) / 2.0
+                    if _atr and _entry_mid_for_atr > 0:
+                        signal.raw_data["atr_pct"] = float(_atr) / float(_entry_mid_for_atr)
+                except Exception:
+                    pass
             except Exception:
                 pass
         else:
@@ -1025,6 +1189,36 @@ class SignalAggregator:
                 signal.raw_data.setdefault("trigger_quality_label", "LOW")
         except Exception:
             pass
+
+        # ── Liq-sweep proximity (PR4 #8) ──────────────────────
+        # Advisory penalty when the stop is parked just beyond a recent
+        # swing extreme or round number — exactly the prices where
+        # resting stops get hunted before the real move begins.
+        try:
+            from analyzers.liq_sweep import liq_sweep_estimator
+            _entry_mid_ls = (signal.entry_low + signal.entry_high) / 2
+            _ohlcv_1h = (signal.raw_data or {}).get("ohlcv_1h")
+            _sweep = liq_sweep_estimator.estimate(
+                direction=direction_str,
+                entry=_entry_mid_ls,
+                stop=signal.stop_loss,
+                ohlcv=_ohlcv_1h,
+            )
+            if _sweep and _sweep.probability > 0:
+                _sweep_penalty = liq_sweep_estimator.confidence_penalty(_sweep.probability)
+                if _sweep_penalty > 0:
+                    signal.confidence = max(0.0, signal.confidence - _sweep_penalty)
+                signal.raw_data.update({
+                    "liq_sweep_probability": _sweep.probability,
+                    "liq_sweep_swing": _sweep.swing_proximity,
+                    "liq_sweep_round": _sweep.round_proximity,
+                    "liq_sweep_level_kind": _sweep.level_kind,
+                    "liq_sweep_penalty": _sweep_penalty,
+                })
+                if _sweep.notes:
+                    self._extend_unique_confluence(signal, _sweep.notes[:1])
+        except Exception as _ls_err:
+            logger.debug(f"liq_sweep estimator skipped: {_ls_err}")
 
         # Derivatives score
         if scored.derivatives_data:
@@ -1339,6 +1533,43 @@ class SignalAggregator:
         regime_override = regime_analyzer.get_min_confidence_override()
         if regime_override:
             min_conf = min(max(min_conf, regime_override), 65)
+
+        # ── Post-commit regime hysteresis ─────────────────────
+        # For TRANSITION_HYSTERESIS_SECS after a committed regime flip,
+        # raise the min-confidence floor by TRANSITION_CONF_FLOOR_BUMP.
+        # The 2-cycle pre-commit confirmation in RegimeAnalyzer prevents
+        # flapping at the regime boundary, but the first 5–15 min after
+        # the flip see the worst fakeouts as price retests prior
+        # structure. Demand stronger setups in that window.
+        try:
+            from config.constants import RegimeHysteresis as _RH
+            if regime_analyzer.is_recently_transitioned(_RH.TRANSITION_HYSTERESIS_SECS):
+                _bumped = min_conf + _RH.TRANSITION_CONF_FLOOR_BUMP
+                logger.info(
+                    f"🌀 Regime hysteresis: min_conf {min_conf:.1f}→{_bumped:.1f} "
+                    f"(within {_RH.TRANSITION_HYSTERESIS_SECS}s of last regime flip)"
+                )
+                min_conf = _bumped
+        except Exception as _rh_err:
+            logger.debug(f"regime hysteresis bump skipped: {_rh_err}")
+
+        # ── Weekend / Sunday-early floor bump (PR4 #10) ───────
+        # TimeFilter.evaluate() already applies a per-signal confidence
+        # penalty, but during the worst weekend windows the *floor*
+        # should also rise so even high-grade signals must clear a
+        # tougher bar (book is thinner, slippage worse).
+        try:
+            from signals.time_filter import time_filter as _tf_wc
+            _weekend_bump = _tf_wc.weekend_chop_floor_bump()
+            if _weekend_bump:
+                _w_bumped = min_conf + _weekend_bump
+                logger.info(
+                    f"📅 Weekend chop: min_conf {min_conf:.1f}→{_w_bumped:.1f} "
+                    f"(+{_weekend_bump} pts during weekend low-liquidity window)"
+                )
+                min_conf = _w_bumped
+        except Exception as _wc_err:
+            logger.debug(f"weekend chop floor bump skipped: {_wc_err}")
 
         # BUG-2 FIX: Only record scores that passed the AGG_THRESHOLD gate.
         # Previously appended BEFORE the gate, poisoning the adaptive floor percentile

@@ -38,6 +38,24 @@ def test_guidance_payload_short_skip_rule_uses_lower_bound():
     assert payload["skip_rule"].startswith("Skip if price trades below 98")
 
 
+def test_guidance_payload_uses_top_level_position_size_for_friction():
+    sig = _signal_dict()
+    sig["raw_data"] = {
+        "spread_bps": 20.0,
+        "top_book_depth_usd": 50_000,
+        "atr_pct": 0.02,
+    }
+    baseline = guidance_payload(sig)
+
+    sized = dict(sig)
+    sized["position_size"] = 20_000
+    sized_payload = guidance_payload(sized)
+
+    assert baseline["fee_adjusted_rr"] is not None
+    assert sized_payload["fee_adjusted_rr"] is not None
+    assert sized_payload["fee_adjusted_rr"] < baseline["fee_adjusted_rr"]
+
+
 def test_formatter_surfaces_guidance_lines():
     from tg.formatter import TelegramFormatter
 

@@ -125,12 +125,21 @@ async def _gather_context(symbol: str, direction: str,
         from signals.liquidation_heatmap import liquidation_heatmap as _lh
         clusters = _lh._cluster_cache.get(symbol, [])
         ctx["liq_clusters"] = len(clusters)
-        ctx["liq_cluster_near_sl"] = any(
-            abs(c.price_low - raw_data.get("stop_loss", 0)) / max(raw_data.get("stop_loss", 1), 1) < 0.005
-            for c in clusters
-        )
+        # FIX: previous divisor `max(stop_loss, 1)` broke for low-priced symbols
+        # (e.g. SHIB at $0.000025 → divisor floors to 1.0 → abs-price-diff/1 is
+        # always <0.005, so cluster_near_sl was always True). Use the stop_loss
+        # value itself with a tiny epsilon, so the threshold is a true percentage.
+        _sl = float(raw_data.get("stop_loss") or 0.0)
+        if _sl > 0:
+            ctx["liq_cluster_near_sl"] = any(
+                abs(c.price_low - _sl) / _sl < 0.005
+                for c in clusters
+            )
+        else:
+            ctx["liq_cluster_near_sl"] = False
     except Exception:
         ctx["liq_clusters"] = 0
+        ctx["liq_cluster_near_sl"] = False
 
     # Recent OHLCV summary (last 4 candles on 1h)
     try:

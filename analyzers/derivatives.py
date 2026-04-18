@@ -33,6 +33,12 @@ class DerivativesData:
     # come from acceleration, not absolute level — a flat-but-high funding is
     # already priced in, whereas a rapidly RISING funding signals crowd entry.
     funding_delta_trend: str = "FLAT"  # RISING | FALLING | FLAT
+    # AUDIT FIX (funding z-score): per-asset normalised funding extreme.
+    # Same threshold catches the relative tail on any symbol because the
+    # normalisation uses each asset's own mean/std. 0.0 = baseline /
+    # insufficient history.
+    funding_z: float = 0.0
+    funding_z_trend: str = "NORMAL"    # NORMAL | EXTREME_HOT | EXTREME_COLD | VERY_HOT | VERY_COLD
     open_interest: float = 0.0         # Current OI in USD
     oi_change_24h: float = 0.0         # OI change % in 24h
     oi_trend: str = "NEUTRAL"          # INCREASING | DECREASING | NEUTRAL
@@ -75,8 +81,13 @@ class DerivativesAnalyzer:
         # rates used to classify rate-of-change (RISING / FALLING / FLAT).  Five
         # samples is enough to smooth a single outlier while still reacting
         # within ~an hour on a venue that polls at 8-minute intervals.
+        # FUNDING-Z UPGRADE: history bumped to 30 samples so we can also derive a
+        # per-asset z-score (mean + std) without exhausting the deque after a
+        # short warmup. The delta classifier still uses only first-vs-last, so
+        # the larger buffer has no impact on its semantics.
+        from config.constants import FundingZScore as _FZ
         self._funding_history: Dict[str, Deque[float]] = {}
-        self._funding_history_max = 5
+        self._funding_history_max = max(_FZ.HISTORY_MAX, 5)
         # Delta threshold (in percentage-points, same scale as funding_rate).
         # 0.005 pp ≈ a clear regime shift on most perps whose typical funding
         # sits in ±0.01 %.  Keeps FLAT noisy in calm markets.
@@ -106,6 +117,8 @@ class DerivativesAnalyzer:
             data.funding_rate = float(funding.get('fundingRate') or 0) * 100  # Convert to %
             data.funding_trend = self._classify_funding_trend(data.funding_rate)
             data.funding_delta_trend = self._classify_funding_delta(symbol, data.funding_rate)
+            # FUNDING-Z: compute *after* delta so the latest sample is in history.
+            data.funding_z, data.funding_z_trend = self._compute_funding_z(symbol)
 
         # Parse open interest
         # AUDIT FIX: compute a real 24h % change from in-memory OI history
@@ -216,6 +229,44 @@ class DerivativesAnalyzer:
             return "FALLING"
         return "FLAT"
 
+    def _compute_funding_z(self, symbol: str) -> Tuple[float, str]:
+        """
+        Compute the per-asset z-score of the latest funding sample relative
+        to its own recent history. Returns ``(z, trend_label)``.
+
+        Trend labels:
+          * ``NORMAL``        — |z| < EXTREME_Z (or insufficient history)
+          * ``EXTREME_HOT``   — z ≥ EXTREME_Z (longs paying unusually high)
+          * ``EXTREME_COLD``  — z ≤ -EXTREME_Z (shorts paying unusually high)
+          * ``VERY_HOT``      — z ≥ VERY_EXTREME_Z (~1 % tail)
+          * ``VERY_COLD``     — z ≤ -VERY_EXTREME_Z
+
+        We require at least ``MIN_SAMPLES_FOR_Z`` observations before
+        emitting a non-zero z; below that the std-dev is too noisy to
+        be meaningful and we'd produce false extremes on warm-up.
+        """
+        from config.constants import FundingZScore as _FZ
+        history = self._funding_history.get(symbol)
+        if not history or len(history) < _FZ.MIN_SAMPLES_FOR_Z:
+            return 0.0, "NORMAL"
+
+        samples = list(history)
+        n = len(samples)
+        mean = sum(samples) / n
+        variance = sum((x - mean) ** 2 for x in samples) / n
+        std = max(variance ** 0.5, _FZ.MIN_STD)
+        z = (samples[-1] - mean) / std
+
+        if z >= _FZ.VERY_EXTREME_Z:
+            return z, "VERY_HOT"
+        if z <= -_FZ.VERY_EXTREME_Z:
+            return z, "VERY_COLD"
+        if z >= _FZ.EXTREME_Z:
+            return z, "EXTREME_HOT"
+        if z <= -_FZ.EXTREME_Z:
+            return z, "EXTREME_COLD"
+        return z, "NORMAL"
+
     def _classify_oi_trend(self, oi_change: float) -> str:
         """Classify OI change"""
         threshold = self._oi_threshold
@@ -249,8 +300,27 @@ class DerivativesAnalyzer:
         """
         funding_trend = data.funding_trend
         funding_delta = data.funding_delta_trend
+        funding_z_trend = data.funding_z_trend
         lsr = data.lsr_trend
         oi = data.oi_trend
+
+        # ── Per-asset funding z-score wiring ──────────────────────
+        # The absolute level classifier ("EXTREMELY_HIGH") is calibrated
+        # for BTC; alts run on different baselines. The z-score catches
+        # the *relative* tail on any symbol. Treat z-extremes as crowd
+        # extremes even if the absolute level / L/S hasn't tripped yet.
+        if funding_z_trend == "VERY_HOT" and lsr in ("LONG_HEAVY", "EXTREME_LONG"):
+            data.notes.append(
+                f"⚠️ Funding z={data.funding_z:+.1f}σ (VERY_HOT) + crowded longs "
+                f"— fade bias"
+            )
+            return "BEARISH"
+        if funding_z_trend == "VERY_COLD" and lsr in ("SHORT_HEAVY", "EXTREME_SHORT"):
+            data.notes.append(
+                f"🚀 Funding z={data.funding_z:+.1f}σ (VERY_COLD) + crowded shorts "
+                f"— short-squeeze fuel"
+            )
+            return "BULLISH"
 
         # Extreme long positioning → bearish bias (shorts will squeeze longs)
         if funding_trend == "EXTREMELY_HIGH" and lsr == "EXTREME_LONG":
@@ -319,6 +389,12 @@ class DerivativesAnalyzer:
             score += 1
         # Rate-of-change adds conviction when it agrees with positioning
         if data.funding_delta_trend == "FALLING" and data.lsr_trend in ("SHORT_HEAVY", "EXTREME_SHORT"):
+            score += 1
+        # Per-asset z-score extreme that *agrees* with positioning =
+        # additional squeeze fuel. A VERY_COLD reading combined with
+        # short-heavy book is the strongest local short-squeeze setup.
+        if data.funding_z_trend in ("VERY_COLD", "EXTREME_COLD") and \
+                data.lsr_trend in ("SHORT_HEAVY", "EXTREME_SHORT"):
             score += 1
 
         if score >= 4:
@@ -395,7 +471,46 @@ class DerivativesAnalyzer:
         elif data.liquidation_risk == "HIGH":
             score -= 10
 
+        # Per-asset funding z-score modifier (orthogonal to absolute level).
+        # A z-score extreme means the current funding is unusually high/low
+        # for *this* asset's recent baseline — fade the crowd.
+        z_trend = data.funding_z_trend
+        if z_trend == "VERY_HOT":
+            score -= 8   # crowd extremely long for this asset's history
+        elif z_trend == "EXTREME_HOT":
+            score -= 4
+        elif z_trend == "VERY_COLD":
+            score += 8   # crowd extremely short → squeeze potential
+        elif z_trend == "EXTREME_COLD":
+            score += 4
+
         return max(0.0, min(100.0, score))
+
+    def _expected_carry_pct(
+        self,
+        funding_rate: float,
+        direction: str,
+        hold_hours: Optional[float] = None,
+    ) -> float:
+        """Return the expected funding carry over the typical hold horizon
+        as a *signed* fraction of notional (positive = trader earns, negative
+        = trader pays).
+
+        Funding is paid every ``ACCRUAL_CYCLE_HOURS`` (8h on Binance perps)
+        at the printed rate per cycle. A LONG pays positive funding and
+        receives negative funding; a SHORT is the mirror.
+        """
+        from config.constants import FundingIntegration as _FI
+        if hold_hours is None:
+            hold_hours = _FI.ACCRUAL_CYCLE_HOURS * 2.0  # ~2 cycles default
+        cycles = max(0.0, float(hold_hours) / float(_FI.ACCRUAL_CYCLE_HOURS))
+        # funding_rate is the per-cycle rate as a fraction (e.g. 0.0001 = 1 bp).
+        per_side = float(funding_rate) * cycles
+        if direction == "LONG":
+            return -per_side    # long pays positive, earns negative
+        if direction == "SHORT":
+            return per_side
+        return 0.0
 
     def assess_entry_validity(
         self, data: DerivativesData, direction: str
@@ -458,6 +573,42 @@ class DerivativesAnalyzer:
             if data.liquidation_risk == "HIGH":
                 notes.append("💣 Long liquidation cascade risk")
                 conf_adj += 8
+
+        # ── PR5 #3: magnitude-aware funding-carry adjustment ──────────
+        # The level-based penalties above are stepwise; an alt at +0.05% per
+        # 8h is materially worse than a major at +0.012% but both classify
+        # as HIGH. Convert the actual rate into expected carry over a
+        # ~2-cycle hold and apply a graduated, symmetric boost/penalty.
+        try:
+            from config.constants import FundingCarry as _FC
+            expected_carry = self._expected_carry_pct(
+                data.funding_rate, direction, hold_hours=_FC.HOLD_HOURS_DEFAULT,
+            )
+            # Convert to basis points for a human-readable note.
+            carry_bps = expected_carry * 10_000.0
+            if carry_bps <= -_FC.PENALTY_THRESHOLD_BPS:
+                # We *pay* this much over the hold — penalise proportionally.
+                penalty = min(
+                    _FC.MAX_PENALTY_PTS,
+                    abs(carry_bps) * _FC.PTS_PER_BP,
+                )
+                conf_adj -= penalty
+                notes.append(
+                    f"💸 Negative funding carry ~{carry_bps:+.1f} bps over "
+                    f"{_FC.HOLD_HOURS_DEFAULT:.0f}h — −{penalty:.1f} pts"
+                )
+            elif carry_bps >= _FC.BOOST_THRESHOLD_BPS:
+                boost = min(
+                    _FC.MAX_BOOST_PTS,
+                    carry_bps * _FC.PTS_PER_BP,
+                )
+                conf_adj += boost
+                notes.append(
+                    f"💰 Positive funding carry ~{carry_bps:+.1f} bps over "
+                    f"{_FC.HOLD_HOURS_DEFAULT:.0f}h — +{boost:.1f} pts"
+                )
+        except Exception:
+            pass
 
         # Block obviously bad trades
         is_valid = conf_adj > -15  # Only block if very negative

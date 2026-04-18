@@ -84,6 +84,12 @@ class RegimeAnalyzer:
         # for the first ~5 minutes (one full update cycle).
         self._is_initialized: bool = False
 
+        # Post-commit hysteresis: timestamp (epoch secs) of the last
+        # regime flip. Aggregator consults this to bump min-confidence
+        # for the noisy window right after a transition is committed.
+        # 0.0 sentinel = no transition seen since startup.
+        self._last_regime_change_at: float = 0.0
+
         # Regime state
         self._btc_trend_bars: Optional[np.ndarray] = None
         self._btc_adx: float = 0
@@ -165,6 +171,23 @@ class RegimeAnalyzer:
         Used by callers as: final_penalty = base_penalty * state_confidence
         """
         return self._state_confidence
+
+    # ── Post-commit transition hysteresis ───────────────────
+    # The 2-cycle confirmation in _update_regime is a *pre-commit*
+    # hysteresis. These helpers expose a *post-commit* window so
+    # downstream consumers (e.g. aggregator min-confidence floor)
+    # can apply extra caution for the noisy minutes after a flip.
+
+    def time_since_last_transition(self) -> Optional[float]:
+        """Seconds since the last committed regime change, or None if never."""
+        if self._last_regime_change_at <= 0:
+            return None
+        return max(0.0, time.time() - self._last_regime_change_at)
+
+    def is_recently_transitioned(self, within_secs: int) -> bool:
+        """True iff a regime change committed within the last ``within_secs``."""
+        elapsed = self.time_since_last_transition()
+        return elapsed is not None and elapsed < within_secs
 
     @property
     def is_alt_season(self) -> bool:
@@ -645,6 +668,8 @@ class RegimeAnalyzer:
 
         if _is_vol_spike:
             # Immediate commit for volatility spikes — don't wait for confirmation
+            if self._regime != Regime.VOLATILE:
+                self._last_regime_change_at = time.time()
             self._regime = Regime.VOLATILE
             self._regime_candidate = Regime.VOLATILE
             self._regime_candidate_count = 0
@@ -659,6 +684,8 @@ class RegimeAnalyzer:
             # FIX #30: reduced from 2→1 for VOLATILE transitions (any volatile candidate)
             _threshold = 1 if (_large_distance or proposed_regime == Regime.VOLATILE) else 2
             if self._regime_candidate_count >= _threshold:
+                if self._regime != proposed_regime:
+                    self._last_regime_change_at = time.time()
                 self._regime = proposed_regime
                 self._regime_candidate_count = 0
         else:

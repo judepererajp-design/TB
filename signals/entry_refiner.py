@@ -478,6 +478,11 @@ class EntryRefiner:
                         f"🔧 SL repaired (was inside entry zone): "
                         f"{old_sl:.6f} → {signal.stop_loss:.6f}"
                     )
+                    # FIX: widening the SL shortens the effective risk distance,
+                    # which changes R:R. Without this, the aggregator may size /
+                    # gate the signal on a stale rr_ratio that no longer matches
+                    # the repaired geometry.
+                    signal = self._recalculate_rr(signal)
             else:
                 # SL must be ABOVE entry_high
                 if signal.stop_loss <= signal.entry_high:
@@ -487,6 +492,7 @@ class EntryRefiner:
                         f"🔧 SL repaired (was inside entry zone): "
                         f"{old_sl:.6f} → {signal.stop_loss:.6f}"
                     )
+                    signal = self._recalculate_rr(signal)
         except Exception:
             pass  # Non-fatal — aggregator geometry check is the safety net
         return signal

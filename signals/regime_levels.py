@@ -699,7 +699,14 @@ def adjust_levels(
             adjustments.append("SL clamped above entry_high (safety)")
 
     # ── 9. Compute final R:R ───────────────────────────────────
-    rr = tp2_dist / sl_dist if sl_dist > 0 else 0
+    # FIX: use the POST-CLAMP distances so the reported rr_ratio matches the
+    # actual SL/TP that will be emitted. Previously this used tp2_dist/sl_dist
+    # which are pre-clamp values — after a safety clamp the real SL is tighter
+    # and the real RR differs from the reported one, causing downstream gates
+    # (RR floor, sizing) to act on stale numbers.
+    effective_sl_dist = abs(entry_mid - new_sl)
+    effective_tp2_dist = abs(new_tp2 - entry_mid) if new_tp2 is not None else 0.0
+    rr = effective_tp2_dist / effective_sl_dist if effective_sl_dist > 0 else 0
 
     return AdjustedLevels(
         entry_low=entry_low,

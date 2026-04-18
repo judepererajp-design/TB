@@ -175,6 +175,21 @@ class PriceCache:
                     f"({len([r for r in results if not isinstance(r, Exception)])} ok)"
                 )
 
+                # PR5 #4: forward each fresh tick to the missed-fill tracker
+                # so it can replay post-expiry "would-have-won" outcomes.
+                # Lazy import + defensive try/except to keep PriceCache
+                # decoupled from any single consumer.
+                try:
+                    from core.missed_fill_tracker import missed_fill_tracker as _mft
+                    for sym, result in zip(tasks.keys(), results):
+                        if isinstance(result, Exception):
+                            continue
+                        last = (result or {}).get("last")
+                        if last is not None:
+                            _mft.update_with_price(sym, float(last))
+                except Exception as _mft_e:
+                    logger.debug(f"missed_fill_tracker tick failed: {_mft_e}")
+
             await asyncio.sleep(POLL_INTERVAL)
 
 

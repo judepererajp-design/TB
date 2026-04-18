@@ -615,6 +615,18 @@ class OutcomeMonitor:
                     f"✅ Signal #{tracked.signal_id} ACTIVE: {tracked.symbol} "
                     f"entered at {_entry_fill} ({_entry_status_val})"
                 )
+                # Start funding-accrual tracker for this live position so
+                # cumulative funding can later be folded into net PnL.
+                try:
+                    from signals.funding_bridge import funding_bridge as _fb
+                    _fb.start_accrual(
+                        tracked.signal_id,
+                        tracked.symbol,
+                        tracked.direction,
+                        entry_ts=now,
+                    )
+                except Exception:
+                    pass
                 # Persist entry — entry_price is critical for all future P&L and
                 # trailing stop calculations after a restart.
                 try:
@@ -1058,6 +1070,26 @@ class OutcomeMonitor:
         """Public alias for _calc_pnl_r — used by bot.py live update button."""
         return self._calc_pnl_r(tracked, current_price)
 
+    def get_net_pnl_r(self, tracked: TrackedSignal, current_price: float) -> float:
+        """Return ``_calc_pnl_r`` minus accrued-funding drag (also in R).
+
+        Introduced for the funding-accrual tracker: lets callers display a
+        funding-inclusive PnL without changing the semantics of the
+        existing ``_calc_pnl_r`` (which remains the "price-only" figure
+        used throughout the outcome pipeline and stats).
+
+        Safe to call for signals with no accrual record — returns the raw
+        R value unchanged.
+        """
+        raw_r = self._calc_pnl_r(tracked, current_price)
+        try:
+            from signals.funding_bridge import funding_bridge as _fb
+            entry = tracked.entry_price or (tracked.entry_low + tracked.entry_high) / 2
+            accrued_r = _fb.get_accrued_r(tracked.signal_id, entry, tracked.stop_loss)
+        except Exception:
+            accrued_r = 0.0
+        return raw_r + accrued_r
+
     async def _complete(self, tracked: TrackedSignal, outcome: str, pnl_r: float, message: str):
         """Complete a signal with an outcome.
 
@@ -1068,6 +1100,13 @@ class OutcomeMonitor:
         """
         tracked.completed_at = time.time()
         tracked.pnl_r = pnl_r
+        # Release the funding-accrual record — the position is closed and
+        # no further cycles should be charged against this signal_id.
+        try:
+            from signals.funding_bridge import funding_bridge as _fb
+            _fb.stop_accrual(tracked.signal_id)
+        except Exception:
+            pass
         # FIX: unsubscribe happens here for ALL outcomes including EXPIRED.
         # Previously remove_signal() was the only unsub path, but EXPIRED
         # signals bypassed remove_signal() — growing the price cache subscriber

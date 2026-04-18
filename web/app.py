@@ -1211,13 +1211,14 @@ class DashboardApp:
             from analyzers.ai_analyst import ai_analyst
             from analyzers.veto_system import veto_system
             from collections import Counter
+            from itertools import islice
 
             stats = diagnostic_engine.get_stats_summary()
             # FIX #22: Use get_death_breakdown() for aggregated, sorted kill reason data
             death_breakdown = diagnostic_engine.get_death_breakdown(hours=24)
             kill_reasons = death_breakdown["by_reason"]
             strat_breakdown_agg = death_breakdown["by_strategy"]
-            death_log = diagnostic_engine._death_log[-200:]
+            death_log = list(islice(diagnostic_engine._death_log, max(0, len(diagnostic_engine._death_log) - 200), None))
             kill_reasons_raw = dict(Counter(d.get("kill_reason","?") for d in death_log).most_common(8))
             strat_breakdown = {}
             for d in death_log:
@@ -1390,6 +1391,14 @@ class DashboardApp:
             except Exception as _vs_err:
                 logger.debug("Failed to load validator stats: %s", _vs_err)
 
+            missed_fill_stats = {}
+            try:
+                from core.missed_fill_tracker import missed_fill_tracker
+                missed_fill_stats = missed_fill_tracker.to_dict()
+            except Exception as _mf_err:
+                logger.debug("Failed to load missed-fill stats: %s", _mf_err)
+                missed_fill_stats["error"] = str(_mf_err)
+
             return _json_response({
                 "pipeline": pipeline_diag,
                 "kill_reasons": kill_reasons,           # from get_death_breakdown (sorted)
@@ -1400,6 +1409,7 @@ class DashboardApp:
                 "execution_gate": exec_gate_data,
                 "near_miss_tracking": near_miss_data,
                 "validator_stats": validator_stats,
+                "missed_fill_tracking": missed_fill_stats,
             })
         except Exception as e:
             return _json_response({"error": str(e)})
