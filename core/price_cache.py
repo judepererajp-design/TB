@@ -25,6 +25,7 @@ Architecture:
 
 import asyncio
 import logging
+import math
 import time
 from typing import Dict, Optional, Set
 
@@ -102,6 +103,18 @@ class PriceCache:
         price = self._prices.get(symbol)
         return price, age
 
+    @staticmethod
+    def _is_valid_price(price: float) -> bool:
+        """Reject nan, inf, zero, negative, and implausibly large prices.
+
+        Prices from exchange tickers are occasionally malformed (nan/inf from
+        a failed floating-point parse, 0 from a halted market, negative from
+        a mis-signed result, or astronomically large from data corruption).
+        Storing any of these would silently corrupt all downstream consumers
+        (outcome monitor, SL checks, position sizing) without any error.
+        """
+        return math.isfinite(price) and 0 < price < 1e9
+
     @property
     def subscribed_symbols(self) -> Set[str]:
         return set(self._subscribers.keys())
@@ -128,8 +141,16 @@ class PriceCache:
             results = await asyncio.gather(*tasks.values(), return_exceptions=True)
             for sym, result in zip(tasks.keys(), results):
                 if not isinstance(result, Exception) and result and "last" in result:
-                    self._prices[sym] = float(result["last"])
-                    self._timestamps[sym] = now
+                    raw = result["last"]
+                    if raw is not None:
+                        p = float(raw)
+                        if self._is_valid_price(p):
+                            self._prices[sym] = p
+                            self._timestamps[sym] = now
+                        else:
+                            logger.debug(
+                                f"PriceCache warm_up: invalid price {raw!r} for {sym} — rejected"
+                            )
         logger.info(f"📡 PriceCache warmed: {len(self._prices)} prices loaded")
 
     async def stop(self):
@@ -167,8 +188,16 @@ class PriceCache:
                         logger.debug(f"PriceCache fetch failed for {sym}: {result}")
                         continue
                     if result and "last" in result:
-                        self._prices[sym] = float(result["last"])
-                        self._timestamps[sym] = now
+                        raw = result["last"]
+                        if raw is not None:
+                            p = float(raw)
+                            if self._is_valid_price(p):
+                                self._prices[sym] = p
+                                self._timestamps[sym] = now
+                            else:
+                                logger.debug(
+                                    f"PriceCache: invalid price {raw!r} for {sym} — rejected"
+                                )
 
                 logger.debug(
                     f"PriceCache: updated {len(symbols)} symbols "
@@ -186,7 +215,9 @@ class PriceCache:
                             continue
                         last = (result or {}).get("last")
                         if last is not None:
-                            _mft.update_with_price(sym, float(last))
+                            p = float(last)
+                            if self._is_valid_price(p):
+                                _mft.update_with_price(sym, p)
                 except Exception as _mft_e:
                     logger.debug(f"missed_fill_tracker tick failed: {_mft_e}")
 

@@ -100,6 +100,11 @@ class CircuitBreaker:
         self._cooldown_mins   = self._cb_cfg.get('cooldown_minutes', 45)
         self._max_drawdown    = self._cb_cfg.get('max_drawdown_pct', 0.08)
 
+        # PS-1: Per-symbol daily loss cap — prevents one asset bleeding
+        # the entire daily budget while other symbols are blocked.
+        self._symbol_daily_losses: Dict[str, int] = {}
+        self._max_losses_per_symbol: int = self._cb_cfg.get('max_losses_per_symbol', 2)
+
     # ── C3 FIX: Persistent state restore / save ───────────────
 
     async def restore(self) -> None:
@@ -252,6 +257,7 @@ class CircuitBreaker:
         loss_r: float = 1.0,
         signal_id: str = "",
         current_capital: float = -1.0,
+        symbol: str = "",
     ) -> bool:
         """
         Record a trade loss. Returns True if circuit breaker triggered.
@@ -290,6 +296,10 @@ class CircuitBreaker:
         self._last_loss_time      = now
         self._losses_this_hour   += 1
 
+        # PS-1: Per-symbol daily loss cap — increment symbol counter
+        if symbol:
+            self._symbol_daily_losses[symbol] = self._symbol_daily_losses.get(symbol, 0) + 1
+
         if current_capital >= 0:
             self._current_capital = current_capital
 
@@ -299,6 +309,7 @@ class CircuitBreaker:
             f"Loss recorded — consecutive: {self._consecutive_losses}, "
             f"this hour: {self._losses_this_hour}, "
             f"daily loss: {self._daily_loss_pct*100:.2f}%"
+            + (f", symbol_losses[{symbol}]={self._symbol_daily_losses[symbol]}" if symbol else "")
         )
 
         # C3 FIX: persist updated counters after every unique loss so restarts
@@ -321,6 +332,22 @@ class CircuitBreaker:
             await self._trigger(
                 f"{self._losses_this_hour} losses in one hour — "
                 f"market conditions unfavorable"
+            )
+            return True
+
+        # PS-1: Per-symbol daily loss cap — block new signals on this symbol
+        # but do NOT trigger the global circuit breaker.  Returned as True only
+        # so callers skip new entries; the engine should treat this as a symbol-
+        # level cooldown, not a portfolio-wide halt.
+        if symbol and self._symbol_daily_losses.get(symbol, 0) >= self._max_losses_per_symbol:
+            risk_log.info(
+                "SYMBOL_CAP | symbol=%s | losses=%d | max=%d",
+                symbol, self._symbol_daily_losses[symbol], self._max_losses_per_symbol,
+            )
+            logger.warning(
+                f"⚠️  Per-symbol loss cap reached: {symbol} has "
+                f"{self._symbol_daily_losses[symbol]} losses today "
+                f"(max {self._max_losses_per_symbol}) — blocking further trades on this symbol"
             )
             return True
 
@@ -395,6 +422,7 @@ class CircuitBreaker:
         self._last_loss_time     = 0.0
         self._peak_capital       = 0.0
         self._current_capital    = 0.0
+        self._symbol_daily_losses.clear()  # PS-1: reset per-symbol counters each day
         if self._hard_kill_active:
             self._hard_kill_active = False
             self._is_active        = False
@@ -471,6 +499,7 @@ class CircuitBreaker:
             'peak_capital':        round(self._peak_capital, 2),
             'current_capital':     round(self._current_capital, 2),
             'hard_kill_active':    self._hard_kill_active,
+            'symbol_daily_losses': dict(self._symbol_daily_losses),
         }
 
 

@@ -95,6 +95,38 @@ class RiskManager:
         if self._daily_trades >= max_daily:
             return False, f"Daily trade limit reached ({self._daily_trades})"
 
+        # LIQ-GUARD: Reject signals where the stop loss is too close to or below
+        # the estimated liquidation price at configured leverage.  This prevents
+        # the exchange liquidating the position before the stop loss fires —
+        # which would mean the bot's % loss logic never executes.
+        try:
+            _base = scored.base_signal
+            _leverage = float(self._risk_cfg.get('default_leverage', 10))
+            _liq_buf  = float(self._risk_cfg.get('liq_min_buffer_pct', 0.02))
+            if _leverage > 1 and _base.entry_low > 0 and _base.entry_high > 0:
+                _entry_mid = (_base.entry_low + _base.entry_high) / 2.0
+                _dir = getattr(_base.direction, 'value', str(_base.direction))
+                if _dir == "LONG":
+                    _liq_price = _entry_mid * (1.0 - 1.0 / _leverage)
+                    _required_sl = _liq_price + _liq_buf * _entry_mid
+                    if _base.stop_loss < _required_sl:
+                        return False, (
+                            f"Stop loss ${_base.stop_loss:.4f} is at or below estimated "
+                            f"liquidation price ${_liq_price:.4f} (+ {_liq_buf*100:.0f}% buffer) "
+                            f"at {_leverage:.0f}x leverage — position would be liquidated before SL fires"
+                        )
+                else:  # SHORT
+                    _liq_price = _entry_mid * (1.0 + 1.0 / _leverage)
+                    _required_sl = _liq_price - _liq_buf * _entry_mid
+                    if _base.stop_loss > _required_sl:
+                        return False, (
+                            f"Stop loss ${_base.stop_loss:.4f} is at or above estimated "
+                            f"liquidation price ${_liq_price:.4f} (- {_liq_buf*100:.0f}% buffer) "
+                            f"at {_leverage:.0f}x leverage — position would be liquidated before SL fires"
+                        )
+        except Exception as _liq_err:
+            logger.debug(f"Liquidation distance check skipped: {_liq_err}")
+
         # R/R minimum is checked in aggregator (setup_class-aware) — not duplicated here
         # NOTE: counter is NOT incremented here. Call commit_signal() after successful publish.
         return True, ""
@@ -121,7 +153,7 @@ class RiskManager:
         if pnl_r < 0:
             triggered = await self.circuit_breaker.record_loss(
                 loss_r=abs(pnl_r), signal_id=signal_id,
-                current_capital=current_capital,
+                current_capital=current_capital, symbol=symbol,
             )
             if triggered:
                 logger.warning(f"Circuit breaker triggered by losses on {symbol}")
