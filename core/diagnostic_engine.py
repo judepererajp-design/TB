@@ -891,7 +891,12 @@ In 1-2 sentences: should they approve or wait? Start with "Approve" or "Wait —
                 # Auto-exclude for 1 hour to stop the spam
                 try:
                     from scanner.scanner import scanner
-                    scanner.exclude_symbol(symbol)
+                    from config.constants import Diagnostics
+                    scanner.temporarily_exclude_symbol(
+                        symbol,
+                        duration_secs=Diagnostics.EDGE_CASE_CHECK_WINDOW_SECS,
+                        reason=f"edge-case repeat with {strategy}",
+                    )
                     logger.info(f"🔬 Edge case: {symbol} appearing {count}x/hour "
                                 f"with {strategy} — temporarily excluded")
                 except Exception:
