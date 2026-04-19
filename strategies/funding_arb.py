@@ -164,11 +164,12 @@ class FundingRateArb(BaseStrategy):
         # ── Confidence ────────────────────────────────────────────────────
         confidence = float(confidence_base)
 
-        # Funding magnitude bonus: +1 per 0.01% above threshold
+        # Funding magnitude bonus: +1 per basis-point above threshold
+        # (funding_rate_pct and long_threshold are in pp; *100 converts to 0.01%-steps)
         if direction == "SHORT":
-            excess = (funding_rate_pct - long_threshold) * 100  # pp -> 0.01% steps
+            excess = (funding_rate_pct - long_threshold) * 100  # pp -> basis points
         else:
-            excess = (abs(funding_rate_pct) - abs(short_threshold)) * 100  # pp -> 0.01% steps
+            excess = (abs(funding_rate_pct) - abs(short_threshold)) * 100  # pp -> basis points
 
         confidence += min(15, excess * 1.0)
 
@@ -190,7 +191,9 @@ class FundingRateArb(BaseStrategy):
         # strong unwind (large delta) gets a proportionally larger bonus and
         # a strong continuation gets a proportionally larger penalty.
         # delta_pp is the raw change in percentage points (newest − oldest poll).
-        _delta_threshold = 0.005  # pp — same scale as derivatives._funding_delta_threshold
+        # _delta_threshold mirrors derivatives.DerivativesAnalyzer._funding_delta_threshold
+        # (0.005 pp) so the scaling is internally consistent; update both if changed.
+        _delta_threshold = 0.005  # pp
         if funding_delta_pct != 0.0:
             if direction == "SHORT":
                 # Fading extreme positive funding
@@ -241,8 +244,10 @@ class FundingRateArb(BaseStrategy):
 
         # FA-Q4: TP philosophy — TP1 is tactical (ATR-based, kept as-is).
         # TP2/TP3 are ATR-anchored proxies for funding normalization; the
-        # actual exit target is when funding recedes to ≤ threshold * 0.5
-        # (stored in raw_data as funding_exit_threshold for runtime monitoring).
+        # actual exit target is when funding recedes to ≤ threshold * 0.5.
+        # The 0.5 multiplier (= "half of the extreme threshold") serves as the
+        # normalization proxy and is stored in raw_data as funding_exit_threshold
+        # so runtime monitoring can trigger an early exit when funding normalizes.
         funding_exit_threshold = long_threshold * 0.5 if direction == "SHORT" else short_threshold * 0.5
 
         if direction == "LONG":
