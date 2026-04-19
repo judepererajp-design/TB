@@ -320,8 +320,12 @@ class Scanner:
         self._temp_excluded_until.pop(symbol, None)
         logger.info(f"Scanner: excluded {symbol} from universe (delisted or bad symbol)")
 
-    def temporarily_exclude_symbol(self, symbol: str, duration_secs: int = 3600, reason: str = "edge case"):
-        """Temporarily pause scans for a symbol without removing it from the universe."""
+    def temporarily_exclude_symbol(self, symbol: str, duration_secs: float = 3600, reason: str = "edge case"):
+        """Temporarily pause scans for a symbol without removing it from the universe.
+
+        If called again before expiry, the exclusion window is extended to the
+        later timestamp (it never shortens an active cooldown).
+        """
         if symbol not in self._symbols:
             return
         until = time.time() + max(1, int(duration_secs))
