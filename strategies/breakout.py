@@ -199,6 +199,11 @@ class BreakoutStrategy(BaseStrategy):
         candle_range = current_high - current_low
         if candle_range > 0:
             close_pos = (current_close - current_low) / candle_range  # 0.0 (bottom) – 1.0 (top)
+            # BR-Q5e: doji/flat-candle guard.  A 1-tick candle where close == high gives
+            # close_pos = 1.0 and would fire +5, but that's noise not conviction.  When the
+            # candle body is below 0.1×ATR the close position is meaningless — neutralise it.
+            if candle_range < atr * 0.1:
+                close_pos = 0.5
             if direction == "LONG":
                 if close_pos >= 0.7:                  # Closed near top — strong bullish candle
                     _q5_bonus += 5
