@@ -13,12 +13,13 @@ Run automatically at engine startup (async), or manually:
   python scripts/bootstrap_oi_history.py
 
 Saves processed history to data/oi_history.json so subsequent
-restarts are instant (no re-fetching needed unless file > 7 days old).
+restarts are instant (no re-fetching needed unless file > 24 hours old).
 """
 
 import asyncio
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -38,7 +39,7 @@ _OKX     = "https://www.okx.com"
 
 _CACHE_FILE  = os.path.join(os.path.dirname(os.path.dirname(__file__)),
                              "data", "oi_history.json")
-_CACHE_TTL   = 6 * 3600   # re-bootstrap if file > 6 hours old
+_CACHE_TTL   = 24 * 3600  # re-bootstrap if file > 24 hours old
 _REQUEST_GAP = 0.3        # seconds between API calls
 
 # Top coins to bootstrap (covers 95%+ of trading volume)
@@ -159,6 +160,62 @@ async def fetch_binance_oi_history(
     return results
 
 
+# ── OKX historical OI ──────────────────────────────────────────────────────────
+
+async def fetch_okx_oi_history(
+    session: aiohttp.ClientSession, coin: str
+) -> List[Tuple[float, float, float]]:
+    """
+    OKX GET /api/v5/rubik/stat/contracts/open-interest-volume
+    Returns list of (timestamp_s, oi_usd, 0.0) tuples — hourly, up to 3 months.
+    Response rows: [ts_ms, openInterestCoin, volume24hCoin, openInterestUsd, volume24hUsd]
+    """
+    results = []
+    now_ms   = int(time.time() * 1000)
+    start_ms = now_ms - 90 * 24 * 3600 * 1000
+
+    # OKX paginates backwards via the 'after' cursor (exclusive upper bound on ts)
+    after: str = ""
+    while True:
+        params: dict = {
+            "ccy":    coin,
+            "period": "1H",
+            "limit":  "100",
+        }
+        if after:
+            params["after"] = after
+
+        data = await _get(
+            session,
+            f"{_OKX}/api/v5/rubik/stat/contracts/open-interest-volume",
+            params=params,
+        )
+        if not data or data.get("code") != "0":
+            break
+
+        rows = data.get("data", [])
+        if not rows:
+            break
+
+        for row in rows:
+            try:
+                ts_ms  = int(row[0])
+                oi_usd = float(row[3] or 0)   # index 3 = openInterestUsd
+                if ts_ms >= start_ms and oi_usd > 0:
+                    results.append((ts_ms / 1000, oi_usd, 0.0))
+            except (IndexError, ValueError, TypeError):
+                pass
+
+        oldest_ts = int(rows[-1][0])
+        if oldest_ts <= start_ms:
+            break
+
+        after = rows[-1][0]
+        await asyncio.sleep(_REQUEST_GAP)
+
+    return results
+
+
 # ── Binance historical klines for price data ───────────────────────────────────
 
 async def fetch_binance_price_history(
@@ -214,11 +271,15 @@ def enrich_with_prices(
     enriched = []
     for ts, oi, _ in oi_points:
         ts_hour = int(ts) // 3600
-        # Try exact hour, then ±1 hour
-        price = (price_map.get(ts_hour) or
-                 price_map.get(ts_hour - 1) or
-                 price_map.get(ts_hour + 1) or 0.0)
-        if price > 0:
+        # Search for nearest available hourly price within a ±2h window.
+        # Expand outward (0, 1, -1, 2, -2) so the closest match wins.
+        price = price_map.get(ts_hour)
+        if price is None:
+            for offset in (1, -1, 2, -2):
+                price = price_map.get(ts_hour + offset)
+                if price is not None:
+                    break
+        if price:
             enriched.append((ts, oi, price))
     return enriched
 
@@ -238,7 +299,13 @@ def build_clusters(
       → Shorts were opened at P → will liquidate at P*(1+1/lev)
 
     We use a mix of 5x, 10x, 20x leverage assumptions weighted realistically.
+    OI deltas are age-weighted (exponential decay) so stale data contributes
+    less than recent accumulation.  The decay constant τ is asset-aware:
+      • BTC/ETH: τ=30 days (structurally stable; older OI stays relevant)
+      • Alts:    τ=21 days (faster cycling; stale accumulation decays sooner)
+
     Returns list of (price, usd_size, 'above'|'below') relative to current price.
+    Clusters with effective OI < $10M are filtered out.
     """
     if len(history) < 5 or current_price <= 0:
         return []
@@ -246,8 +313,20 @@ def build_clusters(
     # Sort by timestamp
     history = sorted(history, key=lambda x: x[0])
 
-    # Bucket price levels (1% wide buckets)
+    # Age-decay parameters — asset-aware:
+    # BTC/ETH are more structurally stable; OI from 30 days ago is still relevant.
+    # Alts cycle faster; use a 21-day τ so stale accumulation decays sooner.
+    now_ts      = time.time()
+    _coin_upper = coin.upper() if coin else ""
+    if any(_coin_upper.startswith(m) for m in ("BTC", "ETH")):
+        tau_days = 30.0
+    else:
+        tau_days = 21.0
+    tau_secs = tau_days * 24 * 3600.0
+
+    # Bucket price levels (1% wide log-space buckets)
     bucket_pct = 0.01
+    log_q      = math.log(1.0 + bucket_pct)   # ≈ 0.00995
     buckets: Dict[float, float] = defaultdict(float)
 
     prev_oi = history[0][1]
@@ -258,16 +337,23 @@ def build_clusters(
         if oi_delta < 2_000_000:  # ignore small OI changes < $2M
             continue
 
-        # Snap price to bucket
-        bucket = round(price / (current_price * bucket_pct)) * (current_price * bucket_pct)
-        buckets[bucket] += abs(oi_delta)
+        # Exponential age weight: recent data → weight ≈ 1.0,
+        # data τ days old → weight ≈ 0.37, data 2τ days old → weight ≈ 0.14.
+        # τ=30d for BTC/ETH, τ=21d for alts (see asset-aware block above).
+        age_secs = max(0.0, now_ts - ts)
+        weight   = math.exp(-age_secs / tau_secs)
+
+        # Log-space bucketing (price-scale invariant)
+        bucket_idx = round(math.log(price) / log_q)
+        bucket     = math.exp(bucket_idx * log_q)
+        buckets[bucket] += abs(oi_delta) * weight
 
     if not buckets:
         return []
 
     clusters: List[Tuple[float, float, str]] = []
     for price_level, oi_accumulated in buckets.items():
-        if oi_accumulated < 10_000_000:  # need $10M+ to be significant
+        if oi_accumulated < 10_000_000:  # need $10M+ (age-weighted) to be significant
             continue
 
         # Leverage distribution: 20% at 5x, 50% at 10x, 30% at 20x
@@ -369,24 +455,32 @@ async def bootstrap(
                     latest_hour = max(price_map.keys())
                     current_price = price_map[latest_hour]
 
-                # 2. Fetch OI history (Bybit primary, Binance supplement)
+                # 2. Fetch OI history (Bybit primary, Binance + OKX supplement)
                 bybit_oi = await fetch_bybit_oi_history(session, coin)
                 await asyncio.sleep(_REQUEST_GAP)
 
                 binance_oi = await fetch_binance_oi_history(session, coin)
                 await asyncio.sleep(_REQUEST_GAP)
 
+                okx_oi = await fetch_okx_oi_history(session, coin)
+                await asyncio.sleep(_REQUEST_GAP)
+
                 # 3. Enrich with prices
                 bybit_enriched   = enrich_with_prices(bybit_oi, price_map)
                 binance_enriched = enrich_with_prices(binance_oi, price_map)
+                okx_enriched     = enrich_with_prices(okx_oi, price_map)
 
-                # Merge: prefer Bybit (longer history), supplement with Binance
-                # Deduplicate by rounding timestamps to nearest hour
+                # Merge: prefer Bybit (longest history), supplement with Binance and OKX.
+                # Deduplicate by rounding timestamps to nearest hour.
                 all_points: Dict[int, Tuple] = {}
                 for ts, oi, px in bybit_enriched:
                     bucket = int(ts) // 3600
                     all_points[bucket] = (ts, oi, px)
                 for ts, oi, px in binance_enriched:
+                    bucket = int(ts) // 3600
+                    if bucket not in all_points:
+                        all_points[bucket] = (ts, oi, px)
+                for ts, oi, px in okx_enriched:
                     bucket = int(ts) // 3600
                     if bucket not in all_points:
                         all_points[bucket] = (ts, oi, px)

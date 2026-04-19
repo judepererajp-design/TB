@@ -12,16 +12,38 @@ Manages the full scanning pipeline:
 
 import asyncio
 import logging
+import math
 import time
 from typing import Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 
 import numpy as np
+import pandas as pd
 
 from config.loader import cfg
 from data.api_client import api
 from data.database import db
+from utils.formatting import fmt_price
+
+# Lazy import to avoid circular dependency at module load time.
+# Accessed via _get_regime() below.
+def _get_regime() -> str:
+    """Return the current regime string, or 'UNKNOWN' if not yet initialised."""
+    try:
+        from analyzers.regime import regime_analyzer
+        return str(regime_analyzer.regime.value)
+    except Exception:
+        return "UNKNOWN"
+
+
+def _regime_recently_changed(within_secs: int = 600) -> bool:
+    """Return True iff the regime changed within the last ``within_secs`` seconds."""
+    try:
+        from analyzers.regime import regime_analyzer
+        return regime_analyzer.is_recently_transitioned(within_secs)
+    except Exception:
+        return False
 
 logger = logging.getLogger(__name__)
 
@@ -68,9 +90,20 @@ class Scanner:
 
         # Whale cooldown tracker
         self._whale_cooldown: Dict[str, float] = {}
+        # Whale persistence cache: symbol → {side: last_snapshot_usd}.
+        # We require a whale to appear in 2 consecutive order-book snapshots
+        # before firing so that spoofed / fleeting walls are filtered out.
+        self._whale_snapshot: Dict[str, Dict[str, float]] = {}
+
         # Watchlist alert cooldown — prevents same symbol spamming every scan cycle
         self._watchlist_cooldown: Dict[str, float] = {}
         self._watchlist_cooldown_secs: int = 3600  # 1 hour between alerts per symbol
+
+        # Cross-path signal dedup: (symbol, setup_type) → last_alert_ts.
+        # Prevents scanner.stalker_scan and stalker.StalkerEngine from both
+        # firing an alert for the same symbol / setup within the same window.
+        self._signal_dedup: Dict[Tuple[str, str], float] = {}
+        self._signal_dedup_ttl: int = 1800  # 30-minute dedup window
 
         # OHLCV data-quality cooldown — symbols that fail N times are auto-excluded
         self._ohlcv_fail_counts: Dict[str, int] = {}      # symbol → consecutive failures
@@ -92,7 +125,15 @@ class Scanner:
         Build/refresh the symbol universe from Binance.
         Called at startup and every hour.
         """
+        # Fast path: skip lock acquisition entirely when no refresh is due.
+        # Callers that arrive while a refresh is already running will get an
+        # early return here or on the second check inside the lock below.
+        if time.time() - self._last_universe_refresh < self._universe_ttl:
+            return
+
         async with self._lock:
+            # Re-check after acquiring the lock so a concurrent caller that was
+            # waiting does not trigger a redundant back-to-back refresh.
             now = time.time()
             if now - self._last_universe_refresh < self._universe_ttl:
                 return
@@ -175,6 +216,20 @@ class Scanner:
 
             self._symbols = new_symbols
             self._last_universe_refresh = now
+
+            # Prune cooldown entries that belong to symbols no longer in the
+            # universe so the dicts don't grow unboundedly on long-running instances.
+            active_symbols = set(new_symbols)
+            for _cd in (
+                self._whale_cooldown,
+                self._watchlist_cooldown,
+                self._ohlcv_fail_counts,
+                self._ohlcv_cooldown_until,
+                self._whale_snapshot,
+                self._signal_dedup,
+            ):
+                for _k in [k for k in _cd if k not in active_symbols]:
+                    _cd.pop(_k, None)
 
             logger.info(
                 f"Universe built: {t1_count} T1 | {t2_count} T2 | {t3_count} T3 "
@@ -286,14 +341,32 @@ class Scanner:
         Check if a symbol should be promoted based on volume spike.
         Returns (from_tier, to_tier) if promoted, else None.
         """
-        if symbol not in self._symbols:
+        # Use .get() to avoid a TOCTOU race between the membership test and
+        # the dict lookup — build_universe() can replace _symbols concurrently.
+        state = self._symbols.get(symbol)
+        if state is None:
             return None
 
-        state = self._symbols[symbol]
         prom_cfg = self._scan_cfg.auto_promotion
 
         if not getattr(prom_cfg, 'enabled', True):
             return None
+
+        # Always update the volume MA *before* computing the spike ratio so it
+        # stays current whether or not a promotion fires this cycle.
+        # Use a time-weighted EMA so the effective half-life is ~7 days for all
+        # tiers (Tier-1 scans every 2 min, Tier-3 every 15 min).
+        elapsed = time.time() - state.last_scan if state.last_scan > 0 else 300.0
+        # Use a regime-dependent time constant:
+        # CHOPPY/VOLATILE → shorter τ (1 day) to react faster to volume spikes.
+        # Trending regimes → longer τ (3 days) to avoid false promotions on spikes.
+        _regime = _get_regime()
+        if _regime in ("CHOPPY", "VOLATILE", "VOLATILE_PANIC"):
+            tau = 1 * 24 * 3600.0   # 1-day time constant
+        else:
+            tau = 3 * 24 * 3600.0   # 3-day time constant
+        alpha = 1.0 - math.exp(-elapsed / tau)
+        state.volume_ma = state.volume_ma * (1.0 - alpha) + current_volume * alpha
 
         vol_ma = state.volume_ma if state.volume_ma > 0 else current_volume
         vol_spike_mult = current_volume / vol_ma if vol_ma > 0 else 1.0
@@ -323,9 +396,6 @@ class Scanner:
             logger.info(f"🚀 {symbol} promoted: Tier {from_tier} → Tier {to_tier} ({vol_spike_mult:.1f}x volume)")
 
             return (from_tier, to_tier)
-
-        # Update volume MA (EMA with 7-day decay)
-        state.volume_ma = state.volume_ma * 0.9 + current_volume * 0.1
 
         return None
 
@@ -360,8 +430,10 @@ class Scanner:
 
         # Use last known price from order book or symbol state
         # order_book bids/asks have prices — use mid of best bid/ask
-        best_bid = float(order_book.get('bids', [[1]])[0][0]) if order_book.get('bids') else 0
-        best_ask = float(order_book.get('asks', [[1]])[0][0]) if order_book.get('asks') else 0
+        _bids_raw = order_book.get('bids', [])
+        _asks_raw = order_book.get('asks', [])
+        best_bid = float(_bids_raw[0][0]) if _bids_raw and _bids_raw[0] else 0.0
+        best_ask = float(_asks_raw[0][0]) if _asks_raw and _asks_raw[0] else 0.0
         if best_bid > 0 and best_ask > 0:
             current_price = (best_bid + best_ask) / 2
         elif best_bid > 0:
@@ -369,31 +441,109 @@ class Scanner:
         elif best_ask > 0:
             current_price = best_ask
         else:
-            # Fallback: derive from 24h volume and an approximate trade count
-            # volume_24h is in quote (USDT), so we can't get price without volume in base
-            # Use 1.0 — this will cause USD threshold to behave as if unit price, which is
-            # better than the previous (volume/86400) which gives tokens/second
-            current_price = 1.0  # last resort; whale detection may fire too often for low-price coins
+            # Cannot derive price from an empty order book — skip rather than
+            # using a bogus fallback that would corrupt USD threshold comparisons.
+            return None
 
         bids = order_book.get('bids', [])
         asks = order_book.get('asks', [])
 
+        # ── compute spread for fill-probability scoring ─────────
+        spread_pct = abs(best_ask - best_bid) / current_price if best_ask > 0 and best_bid > 0 else 0.0
+
+        def _fill_prob(order_price: float, side: str, order_usd: float, threshold: float) -> float:
+            """
+            Quick fill-probability heuristic (0.0–1.0).
+            Factors: distance from mid, relative spread, size relative to threshold.
+            """
+            dist_pct  = abs(order_price - current_price) / current_price
+            size_ratio = min(order_usd / (threshold * 3), 1.0)   # saturates at 3× threshold
+            # Large spread or far-from-mid → lower fill probability
+            fill_score = max(0.0, 1.0 - dist_pct * 10 - spread_pct * 5) * (0.5 + size_ratio * 0.5)
+            return round(min(1.0, max(0.0, fill_score)), 3)
+
+        # Check up to 50 levels.  Detect both concentrated single-level whale
+        # walls AND distributed / iceberg orders accumulated within 1% of mid.
+        price_band = current_price * 0.01
         for side, orders in [('buy', bids), ('sell', asks)]:
-            for price, qty in orders[:20]:
-                price = float(price)
-                qty   = float(qty)
+            cumulative_usd = 0.0
+            for price, qty in orders[:50]:
+                price     = float(price)
+                qty       = float(qty)
                 order_usd = price * qty
 
+                # Single-level whale wall
                 if order_usd >= min_order_usd:
+                    # ── Persistence check (relative ratio) ─────────
+                    # Require prev_snapshot >= 50% of current snapshot so that the
+                    # persistence bar scales with order size rather than being
+                    # anchored to the fixed min_order_usd threshold.
+                    # This filters spoofed walls that vanish between polls while
+                    # still allowing genuine whales that grew since last snapshot.
+                    prev = self._whale_snapshot.setdefault(symbol, {}).get(side, 0.0)
+                    self._whale_snapshot[symbol][side] = order_usd
+                    if prev == 0.0 or (prev / order_usd) < 0.5:
+                        # First sighting or too small relative to current — record but don't fire yet
+                        logger.debug(
+                            f"🐋 Whale candidate (first sighting): "
+                            f"{symbol} {side} ${order_usd:,.0f} @ {price}"
+                        )
+                        break  # still check iceberg on same side below
+
                     self._whale_cooldown[symbol] = time.time()
-                    logger.info(f"🐋 Whale detected: {symbol} {side} ${order_usd:,.0f}")
+                    fp = _fill_prob(price, side, order_usd, min_order_usd)
+                    logger.info(
+                        f"🐋 Whale order: {symbol} {side} ${order_usd:,.0f} @ {price}"
+                        f"  fill_prob={fp:.2f}"
+                    )
                     return {
-                        'symbol': symbol,
-                        'side': side,
+                        'symbol':    symbol,
+                        'side':      side,
                         'order_usd': order_usd,
-                        'price': price,
-                        'qty': qty
+                        'price':     price,
+                        'qty':       qty,
+                        'fill_prob': fp,
+                        'spread_pct': spread_pct,
                     }
+
+                # Accumulate within the 1% mid-price band to catch iceberg orders
+                if abs(price - current_price) <= price_band:
+                    cumulative_usd += order_usd
+
+            # Distributed / iceberg whale — same relative persistence check
+            if cumulative_usd >= min_order_usd:
+                prev = self._whale_snapshot.setdefault(symbol, {}).get(f"iceberg_{side}", 0.0)
+                self._whale_snapshot[symbol][f"iceberg_{side}"] = cumulative_usd
+                if prev == 0.0 or (prev / cumulative_usd) < 0.5:
+                    logger.debug(
+                        f"🐋 Iceberg candidate (first sighting): "
+                        f"{symbol} {side} ${cumulative_usd:,.0f} cumulative"
+                    )
+                    continue
+
+                self._whale_cooldown[symbol] = time.time()
+                fp = _fill_prob(current_price, side, cumulative_usd, min_order_usd)
+                logger.info(
+                    f"🐋 Iceberg whale: {symbol} {side} "
+                    f"${cumulative_usd:,.0f} cumulative within 1% band"
+                    f"  fill_prob={fp:.2f}"
+                )
+                return {
+                    'symbol':    symbol,
+                    'side':      side,
+                    'order_usd': cumulative_usd,
+                    'price':     current_price,
+                    'qty':       cumulative_usd / current_price,
+                    'fill_prob': fp,
+                    'spread_pct': spread_pct,
+                }
+
+        # Order book checked; update snapshot for sides that saw no whale this cycle
+        # (so previous sightings don't carry indefinitely).
+        self._whale_snapshot.setdefault(symbol, {})
+        for side in ('buy', 'sell', 'iceberg_buy', 'iceberg_sell'):
+            if side not in self._whale_snapshot[symbol]:
+                self._whale_snapshot[symbol][side] = 0.0
 
         return None
 
@@ -408,14 +558,45 @@ class Scanner:
         if not ohlcv or len(ohlcv) < 30:
             return None
 
-        # Cooldown gate — StalkerEngine._watched was never consulted here,
-        # causing the same high-scoring symbol to alert every scan cycle.
-        import time as _time
+        # Cooldown gate — check before any expensive computation
         _last = self._watchlist_cooldown.get(symbol, 0)
-        if _time.time() - _last < self._watchlist_cooldown_secs:
+        if time.time() - _last < self._watchlist_cooldown_secs:
             return None
 
-        import pandas as pd
+        # Dynamic threshold: raise the bar in CHOPPY (signal flood risk),
+        # lower it in trending regimes (signals are scarcer but higher quality).
+        # Hysteresis: damp adjustments 25% within 10 min of a regime flip to
+        # prevent violent over-correction right after a transition.
+        _regime = _get_regime()
+        _recently_flipped = _regime_recently_changed(600)
+        if _regime == "CHOPPY":
+            _raw_adj = 8
+        elif _regime in ("VOLATILE", "VOLATILE_PANIC"):
+            _raw_adj = 5
+        elif _regime in ("BULL_TREND", "BEAR_TREND"):
+            _raw_adj = -5
+        else:
+            _raw_adj = 0
+        if _recently_flipped:
+            _raw_adj = round(_raw_adj * 0.75)   # damp by 25% during transition
+        _min_score = 50 + _raw_adj
+
+        # Regime-dependent dedup TTL:
+        # TREND → signals evolve slowly, 30 min window avoids duplicate noise.
+        # CHOPPY → signals flip quickly, 15 min window allows valid re-entries.
+        # Hysteresis: within 10 min of a regime flip, damp the TTL reduction by
+        # 25% so we don't instantly halve the dedup window on a noisy transition.
+        if _regime in ("BULL_TREND", "BEAR_TREND"):
+            _dedup_ttl = self._signal_dedup_ttl        # 30 min
+        else:
+            _raw_ttl_reduction = self._signal_dedup_ttl // 2
+            if _recently_flipped:
+                # Damp: interpolate 75% of the way from full TTL to half TTL
+                _damped_ttl = self._signal_dedup_ttl - round(_raw_ttl_reduction * 0.75)
+                _dedup_ttl = _damped_ttl
+            else:
+                _dedup_ttl = self._signal_dedup_ttl - _raw_ttl_reduction  # 15 min in chop/volatile
+
         df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
         df = df.astype({'open':float,'high':float,'low':float,'close':float,'volume':float})
 
@@ -433,7 +614,7 @@ class Scanner:
             window = closes[-bb_period:]
             bb_mean = np.mean(window)
             bb_std  = np.std(window)
-            bb_width = bb_std * 2 / bb_mean  # Relative bandwidth
+            bb_width = (bb_std * 4) / bb_mean if bb_mean > 0 else 0.0  # Full band width (upper - lower) / mean
 
             # Lowest bandwidth in 48 bars = squeeze
             if len(closes) >= 48:
@@ -441,7 +622,8 @@ class Scanner:
                 for i in range(len(closes) - 48, len(closes)):
                     w = closes[max(0,i-20):i]
                     if len(w) >= 10:
-                        widths_hist.append(np.std(w) / np.mean(w))
+                        m = np.mean(w)
+                        widths_hist.append((np.std(w) * 4) / m if m > 0 else 0.0)
                 if widths_hist and bb_width < np.percentile(widths_hist, 20):
                     score += 30
                     reasons.append("🌀 Bollinger squeeze — lowest volatility in 48 bars")
@@ -489,22 +671,36 @@ class Scanner:
                 score += 10
                 reasons.append(f"🔇 ATR compressed {atr_now/atr_old:.0%} of normal")
 
-        if score >= 50:
+        if score >= _min_score:
+            # Cross-path dedup: if stalker.StalkerEngine already raised this
+            # symbol / setup within the regime-dependent TTL window, don't double-fire.
+            setup_type = "pre_breakout"
+            dedup_key  = (symbol, setup_type)
+            now        = time.time()
+            if now - self._signal_dedup.get(dedup_key, 0) < _dedup_ttl:
+                return None
+
             await db.upsert_watchlist(symbol, float(score), reasons)
-            self._watchlist_cooldown[symbol] = _time.time()
-            return {'symbol': symbol, 'score': score, 'reasons': reasons}
+            self._watchlist_cooldown[symbol] = now
+            self._signal_dedup[dedup_key]    = now
+            return {'symbol': symbol, 'score': score, 'reasons': reasons, 'regime': _regime}
 
         return None
 
     @staticmethod
     def _quick_rsi(closes, period=14) -> float:
+        """RSI using Wilder's smoothed moving average (matches standard chart RSI)."""
         if len(closes) < period + 1:
             return 50.0
-        deltas = np.diff(closes[-(period+1):])
+        deltas = np.diff(closes)
         gains  = np.where(deltas > 0, deltas, 0.0)
         losses = np.where(deltas < 0, -deltas, 0.0)
-        avg_g  = np.mean(gains)
-        avg_l  = np.mean(losses)
+        # Seed with SMA of the first `period` bars, then apply Wilder's EMA
+        avg_g = float(np.mean(gains[:period]))
+        avg_l = float(np.mean(losses[:period]))
+        for g, l in zip(gains[period:], losses[period:]):
+            avg_g = (avg_g * (period - 1) + float(g)) / period
+            avg_l = (avg_l * (period - 1) + float(l)) / period
         if avg_l == 0:
             return 100.0
         return float(100 - 100 / (1 + avg_g / avg_l))
@@ -527,6 +723,3 @@ class Scanner:
 
 # ── Singleton ──────────────────────────────────────────────
 scanner = Scanner()
-
-from typing import Dict, List  # re-export for other modules
-from utils.formatting import fmt_price

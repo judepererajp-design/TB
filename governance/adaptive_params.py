@@ -218,6 +218,11 @@ class AdaptiveParamStore:
 
         The delta is clamped to ±step for the parameter so no single cycle
         can make a large jump.  The result is clamped to [lo, hi].
+
+        G-1 FIX: acquire _lock around the read-modify-write so that a
+        concurrent param_tuner.adjust() call (e.g. from a background task
+        racing with the diagnostic loop) cannot produce a torn write where
+        two increments are applied but only one is visible.
         """
         spec = PARAM_SPECS.get(key)
         if spec is None:
@@ -262,18 +267,23 @@ class AdaptiveParamStore:
         try:
             from data.database import db as _db
             state = await _db.load_learning_state(self._DB_KEY)
-            if state:
-                count = 0
-                for key, value in state.items():
-                    if key in PARAM_SPECS:
-                        spec = PARAM_SPECS[key]
-                        # Clamp loaded values to the current safe range in case
-                        # bounds were tightened since the last save.
-                        self._values[key] = max(spec.lo, min(spec.hi, float(value)))
-                        count += 1
-                logger.info("⚙️  adaptive_params: loaded %d values from DB", count)
-            else:
-                logger.info("⚙️  adaptive_params: no persisted state — using defaults")
+            # G-1 FIX: acquire _lock while mutating _values so that any adjust()
+            # call that fires between two awaits in this method (impossible in
+            # single-threaded asyncio, but guarded for clarity and future
+            # thread-pool usage) sees a fully-written state.
+            async with self._lock:
+                if state:
+                    count = 0
+                    for key, value in state.items():
+                        if key in PARAM_SPECS:
+                            spec = PARAM_SPECS[key]
+                            # Clamp loaded values to the current safe range in case
+                            # bounds were tightened since the last save.
+                            self._values[key] = max(spec.lo, min(spec.hi, float(value)))
+                            count += 1
+                    logger.info("⚙️  adaptive_params: loaded %d values from DB", count)
+                else:
+                    logger.info("⚙️  adaptive_params: no persisted state — using defaults")
             # Restore the pre-change snapshot if the tuner saved one before shutdown
             snap = await _db.load_learning_state(self._DB_KEY + "_snapshot")
             if snap and "values" in snap:
@@ -286,12 +296,17 @@ class AdaptiveParamStore:
         """Persist current values to the database."""
         try:
             from data.database import db as _db
-            await _db.save_learning_state(self._DB_KEY, self._values)
-            self._dirty = False
+            # G-1 FIX: take a consistent copy under lock before the first await
+            # so an interleaved adjust() cannot change _values mid-save.
+            async with self._lock:
+                values_copy = dict(self._values)
+                snapshot_copy = self._snapshot
+                self._dirty = False
+            await _db.save_learning_state(self._DB_KEY, values_copy)
             # Also persist the pre-change snapshot so that a restart between a
             # tuning cycle and the next check cycle doesn't lose the rollback data.
-            if self._snapshot is not None:
-                snap_values, snap_ts = self._snapshot
+            if snapshot_copy is not None:
+                snap_values, snap_ts = snapshot_copy
                 await _db.save_learning_state(
                     self._DB_KEY + "_snapshot", {"values": snap_values, "ts": snap_ts}
                 )

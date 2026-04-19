@@ -555,6 +555,12 @@ risk:
   correlation_adjustment: true
   max_correlated_positions: 2
 
+  # Liquidation distance guard — stop loss must clear estimated liquidation price
+  # by at least liq_min_buffer_pct of entry. Uses default_leverage as a conservative
+  # worst-case when the actual applied leverage is unknown at signal-validation time.
+  default_leverage: 10           # Assumed leverage for liquidation distance check
+  liq_min_buffer_pct: 0.02       # Stop loss must sit ≥2% of entry ABOVE (LONG) / BELOW (SHORT) liquidation price
+
   circuit_breaker:
     max_consecutive_losses: 4     # Was 3 — too tight on cold start with no prior data; tighten after 30+ trades
     max_losses_per_hour: 3        # Was 2 — 3 losses/hr still protective without hair-trigger pauses
@@ -562,6 +568,7 @@ risk:
     max_drawdown_pct: 0.08
     max_peak_drawdown_pct: 0.12   # T3-FIX: halt if capital drops 12% from today's intraday high
     max_absolute_day_loss_pct: 0.20  # ISSUE-8: hard kill if total day loss exceeds 20% — no cooldown, clears at midnight
+    max_losses_per_symbol: 2      # PS-1: block further trades on a symbol after 2 daily losses (resets at midnight)
 
 # ============================================================
 # DATABASE

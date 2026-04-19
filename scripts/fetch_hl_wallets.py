@@ -48,6 +48,16 @@ except ImportError:
 ROOT = Path(__file__).parent.parent
 SETTINGS_PATH = ROOT / "config" / "settings.yaml"
 
+
+def _is_eth_address(addr: str) -> bool:
+    """Return True only for valid-looking Ethereum hex addresses (0x + 40 hex chars)."""
+    return (
+        bool(addr)
+        and addr.startswith("0x")
+        and len(addr) == 42
+        and all(c in "0123456789abcdefABCDEF" for c in addr[2:])
+    )
+
 # ── Load API key from settings.yaml ──────────────────────────
 def load_api_key():
     content = SETTINGS_PATH.read_text()
@@ -82,7 +92,7 @@ def fetch_hl_leaderboard(top_n=50):
                 entry.get("address") or
                 entry.get("user", "")
             )
-            if not addr or len(addr) < 20:
+            if not _is_eth_address(addr):
                 continue
 
             # Extract all-time PnL from windowPerformances
@@ -126,7 +136,7 @@ def fetch_hl_leaderboard(top_n=50):
         wallets = []
         for entry in entries[:top_n]:
             addr = entry.get("ethAddress") or entry.get("address", "")
-            if addr and len(addr) >= 20:
+            if addr and _is_eth_address(addr):
                 wallets.append({"address": addr.lower(), "source": "hl_leaderboard", "pnl": 0.0})
         if wallets:
             print(f"  ✅ Got {len(wallets)} addresses from HL /info fallback")
@@ -159,7 +169,13 @@ def fetch_ht_money_printers(api_key, top_n=30):
                 wallets.append({
                     "address": addr.lower(),
                     "source": "ht_money_printer",
-                    "pnl": float(pos.get("unrealizedPnl", 0)),
+                    "pnl": float(
+                        pos.get("pnl") or
+                        pos.get("total_pnl") or
+                        pos.get("realizedPnl") or
+                        pos.get("unrealizedPnl") or
+                        0
+                    ),
                 })
             if len(wallets) >= top_n:
                 break
@@ -190,7 +206,7 @@ def fetch_ht_leaderboard(api_key, top_n=20):
             seen = set()
             for entry in entries[:top_n]:
                 addr = (entry.get("address") or entry.get("wallet") or entry.get("ethAddress") or "").lower()
-                if addr and len(addr) >= 20 and addr not in seen:
+                if _is_eth_address(addr) and addr not in seen:
                     seen.add(addr)
                     wallets.append({
                         "address": addr,
@@ -224,28 +240,36 @@ def write_wallets_to_settings(addresses):
         items = "\n".join(f'    - "{addr}"' for addr in addresses)
         wallet_yaml = f"    # Auto-fetched {time.strftime('%Y-%m-%d %H:%M')} — {len(addresses)} wallets\n{items}"
 
-    # Replace existing list
-    pattern = r'hypertracker_watched_wallets:\s*\n(?:    (?:[^\n]*)\n)*(?:    (?:[^\n]*))?'
-    replacement = f"hypertracker_watched_wallets:\n{wallet_yaml}"
+    # Replace existing list.
+    # Anchored multiline pattern: matches the key at column 0 followed by
+    # either an inline value ([]) or any number of indented list/comment lines.
+    pattern = r'(?m)^hypertracker_watched_wallets:[ \t]*(?:\[\][^\n]*)?\n(?:[ \t][^\n]*\n)*'
+    replacement = f"hypertracker_watched_wallets:\n{wallet_yaml}\n"
 
     new_content = re.sub(pattern, replacement, content, count=1)
     if new_content == content:
-        # Simple fallback: line-by-line replacement
+        # Fallback: line-by-line replacement that is careful to stop skipping
+        # only when it sees a non-indented, non-list, non-comment line so it
+        # cannot accidentally delete content from other YAML sections.
         lines = content.split("\n")
         out = []
         skip_until_next_key = False
         for line in lines:
-            if "hypertracker_watched_wallets:" in line:
-                out.append(f"hypertracker_watched_wallets:")
+            if "hypertracker_watched_wallets:" in line and not line.startswith(" "):
+                out.append("hypertracker_watched_wallets:")
                 out.append(wallet_yaml)
                 skip_until_next_key = True
                 continue
             if skip_until_next_key:
                 stripped = line.strip()
-                if stripped.startswith("-") or stripped.startswith("#") or stripped == "[]":
-                    continue
-                else:
+                # Stop skipping when we hit a non-indented key (new YAML section).
+                # Allow blank lines, comments, and list items to pass through
+                # as they're part of the current list block.
+                if stripped and not stripped.startswith("-") and not stripped.startswith("#") and not line.startswith(" ") and not line.startswith("\t"):
                     skip_until_next_key = False
+                    out.append(line)
+                # Otherwise silently drop the old list line
+                continue
             out.append(line)
         new_content = "\n".join(out)
 
@@ -282,7 +306,7 @@ def main():
     unique = []
     for w in all_wallets:
         addr = w["address"].lower()
-        if addr and addr not in seen and len(addr) >= 20:
+        if _is_eth_address(addr) and addr not in seen:
             seen.add(addr)
             unique.append(addr)
 

@@ -82,6 +82,13 @@ class CircuitBreaker:
         # P1-C: dedup guard — signal_id -> timestamp of last record_loss call
         self._recent_loss_ids: Dict[str, float] = {}
         self._dedup_window: float = 10.0  # seconds
+        # R-1 FIX: protect _recent_loss_ids with a lock so that simultaneous
+        # calls from outcome_monitor and the engine outcome handler cannot both
+        # pass the dedup check before either writes back the updated timestamp.
+        # Without the lock, two concurrent record_loss() calls for the same
+        # signal_id can read the same (missing) entry, both decide "not seen",
+        # and both write — doubling every counter.
+        self._dedup_lock: asyncio.Lock = asyncio.Lock()
 
         self._last_loss_time: float = 0.0
 
@@ -92,6 +99,11 @@ class CircuitBreaker:
         self._max_per_hour    = self._cb_cfg.get('max_losses_per_hour', 4)
         self._cooldown_mins   = self._cb_cfg.get('cooldown_minutes', 45)
         self._max_drawdown    = self._cb_cfg.get('max_drawdown_pct', 0.08)
+
+        # PS-1: Per-symbol daily loss cap — prevents one asset bleeding
+        # the entire daily budget while other symbols are blocked.
+        self._symbol_daily_losses: Dict[str, int] = {}
+        self._max_losses_per_symbol: int = self._cb_cfg.get('max_losses_per_symbol', 2)
 
     # ── C3 FIX: Persistent state restore / save ───────────────
 
@@ -245,6 +257,7 @@ class CircuitBreaker:
         loss_r: float = 1.0,
         signal_id: str = "",
         current_capital: float = -1.0,
+        symbol: str = "",
     ) -> bool:
         """
         Record a trade loss. Returns True if circuit breaker triggered.
@@ -253,14 +266,19 @@ class CircuitBreaker:
 
         # ── 1. SIGNAL DEDUP ──────────────────────────────────────────────
         if signal_id:
-            last_seen = self._recent_loss_ids.get(signal_id, 0)
-            if now - last_seen < self._dedup_window:
-                logger.warning(
-                    f"Circuit breaker: duplicate loss record ignored "
-                    f"(signal_id={signal_id}, {now - last_seen:.1f}s ago)"
-                )
-                return False
-            self._recent_loss_ids[signal_id] = now
+            # R-1 FIX: hold the dedup lock for the entire read-check-write
+            # sequence so two concurrent callers (outcome_monitor + engine
+            # outcome handler) cannot both pass the "not seen" check before
+            # either writes back the timestamp, which would double-count the loss.
+            async with self._dedup_lock:
+                last_seen = self._recent_loss_ids.get(signal_id, 0)
+                if now - last_seen < self._dedup_window:
+                    logger.warning(
+                        f"Circuit breaker: duplicate loss record ignored "
+                        f"(signal_id={signal_id}, {now - last_seen:.1f}s ago)"
+                    )
+                    return False
+                self._recent_loss_ids[signal_id] = now
 
         # Always prune stale dedup entries (not just when signal_id is provided)
         if self._recent_loss_ids:
@@ -278,6 +296,10 @@ class CircuitBreaker:
         self._last_loss_time      = now
         self._losses_this_hour   += 1
 
+        # PS-1: Per-symbol daily loss cap — increment symbol counter
+        if symbol:
+            self._symbol_daily_losses[symbol] = self._symbol_daily_losses.get(symbol, 0) + 1
+
         if current_capital >= 0:
             self._current_capital = current_capital
 
@@ -287,6 +309,7 @@ class CircuitBreaker:
             f"Loss recorded — consecutive: {self._consecutive_losses}, "
             f"this hour: {self._losses_this_hour}, "
             f"daily loss: {self._daily_loss_pct*100:.2f}%"
+            + (f", symbol_losses[{symbol}]={self._symbol_daily_losses[symbol]}" if symbol else "")
         )
 
         # C3 FIX: persist updated counters after every unique loss so restarts
@@ -309,6 +332,22 @@ class CircuitBreaker:
             await self._trigger(
                 f"{self._losses_this_hour} losses in one hour — "
                 f"market conditions unfavorable"
+            )
+            return True
+
+        # PS-1: Per-symbol daily loss cap — block new signals on this symbol
+        # but do NOT trigger the global circuit breaker.  Returned as True only
+        # so callers skip new entries; the engine should treat this as a symbol-
+        # level cooldown, not a portfolio-wide halt.
+        if symbol and self._symbol_daily_losses.get(symbol, 0) >= self._max_losses_per_symbol:
+            risk_log.info(
+                "SYMBOL_CAP | symbol=%s | losses=%d | max=%d",
+                symbol, self._symbol_daily_losses[symbol], self._max_losses_per_symbol,
+            )
+            logger.warning(
+                f"⚠️  Per-symbol loss cap reached: {symbol} has "
+                f"{self._symbol_daily_losses[symbol]} losses today "
+                f"(max {self._max_losses_per_symbol}) — blocking further trades on this symbol"
             )
             return True
 
@@ -348,7 +387,16 @@ class CircuitBreaker:
         return False
 
     def update_peak_capital(self, current_capital: float):
-        """Call whenever capital changes to track intraday peak."""
+        """Call whenever capital changes to track intraday peak.
+
+        R-2 FIX: when _peak_capital is 0 (first call after startup or midnight
+        reset, before the scan loop refreshes the value), seed it from
+        current_capital so the peak-equity drawdown gate is live immediately.
+        Without this, the guard ``if self._peak_capital > 0`` in record_loss()
+        is permanently False until the first update_peak_capital() call — leaving
+        the kill-switch dead for an unknown window that can span the bot's entire
+        startup phase.
+        """
         self._current_capital = current_capital
         if current_capital > self._peak_capital:
             self._peak_capital = current_capital
@@ -374,6 +422,7 @@ class CircuitBreaker:
         self._last_loss_time     = 0.0
         self._peak_capital       = 0.0
         self._current_capital    = 0.0
+        self._symbol_daily_losses.clear()  # PS-1: reset per-symbol counters each day
         if self._hard_kill_active:
             self._hard_kill_active = False
             self._is_active        = False
@@ -450,6 +499,7 @@ class CircuitBreaker:
             'peak_capital':        round(self._peak_capital, 2),
             'current_capital':     round(self._current_capital, 2),
             'hard_kill_active':    self._hard_kill_active,
+            'symbol_daily_losses': dict(self._symbol_daily_losses),
         }
 
 

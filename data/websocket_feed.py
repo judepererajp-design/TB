@@ -26,6 +26,7 @@ Architecture:
 import asyncio
 import json
 import logging
+import math
 import time
 from typing import Dict, List, Optional, Any, Callable
 
@@ -274,9 +275,11 @@ class WebSocketFeed:
         """Return a snapshot of all current prices."""
         return dict(self._prices)
 
-    @property
-    def is_connected(self) -> bool:
-        return self._connected and self._running
+    # D-1 FIX: removed second (stale) `is_connected` property that shadowed the
+    # correct per-shard implementation defined earlier in the class.  The duplicate
+    # `return self._connected and self._running` used a legacy flag that was never
+    # updated after shards were introduced, causing api_client fallback logic to
+    # treat the feed as disconnected even when all shards were healthy.
 
     def connection_stats(self) -> Dict:
         """Return connection diagnostics."""
@@ -356,6 +359,30 @@ class WebSocketFeed:
         elif event_type == "kline":
             self._handle_kline(data)
 
+    # D-3: Maximum believable price for any crypto pair quoted in USDT.
+    # A price above this (e.g. BTC/USDT at $10 million) is plainly malformed.
+    _MAX_SANE_PRICE: float = 1_000_000_000.0  # $1 billion per unit
+
+    def _validate_price(self, price: float, symbol: str) -> bool:
+        """Return True only if price is a finite, positive, sane value.
+
+        D-3 FIX: Binance occasionally emits malformed ticks (nan, inf,
+        negative, or astronomically large values) during exchange issues.
+        Accepting them without validation poisons all downstream math:
+        ``if price > entry_high`` becomes permanently True for +inf, and
+        NaN propagates silently through slippage and R-multiple calculations.
+        """
+        if not math.isfinite(price):
+            logger.warning("WS: non-finite price %.6g for %s — discarded", price, symbol)
+            return False
+        if price <= 0:
+            logger.warning("WS: non-positive price %.6g for %s — discarded", price, symbol)
+            return False
+        if price > self._MAX_SANE_PRICE:
+            logger.warning("WS: absurd price %.6g for %s — discarded", price, symbol)
+            return False
+        return True
+
     def _handle_ticker(self, data: dict):
         """Extract price from 24hr ticker event."""
         ws_symbol = data.get("s", "")  # e.g. "BTCUSDT"
@@ -368,7 +395,11 @@ class WebSocketFeed:
         except (ValueError, TypeError):
             return
 
+        # D-3 FIX: reject nan/inf/negative/absurd values before storing
         symbol = _to_exchange_symbol(ws_symbol.lower())
+        if not self._validate_price(price, symbol):
+            return
+
         self._prices[symbol] = price
         self._timestamps[symbol] = time.time()
 
@@ -388,7 +419,11 @@ class WebSocketFeed:
         except (ValueError, TypeError):
             return
 
+        # D-3 FIX: reject nan/inf/negative/absurd values before storing
         symbol = _to_exchange_symbol(ws_symbol.lower())
+        if not self._validate_price(price, symbol):
+            return
+
         self._prices[symbol] = price
         self._timestamps[symbol] = time.time()
 
@@ -433,6 +468,12 @@ class WebSocketFeed:
                 )
                 self._reconnections = (self._reconnections + 1) % WSConst.COUNTER_WRAP
                 self._connected = False
+                # D-2 FIX: clear stale price cache before reconnecting so that
+                # downstream consumers never read prices from the dead connection
+                # window.  Without this, entry-zone math and slippage estimates
+                # kept using the last known price for the entire reconnect period.
+                self._prices.clear()
+                self._timestamps.clear()
                 await self._reconnect_with_backoff()
 
     async def _reconnect_with_backoff(self):

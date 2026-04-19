@@ -222,7 +222,11 @@ class HarmonicDetector(BaseStrategy):
             return None
 
         def in_range(val, targets):
-            return any(abs(val - t) / t < tol for t in targets)
+            # P-3 FIX: guard against t <= 0 before dividing; a zero or negative
+            # target ratio (possible on near-zero price assets or data corruption)
+            # would produce ZeroDivisionError or a negative comparison that always
+            # passes, silently injecting a false harmonic match into trade decisions.
+            return any(t > 0 and abs(val - t) / t < tol for t in targets)
 
         # Calculate ratios
         xa = abs(a - x)
@@ -257,8 +261,12 @@ class HarmonicDetector(BaseStrategy):
             (bcd_ratio, ratios['BCD']),
             (xad_ratio, ratios['XAD']),
         ]:
-            best_target = min(targets, key=lambda t: abs(ratio - t) / t)
-            errors.append(abs(ratio - best_target) / best_target)
+            best_target = min(
+                (t for t in targets if t > 0),
+                key=lambda t: abs(ratio - t) / t,
+                default=targets[0] if targets else 1.0,
+            )
+            errors.append(abs(ratio - best_target) / best_target if best_target > 0 else 0.0)
 
         avg_error   = np.mean(errors)
         confidence  = max(55, 85 - avg_error * 200)

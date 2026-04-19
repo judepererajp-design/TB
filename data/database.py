@@ -2024,15 +2024,19 @@ class Database:
         """Strategy direction bias breakdown for Sentinel dashboard."""
         try:
             async with self._pool.reader() as conn:
-                cutoff = time.time() - hours * 3600
+                # D-6 FIX: signals.created_at is a TEXT ISO datetime column
+                # (DEFAULT (datetime('now'))). Comparing against time.time() (a
+                # REAL unix timestamp) produces a string vs float comparison that
+                # silently returns 0 rows on most SQLite builds.  Use SQLite's
+                # datetime arithmetic so both sides are the same type.
                 cursor = await conn.execute("""
                     SELECT strategy,
                            SUM(CASE WHEN direction='LONG'  THEN 1 ELSE 0 END) AS long_count,
                            SUM(CASE WHEN direction='SHORT' THEN 1 ELSE 0 END) AS short_count
                     FROM signals
-                    WHERE created_at >= ? AND strategy IS NOT NULL
+                    WHERE created_at > datetime('now', ?) AND strategy IS NOT NULL
                     GROUP BY strategy
-                """, (cutoff,))
+                """, (f"-{hours} hours",))
                 rows = await cursor.fetchall()
                 await cursor.close()
                 return [dict(r) for r in rows]
@@ -2104,7 +2108,12 @@ class Database:
         import time as _t
         now = _t.time()
         async with self._pool.writer() as conn:
-            await conn.execute("""
+            # D-7 FIX: use _exec() so the aiosqlite cursor is always closed via
+            # the context manager. Bare `await conn.execute(...)` without storing
+            # and closing the cursor leaves the cursor on the background thread
+            # queue, which causes all subsequent execute() calls on this connection
+            # to block indefinitely after ~10–20 writes.
+            await self._exec("""
                 INSERT OR REPLACE INTO card_state
                 (signal_id, message_id, chat_id, symbol, direction,
                  grade, state, confirmed, created_at, updated_at)
@@ -2136,12 +2145,13 @@ class Database:
         """Update card state when trade advances."""
         import time as _t
         async with self._pool.writer() as conn:
+            # D-7 FIX: use _exec() to close cursor immediately (see save_card_state)
             if confirmed is not None:
-                await conn.execute(
+                await self._exec(
                     "UPDATE card_state SET state=?,confirmed=?,updated_at=? WHERE signal_id=?",
                     (state, 1 if confirmed else 0, _t.time(), signal_id))
             else:
-                await conn.execute(
+                await self._exec(
                     "UPDATE card_state SET state=?,updated_at=? WHERE signal_id=?",
                     (state, _t.time(), signal_id))
             await conn.commit()
@@ -2149,7 +2159,8 @@ class Database:
     async def delete_card_state(self, signal_id: int):
         """Remove card state on signal close."""
         async with self._pool.writer() as conn:
-            await conn.execute(
+            # D-7 FIX: use _exec() to close cursor immediately (see save_card_state)
+            await self._exec(
                 "DELETE FROM card_state WHERE signal_id=?", (signal_id,))
             await conn.commit()
 

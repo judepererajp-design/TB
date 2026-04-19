@@ -160,11 +160,20 @@ class GeometricPatterns(BaseStrategy):
             return None
 
         current = closes[-1]
-        consol_high = max(highs[-10:])
-        consol_low  = min(lows[-10:])
+        # P-2 FIX: when the series is shorter than 10 bars, highs[-10:] / lows[-10:]
+        # silently use the entire series (Python negative-index slicing behaviour),
+        # producing a much wider consolidation range than intended and generating
+        # false breakout signals during warmup.  Guard explicitly.
+        _consol_lookback = min(10, len(highs))
+        consol_high = max(highs[-_consol_lookback:])
+        consol_low  = min(lows[-_consol_lookback:])
+        # Similarly guard the impulse direction check
+        _impulse_lookback = min(25, len(closes) - 1)
+        if _impulse_lookback < 10:
+            return None  # Not enough history to determine impulse direction
 
         # Bull flag: impulse was up, consolidation is sideways/slight down
-        if closes[-10] > closes[-25]:  # Upward impulse
+        if closes[-_consol_lookback] > closes[-_impulse_lookback]:  # Upward impulse
             # Breakout confirmation: current close above consolidation high
             # FIX GEO-1: was `current > consol_high - atr*0.2` which fired INSIDE the
             # consolidation (up to 0.2 ATR below the high). Changed to `+ atr*0.1`
@@ -181,7 +190,7 @@ class GeometricPatterns(BaseStrategy):
                 return ("LONG", "BullFlag", 68, notes, entry, stop_loss, tp1, tp2)
 
         # Bear flag: impulse was down, consolidation sideways/slight up
-        elif closes[-10] < closes[-25]:
+        elif closes[-_consol_lookback] < closes[-_impulse_lookback]:
             # FIX GEO-1: mirror fix for bear flag — must close BELOW consolidation low
             if current < consol_low - atr * 0.1:
                 entry      = current

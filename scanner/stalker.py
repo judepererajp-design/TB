@@ -18,7 +18,7 @@ The scanner then elevates its scan frequency.
 import asyncio
 import logging
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -31,6 +31,24 @@ from strategies.base import BaseStrategy
 logger = logging.getLogger(__name__)
 
 
+def _get_regime() -> str:
+    """Return the current regime string, or 'UNKNOWN' if not yet initialised."""
+    try:
+        from analyzers.regime import regime_analyzer
+        return str(regime_analyzer.regime.value)
+    except Exception:
+        return "UNKNOWN"
+
+
+def _regime_recently_changed(within_secs: int = 600) -> bool:
+    """Return True iff the regime changed within the last ``within_secs`` seconds."""
+    try:
+        from analyzers.regime import regime_analyzer
+        return regime_analyzer.is_recently_transitioned(within_secs)
+    except Exception:
+        return False
+
+
 class StalkerEngine:
     """
     Monitors potential pre-breakout setups and populates the watchlist.
@@ -40,7 +58,7 @@ class StalkerEngine:
     def __init__(self):
         self._watched: Dict[str, float] = {}     # symbol -> last_alert_time
         self._alert_cooldown = 3600              # 1 hour between repeat alerts
-        self._min_watch_score = 55               # Min score to add to watchlist
+        self._min_watch_score = 55               # Min score to add to watchlist (base)
 
     async def scan_symbol(self, symbol: str, ohlcv_1h: List, ohlcv_15m: List) -> Optional[Dict]:
         """
@@ -49,6 +67,46 @@ class StalkerEngine:
         """
         if not ohlcv_1h or len(ohlcv_1h) < 50:
             return None
+
+        # Check alert cooldown *before* any expensive computation
+        last_alert = self._watched.get(symbol, 0)
+        if time.time() - last_alert < self._alert_cooldown:
+            return None
+
+        # Dynamic threshold — mirrors scanner.stalker_scan logic
+        # Hysteresis: damp by 25% within 10 min of a regime flip.
+        _regime = _get_regime()
+        _recently_flipped = _regime_recently_changed(600)
+        if _regime == "CHOPPY":
+            _raw_adj = 8
+        elif _regime in ("VOLATILE", "VOLATILE_PANIC"):
+            _raw_adj = 5
+        elif _regime in ("BULL_TREND", "BEAR_TREND"):
+            _raw_adj = -5
+        else:
+            _raw_adj = 0
+        if _recently_flipped:
+            _raw_adj = round(_raw_adj * 0.75)
+        min_score = self._min_watch_score + _raw_adj
+
+        # Regime-dependent dedup TTL (mirrors scanner.stalker_scan).
+        # Read the base TTL from the scanner singleton so both paths stay in sync.
+        # Hysteresis: within 10 min of a regime flip, damp the TTL reduction by
+        # 25% so we don't instantly halve the dedup window on a noisy transition.
+        try:
+            from scanner.scanner import scanner as _scanner_singleton
+            _base_dedup_ttl = _scanner_singleton._signal_dedup_ttl
+        except Exception:
+            _base_dedup_ttl = 1800  # 30 min fallback
+        if _regime in ("BULL_TREND", "BEAR_TREND"):
+            _dedup_ttl = _base_dedup_ttl        # 30 min — signals evolve slowly
+        else:
+            _raw_ttl_reduction = _base_dedup_ttl // 2
+            if _recently_flipped:
+                _damped_ttl = _base_dedup_ttl - round(_raw_ttl_reduction * 0.75)
+                _dedup_ttl = _damped_ttl
+            else:
+                _dedup_ttl = _base_dedup_ttl - _raw_ttl_reduction  # 15 min in chop/volatile
 
         df = pd.DataFrame(ohlcv_1h, columns=['ts','open','high','low','close','volume'])
         df = df.astype({'open': float,'high': float,'low': float,'close': float,'volume': float})
@@ -100,18 +158,29 @@ class StalkerEngine:
                 score   += 15
                 reasons.append("⚡ 15m structure aligning with 1h")
 
-        if score < self._min_watch_score or not reasons:
+        if score < min_score or not reasons:
             return None
 
-        # Check cooldown
-        last_alert = self._watched.get(symbol, 0)
-        if time.time() - last_alert < self._alert_cooldown:
-            return None
+        # Cross-path dedup: consult scanner singleton's shared dedup dict so
+        # that StalkerEngine and scanner.stalker_scan don't both fire for the
+        # same symbol within the regime-dependent dedup TTL window.
+        setup_type = "pre_breakout"
+        dedup_key  = (symbol, setup_type)
+        now        = time.time()
+        try:
+            from scanner.scanner import scanner as _scanner_singleton
+            dedup = _scanner_singleton._signal_dedup
+            if now - dedup.get(dedup_key, 0) < _dedup_ttl:
+                return None
+            dedup[dedup_key] = now
+        except Exception:
+            pass   # Dedup unavailable — allow through rather than block
 
         return {
             'symbol':  symbol,
             'score':   score,
             'reasons': reasons,
+            'regime':  _regime,
         }
 
     async def process_result(self, result: Dict, publisher):
@@ -173,8 +242,8 @@ class StalkerEngine:
                 trs.append(max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])))
             return np.mean(trs[-p:]) if trs else 0
 
-        recent_atr = atr(highs[-20:], lows[-20:], closes[-20:], period)
-        long_atr   = atr(highs[-60:], lows[-60:], closes[-60:], period)
+        recent_atr = atr(highs[-14:], lows[-14:], closes[-14:], period)
+        long_atr   = atr(highs[-60:], lows[-60:], closes[-60:], 59)   # 60 bars → 59 TRs, average all
 
         if long_atr == 0:
             return False
@@ -212,14 +281,18 @@ class StalkerEngine:
             return False
 
         def rsi(c, p=14):
-            if len(c) < p+1:
+            if len(c) < p + 1:
                 return 50.0
-            d = np.diff(c[-(p+1):])
-            gains  = np.where(d > 0, d, 0)
-            losses = np.where(d < 0, -d, 0)
-            avg_g  = np.mean(gains)  or 1e-10
-            avg_l  = np.mean(losses) or 1e-10
-            return 100 - (100 / (1 + avg_g/avg_l))
+            d = np.diff(c)
+            gains  = np.where(d > 0, d, 0.0)
+            losses = np.where(d < 0, -d, 0.0)
+            # Seed with SMA, then apply Wilder's smoothing (matches standard charts)
+            avg_g = float(np.mean(gains[:p])) or 1e-10
+            avg_l = float(np.mean(losses[:p])) or 1e-10
+            for g, l in zip(gains[p:], losses[p:]):
+                avg_g = (avg_g * (p - 1) + float(g)) / p
+                avg_l = (avg_l * (p - 1) + float(l)) / p
+            return 100 - (100 / (1 + avg_g / avg_l))
 
         rsi_vals = [rsi(closes[:i]) for i in range(len(closes)-15, len(closes))]
         coiling  = all(40 < v < 60 for v in rsi_vals[-8:])
@@ -253,7 +326,7 @@ class StalkerEngine:
         volumes = df15['volume'].values
 
         avg_vol = np.mean(volumes[-20:])
-        cur_vol = volumes[-1]
+        cur_vol = volumes[-2]  # Use last completed (closed) candle; [-1] is still forming
 
         # Volume spike on recent bars
         vol_spike = cur_vol > avg_vol * 1.8

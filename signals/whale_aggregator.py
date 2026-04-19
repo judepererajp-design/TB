@@ -34,6 +34,8 @@ class WhaleEvent:
     order_usd: float
     price: float
     qty: float
+    fill_prob: float = 0.5    # 0.0–1.0 heuristic fill probability
+    spread_pct: float = 0.0   # bid/ask spread at detection time
     timestamp: float = field(default_factory=time.time)
 
 
@@ -86,6 +88,8 @@ class WhaleAggregator:
             order_usd=whale['order_usd'],
             price=whale.get('price', 0),
             qty=whale.get('qty', 0),
+            fill_prob=whale.get('fill_prob', 0.5),
+            spread_pct=whale.get('spread_pct', 0.0),
         )
         self._buffer.append(event)
         self._total_events += 1
@@ -310,13 +314,17 @@ class WhaleAggregator:
         min_events: int = 2,
         min_dominance_ratio: float = 0.60,
     ) -> str:
-        """Return LONG/SHORT when recent whale flow has a clear dominant side."""
+        """Return LONG/SHORT when recent whale flow has a clear dominant side.
+
+        Volume is weighted by fill_prob so high-probability walls contribute
+        more than far-from-mid walls that are unlikely to be filled.
+        """
         recent = self.get_recent_events(symbol=symbol, max_age_secs=max_age_secs)
         if len(recent) < min_events:
             return ""
 
-        buy_vol = sum(e.order_usd for e in recent if e.side == "buy")
-        sell_vol = sum(e.order_usd for e in recent if e.side == "sell")
+        buy_vol = sum(e.order_usd * e.fill_prob for e in recent if e.side == "buy")
+        sell_vol = sum(e.order_usd * e.fill_prob for e in recent if e.side == "sell")
         total_vol = buy_vol + sell_vol
         if total_vol <= 0:
             return ""
