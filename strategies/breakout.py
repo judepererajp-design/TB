@@ -190,31 +190,56 @@ class BreakoutStrategy(BaseStrategy):
         else:
             return None
 
-        # BR-Q5: breakout quality scoring — body % and distance from level.
-        # A real breakout candle closes well into new territory with a solid body;
-        # a wick-only probe or doji at the level is a low-quality entry signal.
+        # BR-Q5: breakout quality scoring — directional close position and distance.
+        # body_pct alone is misleading: a large red rejection candle also has a big body.
+        # Instead we score WHERE the close sits within the candle range (direction-aware):
+        #   LONG:  close near the HIGH is conviction;  close near the LOW is rejection.
+        #   SHORT: close near the LOW is conviction;   close near the HIGH is rejection.
+        _q5_bonus = 0
         candle_range = current_high - current_low
         if candle_range > 0:
-            body = abs(current_close - current_open)
-            body_pct = body / candle_range           # 0.0 – 1.0
-            if body_pct >= 0.65:                     # Marubozu-class: strong conviction
-                confidence += 5
-                confluence.append(f"💪 Strong body: {body_pct:.0%} of candle range")
-            elif body_pct < 0.35:                    # Doji / wick: low conviction
-                confidence -= 5
-                confluence.append(f"⚠️ Weak body: {body_pct:.0%} — possible wick probe")
+            close_pos = (current_close - current_low) / candle_range  # 0.0 (bottom) – 1.0 (top)
+            if direction == "LONG":
+                if close_pos >= 0.7:                  # Closed near top — strong bullish candle
+                    _q5_bonus += 5
+                    confluence.append(f"💪 Bullish close position: {close_pos:.0%} of range")
+                elif close_pos < 0.35:                # Closed near bottom — rejection candle
+                    _q5_bonus -= 5
+                    confluence.append(f"⚠️ Rejection close: {close_pos:.0%} of range")
+            else:  # SHORT
+                if close_pos <= 0.3:                  # Closed near bottom — strong bearish candle
+                    _q5_bonus += 5
+                    confluence.append(f"💪 Bearish close position: {close_pos:.0%} of range")
+                elif close_pos > 0.65:                # Closed near top — rejection / wick probe
+                    _q5_bonus -= 5
+                    confluence.append(f"⚠️ Rejection close: {close_pos:.0%} of range")
 
         # BR-Q5b: distance from level — price well beyond the channel adds conviction.
-        if direction == "LONG" and atr > 0:
-            dist_atr = (current_close - channel_high) / atr
-            if dist_atr >= 0.5:
-                confidence += 3
-                confluence.append(f"📐 Strong close: {dist_atr:.1f}× ATR beyond level")
-        elif direction == "SHORT" and atr > 0:
-            dist_atr = (channel_low - current_close) / atr
-            if dist_atr >= 0.5:
-                confidence += 3
-                confluence.append(f"📐 Strong close: {dist_atr:.1f}× ATR beyond level")
+        # Threshold: max(0.5×ATR, 0.2% of price) so low-ATR assets still need real distance.
+        if atr > 0:
+            _dist_thresh = max(0.5 * atr, current_close * 0.002)
+            if direction == "LONG":
+                dist = current_close - channel_high
+            else:
+                dist = channel_low - current_close
+            if dist >= _dist_thresh:
+                _q5_bonus += 3
+                confluence.append(f"📐 Strong close: {dist / atr:.1f}× ATR beyond level")
+
+        # BR-Q5c: cap quality bonuses at +8 so correlated signals (close position +
+        # ATR distance) cannot inflate weak signals beyond the vol bonus weight.
+        confidence += max(-5, min(8, _q5_bonus))
+
+        # BR-Q5d: soft 2-bar continuation bonus.  Requiring previous_close > channel_high
+        # as a HARD gate would block ~70% of valid first-bar breakouts.  Instead, a +3
+        # bonus rewards confirmed continuation without eliminating single-bar entries.
+        _prev_close = closes[-2] if len(closes) >= 2 else current_close
+        if direction == "LONG" and _prev_close > channel_high * 0.995:
+            confidence += 3
+            confluence.append("🔄 2-bar continuation above level")
+        elif direction == "SHORT" and _prev_close < channel_low * 1.005:
+            confidence += 3
+            confluence.append("🔄 2-bar continuation below level")
 
         # DIRECTIONAL-GATE FIX: Block counter-trend breakouts in strong trends.
         # In BEAR_TREND, a breakout LONG is fighting weekly structure. In BULL_TREND,
