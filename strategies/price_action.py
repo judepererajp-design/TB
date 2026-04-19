@@ -287,12 +287,16 @@ class PriceAction(BaseStrategy):
             confidence += 8
         if _vol_rising:
             confidence += 4  # rising volume sequence builds credibility for the move
+            # Magnitude bonus: was the leading volume also above-average?
+            if avg_vol > 0 and volumes[-2] > 1.5 * avg_vol:
+                confidence += 2  # above-average leading volume = stronger build-up
         if len(signal_patterns) > 1:
             confidence += 5 * (len(signal_patterns) - 1)
 
         # ── Prior-bar context for single-bar patterns ─────────────────────
         # For PinBar and Doji — which are single-bar signals — check that the
-        # preceding bar's direction is consistent with the expected reversal:
+        # preceding bar's direction is consistent with the expected reversal.
+        # Strength is ATR-normalized: a large prior body = stronger context signal.
         # LONG setup: prior bar should be bearish (downmove to fade)
         # SHORT setup: prior bar should be bullish (upmove to fade)
         _single_bar_patterns = {"PinBar", "Doji"}
@@ -301,18 +305,20 @@ class PriceAction(BaseStrategy):
         _prior_bar_conflicts = False
         if _is_single_bar and len(opens) >= 2:
             _prior_close_vs_open = closes[-2] - opens[-2]
+            _context_strength = abs(_prior_close_vs_open) / atr if atr > 0 else 0.0
+            _context_adj = min(5, _context_strength * 5)
             if direction == "LONG" and _prior_close_vs_open < 0:
                 _prior_bar_confirms = True   # prior sell-off confirms reversal context
-                confidence += 3
+                confidence += _context_adj
             elif direction == "SHORT" and _prior_close_vs_open > 0:
                 _prior_bar_confirms = True
-                confidence += 3
+                confidence += _context_adj
             elif direction == "LONG" and _prior_close_vs_open > 0:
                 _prior_bar_conflicts = True  # prior bar moving with us = chasing
-                confidence -= 3
+                confidence -= _context_adj
             elif direction == "SHORT" and _prior_close_vs_open < 0:
                 _prior_bar_conflicts = True
-                confidence -= 3
+                confidence -= _context_adj
 
         # ── Entry / SL / TP levels ────────────────────────────────────────
         # FIX: SL buffer used entry_zone_tight (0.10 ATR) — far too thin.

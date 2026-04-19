@@ -108,10 +108,12 @@ class ReversalStrategy(BaseStrategy):
 
         # ── RSI divergence check ──────────────────────────────
         if req_div:
-            divergence = self._check_divergence(closes, highs, lows, direction, lookback=20)
-            if divergence:
-                confluence.append(f"✅ RSI divergence confirmed")
-                confidence += 10
+            div_strength = self._check_divergence(closes, highs, lows, direction, lookback=20)
+            if div_strength > 0:
+                # Scale bonus: +10 at minimum qualifying divergence, up to +18 for strong
+                _div_bonus = int(min(18, 10 + (div_strength - 1.0) * 8))
+                confluence.append(f"✅ RSI divergence confirmed (strength: {div_strength:.1f}x, +{_div_bonus})")
+                confidence += _div_bonus
             else:
                 confidence -= 5  # No divergence = weaker setup
 
@@ -128,6 +130,10 @@ class ReversalStrategy(BaseStrategy):
         if vol_ratio >= vol_conf_mult:
             confluence.append(f"✅ Volume: {vol_ratio:.1f}x average")
             confidence += 5
+        # Climactic volume: genuine capitulation/euphoria spikes are 3–5× normal.
+        if vol_ratio > 3.0:
+            confluence.append(f"🔥 Climactic volume: {vol_ratio:.1f}x — capitulation signal (+4)")
+            confidence += 4
 
         # ── Targets ───────────────────────────────────────────
         # Wire timeframe+volatility-scaled TPs for realistic targets per setup class
@@ -186,9 +192,16 @@ class ReversalStrategy(BaseStrategy):
             return None
         return _candidate
 
-    def _check_divergence(self, closes, highs, lows, direction, lookback=20) -> bool:
+    def _check_divergence(self, closes, highs, lows, direction, lookback=20) -> float:
         """
-        Detect RSI divergence over last N bars.
+        Detect RSI divergence over last N bars and return a strength score.
+
+        Returns:
+            0.0  — no qualifying divergence
+            ≥1.0 — divergence detected; score = rsi_delta / MIN_RSI_DELTA so that
+                   1.0 = minimum qualifying (delta=5), 2.0 = double minimum (delta=10).
+                   Higher scores indicate stronger divergences that warrant more
+                   confidence. Callers should cap total bonus (e.g. min(18, …)).
 
         Requires two genuine swing extremes within the lookback window:
         - A swing low/high is a local extreme where both adjacent bars are higher/lower.
@@ -216,7 +229,7 @@ class ReversalStrategy(BaseStrategy):
             lows   = np.array(lows,   dtype=float)
 
             if len(closes) < lookback + 14:
-                return False
+                return 0.0
 
             window_highs = highs[-lookback:]
             window_lows  = lows[-lookback:]
@@ -226,7 +239,7 @@ class ReversalStrategy(BaseStrategy):
                 # Find the two most recent swing lows (local minima) in the window
                 swing_lows = self._find_swing_points_in_window(window_lows, is_high=False)
                 if len(swing_lows) < 2:
-                    return False
+                    return 0.0
 
                 # Most recent swing low and the one before it
                 recent_idx, recent_price = swing_lows[-1]
@@ -234,49 +247,55 @@ class ReversalStrategy(BaseStrategy):
 
                 # Price must make a lower low
                 if recent_price >= prior_price:
-                    return False
+                    return 0.0
 
                 # RSI at both swing lows
                 abs_recent = len(closes) - lookback + recent_idx
                 abs_prior  = len(closes) - lookback + prior_idx
                 rsi_series = self._calculate_rsi_series(closes, 14)
                 if abs_recent >= len(rsi_series) or abs_prior >= len(rsi_series):
-                    return False
+                    return 0.0
                 rsi_recent = rsi_series[abs_recent]
                 rsi_prior  = rsi_series[abs_prior]
                 if not np.isfinite(rsi_recent) or not np.isfinite(rsi_prior):
-                    return False
+                    return 0.0
 
                 # RSI must be higher at lower price, by at least MIN_RSI_DELTA
-                return (rsi_recent - rsi_prior) >= MIN_RSI_DELTA
+                rsi_delta = rsi_recent - rsi_prior
+                if rsi_delta < MIN_RSI_DELTA:
+                    return 0.0
+                return rsi_delta / MIN_RSI_DELTA
 
             else:
                 # Bearish divergence: price makes higher high, RSI makes lower high
                 swing_highs = self._find_swing_points_in_window(window_highs, is_high=True)
                 if len(swing_highs) < 2:
-                    return False
+                    return 0.0
 
                 recent_idx, recent_price = swing_highs[-1]
                 prior_idx, prior_price   = swing_highs[-2]
 
                 if recent_price <= prior_price:
-                    return False
+                    return 0.0
 
                 abs_recent = len(closes) - lookback + recent_idx
                 abs_prior  = len(closes) - lookback + prior_idx
                 rsi_series = self._calculate_rsi_series(closes, 14)
                 if abs_recent >= len(rsi_series) or abs_prior >= len(rsi_series):
-                    return False
+                    return 0.0
                 rsi_recent = rsi_series[abs_recent]
                 rsi_prior  = rsi_series[abs_prior]
                 if not np.isfinite(rsi_recent) or not np.isfinite(rsi_prior):
-                    return False
+                    return 0.0
 
                 # RSI must be lower at higher price, by at least MIN_RSI_DELTA
-                return (rsi_prior - rsi_recent) >= MIN_RSI_DELTA
+                rsi_delta = rsi_prior - rsi_recent
+                if rsi_delta < MIN_RSI_DELTA:
+                    return 0.0
+                return rsi_delta / MIN_RSI_DELTA
 
         except Exception:
-            return False
+            return 0.0
 
     @staticmethod
     def _calculate_rsi_series(closes, period: int = 14):

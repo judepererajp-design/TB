@@ -88,12 +88,17 @@ class RangeScalperStrategy(BaseStrategy):
         # ── BTC breakout gate (RS-Q4) ─────────────────────────────
         # If BTC is breaking out / strongly trending, alt ranges are unstable.
         # Use the already-fetched MarketStateResult for BTC momentum data.
+        # Hard reject at 2.5% 6h momentum; soft −6 confidence at 1.5% (graded).
+        _btc_soft_penalty = 0
         if _ms_result is not None:
             _btc_momentum_abs = abs(_ms_result.btc_momentum_fast)
             _btc_bias = _ms_result.direction_bias
             _btc_breakout_thresh = 0.025  # 2.5% BTC 6h momentum = trending, not ranging
+            _btc_soft_thresh = 0.015      # 1.5% — elevated momentum, degrade confidence
             if _btc_momentum_abs >= _btc_breakout_thresh and _btc_bias != "NEUTRAL":
                 return None  # BTC strongly trending — alt ranges unreliable
+            elif _btc_momentum_abs >= _btc_soft_thresh and _btc_bias != "NEUTRAL":
+                _btc_soft_penalty = 6   # Moderate BTC move — reduce confidence, don't block
 
         # ── 1. Get candle data ────────────────────────────────────
         tf = '15m'  # Scalper uses 15m for entries
@@ -155,6 +160,30 @@ class RangeScalperStrategy(BaseStrategy):
         supply_zone_start = range_high - edge_band
         demand_zone_start = range_low + edge_band
 
+        # ── Range decay detection ─────────────────────────────────
+        # Detects a range that is quietly tightening (compression) while
+        # intrabar volatility is rising — a pre-breakout pattern that invalidates
+        # range-scalping assumptions.  Compare older vs newer sub-window of the
+        # lookback without external state; also checks ATR acceleration.
+        _range_decaying = False
+        _half = max(10, lookback // 2)
+        if len(highs) >= lookback:
+            _early_range = (
+                float(np.percentile(highs[-lookback:-_half], 90))
+                - float(np.percentile(lows[-lookback:-_half], 10))
+            )
+            _recent_range_local = (
+                float(np.percentile(highs[-_half:], 90))
+                - float(np.percentile(lows[-_half:], 10))
+            )
+            _atr_slow = self.calculate_atr(highs, lows, closes, min(30, len(closes) - 1))
+            _range_decaying = (
+                _early_range > 0
+                and _recent_range_local < _early_range * 0.80  # range shrinking ≥20%
+                and _atr_slow > 0
+                and atr > _atr_slow * 0.95  # intrabar volatility not yet contracting
+            )
+
         # ── 4. Determine if price is at a zone edge ───────────────
         direction = None
         zone_name = ""
@@ -170,7 +199,7 @@ class RangeScalperStrategy(BaseStrategy):
 
         # ── 5. Confluence checks ──────────────────────────────────
         confluence = []
-        confidence = conf_base + _ms_compression_penalty
+        confidence = conf_base + _ms_compression_penalty - _btc_soft_penalty
 
         # a) Zone position — deeper in zone = higher confidence
         if direction == "LONG":
@@ -254,6 +283,11 @@ class RangeScalperStrategy(BaseStrategy):
         # Need at least: zone + one confirmation (rejection, RSI, or volume)
         if not has_rejection and rsi > rsi_os and rsi < rsi_ob and vol_ratio < vol_mult:
             return None  # No confirmation at all — skip
+
+        # g) Range decay penalty — range tightening while vol rising = pre-breakout
+        if _range_decaying:
+            confidence -= 4
+            confluence.append("⚠️ Range decay: structure compressing with rising vol (-4)")
 
         # ── 7. Calculate levels ───────────────────────────────────
         # Targets: midpoint (equilibrium), NOT trend continuation
