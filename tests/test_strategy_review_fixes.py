@@ -29,7 +29,7 @@ def test_price_action_has_vol_rising_and_prior_bar_context():
     assert '_vol_rising' in src
     assert 'volumes[-2] > volumes[-3] > volumes[-4]' in src
     assert '_is_single_bar' in src
-    assert '_prior_bearish' in src
+    assert '_prior_bar_confirms' in src
 
 
 def test_range_scalper_uses_bos_hold_and_absolute_stop_boundaries():
@@ -54,7 +54,7 @@ def test_range_scalper_btc_breakout_gate():
     from strategies.range_scalper import RangeScalperStrategy
 
     src = inspect.getsource(RangeScalperStrategy)
-    assert 'btc_mom' in src
+    assert '_btc_momentum_abs' in src
     assert '_btc_breakout_thresh' in src
 
 

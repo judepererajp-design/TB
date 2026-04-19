@@ -209,7 +209,7 @@ class PriceAction(BaseStrategy):
         # Round numbers: dynamic magnitude scaled to instrument price.
         # Keep coarse levels for high-priced assets and usable decimals for sub-$1.
         if current_price <= 0:
-            logger.debug(f"PriceAction invalid current price for {symbol}: {current_price}")
+            logger.warning(f"PriceAction: invalid current price for {symbol}: {current_price}")
             return None
         _log10 = math.floor(math.log10(current_price))
         if current_price >= 1.0:
@@ -297,16 +297,21 @@ class PriceAction(BaseStrategy):
         # SHORT setup: prior bar should be bullish (upmove to fade)
         _single_bar_patterns = {"PinBar", "Doji"}
         _is_single_bar = primary_pattern["pattern"] in _single_bar_patterns
+        _prior_bar_confirms = False
+        _prior_bar_conflicts = False
         if _is_single_bar and len(opens) >= 2:
-            _prior_bearish = closes[-2] < opens[-2]
-            _prior_bullish = closes[-2] > opens[-2]
-            if direction == "LONG" and _prior_bearish:
-                confidence += 3  # prior sell-off confirms reversal context
-            elif direction == "SHORT" and _prior_bullish:
+            _prior_close_vs_open = closes[-2] - opens[-2]
+            if direction == "LONG" and _prior_close_vs_open < 0:
+                _prior_bar_confirms = True   # prior sell-off confirms reversal context
                 confidence += 3
-            elif direction == "LONG" and _prior_bullish:
-                confidence -= 3  # prior bar moving with us = chasing, not reversing
-            elif direction == "SHORT" and _prior_bearish:
+            elif direction == "SHORT" and _prior_close_vs_open > 0:
+                _prior_bar_confirms = True
+                confidence += 3
+            elif direction == "LONG" and _prior_close_vs_open > 0:
+                _prior_bar_conflicts = True  # prior bar moving with us = chasing
+                confidence -= 3
+            elif direction == "SHORT" and _prior_close_vs_open < 0:
+                _prior_bar_conflicts = True
                 confidence -= 3
 
         # ── Entry / SL / TP levels ────────────────────────────────────────
@@ -375,12 +380,11 @@ class PriceAction(BaseStrategy):
             confluence.append(f"✅ Volume: {vol_ratio:.1f}x average")
         if _vol_rising:
             confluence.append("✅ Volume trend: rising sequence (x3 bars)")
-        if _is_single_bar and len(opens) >= 2:
-            _prior_ctx = "prior bar confirms" if (
-                (direction == "LONG" and closes[-2] < opens[-2]) or
-                (direction == "SHORT" and closes[-2] > opens[-2])
-            ) else "prior bar neutral/conflicting"
-            confluence.append(f"📊 Single-bar pattern context: {_prior_ctx}")
+        if _is_single_bar:
+            if _prior_bar_confirms:
+                confluence.append("✅ Prior bar: confirms reversal context (+3)")
+            elif _prior_bar_conflicts:
+                confluence.append("⚠️ Prior bar: conflicts with signal direction (-3)")
         if _mtf_mismatch:
             confluence.append(f"⚠️ HTF mismatch: 4h {_htf_bias['bias']} vs signal {direction} (-{_mtf_penalty})")
         confluence.append(f"📊 Regime: {regime} | TF: {tf}")

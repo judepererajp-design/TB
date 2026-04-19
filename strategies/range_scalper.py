@@ -89,10 +89,10 @@ class RangeScalperStrategy(BaseStrategy):
         # If BTC is breaking out / strongly trending, alt ranges are unstable.
         # Use the already-fetched MarketStateResult for BTC momentum data.
         if _ms_result is not None:
-            _btc_mom = abs(_ms_result.btc_momentum_fast)
+            _btc_momentum_abs = abs(_ms_result.btc_momentum_fast)
             _btc_bias = _ms_result.direction_bias
             _btc_breakout_thresh = 0.025  # 2.5% BTC 6h momentum = trending, not ranging
-            if _btc_mom >= _btc_breakout_thresh and _btc_bias != "NEUTRAL":
+            if _btc_momentum_abs >= _btc_breakout_thresh and _btc_bias != "NEUTRAL":
                 return None  # BTC strongly trending — alt ranges unreliable
 
         # ── 1. Get candle data ────────────────────────────────────

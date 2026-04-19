@@ -245,8 +245,8 @@ strategies:
     confidence_base: 72
     min_volume_24h: 3000000
     rsi_period: 14
-    rsi_oversold: 20
-    rsi_overbought: 80
+    rsi_oversold: 20   # Crypto-appropriate: RSI regularly extends to 15 before reverting
+    rsi_overbought: 80  # Crypto-appropriate: RSI regularly extends to 85+ before reverting
     bb_period: 20
     bb_std: 2.5
     require_divergence: true
