@@ -154,14 +154,17 @@ class Momentum(BaseStrategy):
 
         direction = "LONG" if bullish_cross else "SHORT"
 
-        # Whipsaw / cooldown approximation — a crossover that reverses within 4
-        # bars and crosses again is almost always a chop trap.  Detect a prior sign
-        # flip in the 5 bars immediately before the current crossover window.
+        # Whipsaw / cooldown — a crossover that reverses within a few bars and
+        # crosses again is almost always a chop trap.  Detect prior sign flips in
+        # the 5 bars immediately before the current crossover window.
+        # 2+ reversals = pure chop → hard block.  1 reversal → soft −10 penalty.
         _whipsaw_penalty = 0
         if len(macd_line) >= 8:
             _prior_diff        = macd_line[-8:-3] - signal_line[-8:-3]
             _prior_sign_chg    = int(np.sum(np.diff(np.sign(_prior_diff)) != 0))
-            if _prior_sign_chg >= 1:
+            if _prior_sign_chg >= 2:
+                return None  # Pure chop — 2+ flips in 5 bars
+            elif _prior_sign_chg == 1:
                 _whipsaw_penalty = -10  # Prior crossover failed — lower conviction
 
         # Early histogram buildup bonus — if the histogram was already narrowing
@@ -247,6 +250,9 @@ class Momentum(BaseStrategy):
         confidence  += adx_bonus
         if vol_ratio >= 3.0:
             confidence += 5
+        # Rising volume participation — trending volume is stronger than a single spike.
+        if len(volumes) >= 4 and volumes[-2] > volumes[-3] > volumes[-4]:
+            confidence += 3
 
         # ── Entry / SL / TP ───────────────────────────────────────────────
         current_close = closes[-1]
@@ -305,6 +311,8 @@ class Momentum(BaseStrategy):
             confluence.append(f"⚠️ Prior crossover reversal detected — chop risk ({_whipsaw_penalty})")
         if _early_momentum_bonus > 0:
             confluence.append(f"✅ Pre-cross histogram buildup (+{_early_momentum_bonus})")
+        if len(volumes) >= 4 and volumes[-2] > volumes[-3] > volumes[-4]:
+            confluence.append("✅ Rising volume participation (+3)")
 
         confidence = min(93, max(40, confidence))
 

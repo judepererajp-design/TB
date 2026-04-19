@@ -59,9 +59,13 @@ class MeanReversion(BaseStrategy):
         # is likely to get swept by the macro move regardless of local CHOPPY regime.
         # Graduated: soft −10 confidence at btc_adx > 30; hard block at btc_adx > 40.
         _btc_adx = 0.0
+        _btc_bearish = False
         try:
             from analyzers.regime import regime_analyzer as _ra
-            _btc_adx = float(getattr(_ra, '_btc_adx', 0.0))
+            _btc_adx      = float(getattr(_ra, '_btc_adx', 0.0))
+            # _btc_ma_bullish is True when fast MA > slow MA (BTC uptrend)
+            _btc_ma_bull  = bool(getattr(_ra, '_btc_ma_bullish', True))
+            _btc_bearish  = not _btc_ma_bull
         except Exception:
             pass
         _btc_trend_penalty = 0
@@ -138,6 +142,15 @@ class MeanReversion(BaseStrategy):
         if _sign_changes < 4:
             return None
 
+        # Range stability guard — if recent volatility is expanding relative to
+        # the earlier part of the window, the range is likely breaking out.
+        # Split the window into a baseline (first half) and recent (second half).
+        _half = max(4, z_period // 2)
+        _std_baseline = float(np.std(closes[-z_period:-_half], ddof=1)) if z_period > _half else std
+        _std_recent   = float(np.std(closes[-_half:], ddof=1))
+        if _std_baseline > 1e-12 and _std_recent > _std_baseline * 1.3:
+            return None
+
         # ── ADX filter — ensure not trending ─────────────────────────────
         adx = self.calculate_adx(highs, lows, closes, period=14)
         if adx >= max_adx:
@@ -183,6 +196,13 @@ class MeanReversion(BaseStrategy):
         if adx < 20:
             confidence += 5   # Very rangy = higher reversion probability
         confidence += _btc_trend_penalty
+        # MR-1: Directional asymmetry — alts drop harder than they bounce in BTC
+        # downtrends, so LONGs are more likely to get swept.  Apply an extra −6
+        # when BTC's own trend is bearish (fast MA below slow MA).
+        _btc_dir_penalty = 0
+        if _btc_bearish and direction == "LONG":
+            _btc_dir_penalty = -6
+        confidence += _btc_dir_penalty
 
         # ── Entry zone ────────────────────────────────────────────────────
         buf = atr * rp.entry_zone_tight
@@ -237,6 +257,8 @@ class MeanReversion(BaseStrategy):
             confluence.append("✅ Rejection candle at extreme")
         if _btc_trend_penalty != 0:
             confluence.append(f"⚠️ BTC trending (ADX {_btc_adx:.0f}) — macro risk ({_btc_trend_penalty})")
+        if _btc_dir_penalty != 0:
+            confluence.append(f"⚠️ BTC bearish — LONG alt correlation risk ({_btc_dir_penalty})")
         confluence.append(f"📊 Regime: {regime} | TF: {tf}")
         confluence.append(f"🎯 R:R {rr_ratio:.2f} | ATR: {fmt_price(atr)}")
 
