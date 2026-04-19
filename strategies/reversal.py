@@ -271,6 +271,11 @@ class ReversalStrategy(BaseStrategy):
 
     @staticmethod
     def _calculate_rsi_series(closes, period: int = 14):
+        def _to_rsi(avg_gain: float, avg_loss: float) -> float:
+            if avg_loss == 0:
+                return 100.0
+            return 100.0 - (100.0 / (1.0 + (avg_gain / avg_loss)))
+
         closes = np.asarray(closes, dtype=float)
         rsi = np.full(len(closes), np.nan, dtype=float)
         if len(closes) < period + 1:
@@ -280,12 +285,12 @@ class ReversalStrategy(BaseStrategy):
         losses = np.where(deltas < 0, -deltas, 0.0)
         avg_gain = np.mean(gains[:period])
         avg_loss = np.mean(losses[:period])
-        rsi[period] = 100.0 if avg_loss == 0 else 100.0 - (100.0 / (1.0 + (avg_gain / avg_loss)))
+        rsi[period] = _to_rsi(avg_gain, avg_loss)
         for i in range(period, len(gains)):
             avg_gain = (avg_gain * (period - 1) + gains[i]) / period
             avg_loss = (avg_loss * (period - 1) + losses[i]) / period
             idx = i + 1
-            rsi[idx] = 100.0 if avg_loss == 0 else 100.0 - (100.0 / (1.0 + (avg_gain / avg_loss)))
+            rsi[idx] = _to_rsi(avg_gain, avg_loss)
         return rsi
 
     @staticmethod

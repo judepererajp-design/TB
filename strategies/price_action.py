@@ -47,6 +47,7 @@ _PATTERN_WEIGHTS = {
 # 0.35 × 1.2 ATR ≈ 0.42 ATR — tight enough to respect pattern invalidation,
 # wide enough to survive market noise (spreads, slippage, minor wicks).
 _SL_BUFFER_FACTOR = 0.35
+_TP_MIN_GAP_ATR = 0.2
 
 
 class PriceAction(BaseStrategy):
@@ -208,6 +209,7 @@ class PriceAction(BaseStrategy):
         # Round numbers: dynamic magnitude scaled to instrument price.
         # Keep coarse levels for high-priced assets and usable decimals for sub-$1.
         if current_price <= 0:
+            logger.debug(f"PriceAction invalid current price for {symbol}: {current_price}")
             return None
         _log10 = math.floor(math.log10(current_price))
         if current_price >= 1.0:
@@ -304,7 +306,7 @@ class PriceAction(BaseStrategy):
             tp2_candidates = [sh for sh in swing_highs[:3] if sh > entry_high + atr]
             tp2 = min(tp2_candidates) if tp2_candidates else (entry_high + atr * rp.volatility_scaled_tp2(tf, vp))
             tp3 = entry_high + atr * rp.volatility_scaled_tp3(tf, vp)
-            _tp_gap = atr * 0.2
+            _tp_gap = atr * float(getattr(self._cfg, "tp_min_gap_atr", _TP_MIN_GAP_ATR))
             tp2 = max(tp2, tp1 + _tp_gap)
             tp3 = max(tp3, tp2 + _tp_gap)
         else:
@@ -322,7 +324,7 @@ class PriceAction(BaseStrategy):
             tp2_candidates = [sl for sl in swing_lows[:3] if sl < entry_low - atr]
             tp2 = max(tp2_candidates) if tp2_candidates else (entry_low - atr * rp.volatility_scaled_tp2(tf, vp))
             tp3 = entry_low - atr * rp.volatility_scaled_tp3(tf, vp)
-            _tp_gap = atr * 0.2
+            _tp_gap = atr * float(getattr(self._cfg, "tp_min_gap_atr", _TP_MIN_GAP_ATR))
             tp2 = min(tp2, tp1 - _tp_gap)
             tp3 = min(tp3, tp2 - _tp_gap)
 

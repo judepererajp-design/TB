@@ -273,6 +273,7 @@ strategies:
     vol_confirmation_mult: 1.5
     mtf_mismatch_penalty: 8
     reject_mtf_mismatch: false
+    tp_min_gap_atr: 0.2
     patterns:
       pin_bar: true
       engulfing: true
