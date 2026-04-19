@@ -54,6 +54,22 @@ class MeanReversion(BaseStrategy):
         if regime not in self.VALID_REGIMES:
             return None
 
+        # BTC trend guard — alts move with ~80% BTC correlation in trending markets.
+        # If BTC's own ADX indicates it is trending strongly, mean-reverting an alt
+        # is likely to get swept by the macro move regardless of local CHOPPY regime.
+        # Graduated: soft −10 confidence at btc_adx > 30; hard block at btc_adx > 40.
+        _btc_adx = 0.0
+        try:
+            from analyzers.regime import regime_analyzer as _ra
+            _btc_adx = float(getattr(_ra, '_btc_adx', 0.0))
+        except Exception:
+            pass
+        _btc_trend_penalty = 0
+        if _btc_adx > 40:
+            return None
+        elif _btc_adx > 30:
+            _btc_trend_penalty = -10
+
         tf = "1h"
         for candidate_tf in ("1h", "15m"):
             if candidate_tf in ohlcv_dict and len(ohlcv_dict[candidate_tf]) >= 60:
@@ -76,6 +92,14 @@ class MeanReversion(BaseStrategy):
         if atr == 0:
             return None
 
+        # ATR expansion guard — if volatility is expanding (range breaking), fading
+        # via mean-reversion is exactly wrong.  Use the 50-bar ATR as a baseline; if
+        # the current 14-bar ATR exceeds it by 50%, the market is no longer ranging.
+        if len(closes) >= 50:
+            atr_50 = self.calculate_atr(highs, lows, closes, period=50)
+            if atr_50 > 0 and atr > atr_50 * 1.5:
+                return None
+
         z_period    = getattr(self._cfg, "z_score_period", 48)
         z_threshold = getattr(self._cfg, "z_score_threshold", 2.2)
         max_adx     = getattr(self._cfg, "max_adx", 25)
@@ -96,7 +120,10 @@ class MeanReversion(BaseStrategy):
             return None
 
         current_price = closes[-1]
-        z_score       = (current_price - mean) / std
+        # Clamp z-score to ±4.0 — crypto fat tails can produce z-scores of 6+
+        # which are mathematically valid but practically indistinguishable from 4.
+        # Clamping prevents extreme values from inflating the confidence bonus.
+        z_score = float(max(-4.0, min(4.0, (current_price - mean) / std)))
 
         if abs(z_score) < z_threshold:
             return None
@@ -155,6 +182,7 @@ class MeanReversion(BaseStrategy):
             confidence += 8
         if adx < 20:
             confidence += 5   # Very rangy = higher reversion probability
+        confidence += _btc_trend_penalty
 
         # ── Entry zone ────────────────────────────────────────────────────
         buf = atr * rp.entry_zone_tight
@@ -207,6 +235,8 @@ class MeanReversion(BaseStrategy):
         ]
         if is_rejection:
             confluence.append("✅ Rejection candle at extreme")
+        if _btc_trend_penalty != 0:
+            confluence.append(f"⚠️ BTC trending (ADX {_btc_adx:.0f}) — macro risk ({_btc_trend_penalty})")
         confluence.append(f"📊 Regime: {regime} | TF: {tf}")
         confluence.append(f"🎯 R:R {rr_ratio:.2f} | ATR: {fmt_price(atr)}")
 

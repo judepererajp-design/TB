@@ -128,6 +128,12 @@ class Momentum(BaseStrategy):
         vol_surge    = getattr(self._cfg, "volume_surge_mult", 2.0)
         confidence_base = getattr(self._cfg, "confidence_base", 70)
 
+        # Dynamic vol_surge: in high-volatility instruments (high ATR%), random
+        # volume spikes are more common, so require proportionally more to confirm.
+        # Scale is modest: ±0-50% of the base threshold.
+        _atr_pct = atr / closes[-1] if closes[-1] > 0 else 0.02
+        _effective_vol_surge = vol_surge * (1.0 + min(0.5, _atr_pct * 10))
+
         # ── MACD calculation ──────────────────────────────────────────────
         macd_line, signal_line, histogram = _macd(closes, fast_period, slow_period, sig_period)
 
@@ -147,6 +153,26 @@ class Momentum(BaseStrategy):
             return None
 
         direction = "LONG" if bullish_cross else "SHORT"
+
+        # Whipsaw / cooldown approximation — a crossover that reverses within 4
+        # bars and crosses again is almost always a chop trap.  Detect a prior sign
+        # flip in the 5 bars immediately before the current crossover window.
+        _whipsaw_penalty = 0
+        if len(macd_line) >= 8:
+            _prior_diff        = macd_line[-8:-3] - signal_line[-8:-3]
+            _prior_sign_chg    = int(np.sum(np.diff(np.sign(_prior_diff)) != 0))
+            if _prior_sign_chg >= 1:
+                _whipsaw_penalty = -10  # Prior crossover failed — lower conviction
+
+        # Early histogram buildup bonus — if the histogram was already narrowing
+        # toward zero in the bar *before* the crossover, momentum was building
+        # early.  This partially offsets the late-entry nature of MACD.
+        _early_momentum_bonus = 0
+        if len(histogram) >= 4:
+            if bullish_cross and histogram[-4] < histogram[-3] < 0:
+                _early_momentum_bonus = 4   # Pre-cross bullish momentum already building
+            elif bearish_cross and histogram[-4] > histogram[-3] > 0:
+                _early_momentum_bonus = 4   # Pre-cross bearish momentum already building
 
         # ── Regime direction gate — soft penalty for counter-trend signals ──
         # Hard-blocking all counter-trend signals in trending regimes misses
@@ -174,7 +200,7 @@ class Momentum(BaseStrategy):
         # a 20-bar average suppresses the ratio for early-in-period checks.
         avg_vol   = float(np.mean(volumes[-20:]))
         vol_ratio = volumes[-2] / avg_vol if avg_vol > 0 else 1.0
-        if vol_ratio < vol_surge:
+        if vol_ratio < _effective_vol_surge:
             return None
 
         # ── EMA pullback confirmation ─────────────────────────────────────
@@ -187,14 +213,20 @@ class Momentum(BaseStrategy):
         _ema_ref = None
 
         # Check proximity to 9 EMA first (faster, tighter entries)
+        # M-3: Scale thresholds by ATR% so volatile alts aren't unfairly penalised.
+        # At low volatility (ATR ~1% of price) threshold = 0.6; at high volatility
+        # (ATR ~5%) threshold = min(2.0, 0.6 + scaling).
+        _near_9_thresh  = max(0.6, min(2.0, _atr_pct * 40))
+        _near_21_thresh = _near_9_thresh + 0.4
+
         _dist_9  = abs(closes[-1] - ema_9[-1]) / atr if atr > 0 else 99
         _dist_21 = abs(closes[-1] - ema_21[-1]) / atr if atr > 0 else 99
 
-        if _dist_9 < 0.6:
+        if _dist_9 < _near_9_thresh:
             _near_ema = True
             _ema_pullback_bonus = 6
             _ema_ref = ema_9[-1]
-        elif _dist_21 < 0.8:
+        elif _dist_21 < _near_21_thresh:
             _near_ema = True
             _ema_pullback_bonus = 4
             _ema_ref = ema_21[-1]
@@ -205,6 +237,8 @@ class Momentum(BaseStrategy):
         confidence = float(confidence_base)
         confidence += _ms_bonus
         confidence += _counter_trend_penalty
+        confidence += _whipsaw_penalty
+        confidence += _early_momentum_bonus
         confidence += _ema_pullback_bonus
         confidence += 5   # MACD crossover
         if histogram_expanding:
@@ -267,6 +301,10 @@ class Momentum(BaseStrategy):
             confluence.append(f"🧠 Market State: {getattr(_ms_state, 'value', 'N/A')} ({'+' if _ms_bonus >= 0 else ''}{_ms_bonus})")
         if _counter_trend_penalty != 0:
             confluence.append(f"⚠️ Counter-trend signal in {regime} ({_counter_trend_penalty})")
+        if _whipsaw_penalty != 0:
+            confluence.append(f"⚠️ Prior crossover reversal detected — chop risk ({_whipsaw_penalty})")
+        if _early_momentum_bonus > 0:
+            confluence.append(f"✅ Pre-cross histogram buildup (+{_early_momentum_bonus})")
 
         confidence = min(93, max(40, confidence))
 
@@ -291,8 +329,11 @@ class Momentum(BaseStrategy):
                 "histogram": float(histogram[-2]),
                 "adx": adx,
                 "vol_ratio": vol_ratio,
+                "vol_surge_threshold": round(_effective_vol_surge, 2),
                 "regime": regime,
                 "market_state": getattr(_ms_state, 'value', None),
+                "whipsaw_penalty": _whipsaw_penalty,
+                "early_momentum_bonus": _early_momentum_bonus,
             },
             regime=regime,
         )
