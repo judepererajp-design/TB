@@ -14,6 +14,7 @@ import pandas as pd
 from typing import Dict, List, Optional
 
 from config.loader import cfg
+from config.constants import STRATEGY_VALID_REGIMES
 from strategies.base import BaseStrategy, SignalResult, SignalDirection, cfg_min_rr
 from utils.formatting import fmt_price
 from utils.risk_params import rp
@@ -33,7 +34,7 @@ class BreakoutStrategy(BaseStrategy):
     # volume confirmation so only institutional-grade moves qualify.
     # In CHOPPY markets, Donchian breakouts fail > 70% of the time
     # — price breaks the level then immediately reverts (stop hunt).
-    VALID_REGIMES = {"BULL_TREND", "BEAR_TREND", "VOLATILE"}
+    VALID_REGIMES = STRATEGY_VALID_REGIMES["InstitutionalBreakout"]
 
     # DIRECTIONAL-GATE FIX: Per-direction regime map, matching MomentumStrategy.
     # In BEAR_TREND, only SHORT breakouts are allowed (breakout longs in bear
@@ -50,6 +51,13 @@ class BreakoutStrategy(BaseStrategy):
         self._cfg = cfg.strategies.breakout
 
     async def analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:
+        try:
+            return await self._analyze(symbol, ohlcv_dict)
+        except Exception as e:
+            self._record_analyze_error(self.name, e, symbol)
+            return None
+
+    async def _analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:
         # ── Regime gate (fastest check — before any computation) ─────────
         try:
             from analyzers.regime import regime_analyzer

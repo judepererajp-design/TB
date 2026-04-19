@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 
 from config.loader import cfg
-from config.constants import Penalties
+from config.constants import Penalties, STRATEGY_VALID_REGIMES
 from strategies.base import BaseStrategy, SignalResult, SignalDirection, cfg_min_rr
 from utils.formatting import fmt_price
 from utils.risk_params import rp, compute_vol_percentile
@@ -36,7 +36,7 @@ class SmartMoneyConcepts(BaseStrategy):
     # at max 2 signals/hr and 90 min_confidence.  Previously VOLATILE_PANIC
     # was missing, so the strategy ran fully then got blocked downstream
     # instead of short-circuiting early via the VALID_REGIMES check.
-    VALID_REGIMES = {"BULL_TREND", "BEAR_TREND", "VOLATILE", "VOLATILE_PANIC", "CHOPPY", "UNKNOWN"}
+    VALID_REGIMES = STRATEGY_VALID_REGIMES["SmartMoneyConcepts"]
 
     # Direction-aware regime confidence: with-trend gets a boost, counter-trend
     # gets a penalty.  Previously flat +8 for both BULL/BEAR regardless of
@@ -82,7 +82,7 @@ class SmartMoneyConcepts(BaseStrategy):
         try:
             return await self._analyze(symbol, ohlcv_dict)
         except Exception as e:
-            logger.debug(f"SMC.analyze {symbol}: {e}")
+            self._record_analyze_error(self.name, e, symbol)
             return None
 
     async def _analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:
@@ -818,6 +818,14 @@ class SmartMoneyConcepts(BaseStrategy):
             tp1        = max(_tp1_support) if _tp1_support else tp1_calc
             tp2        = entry_ref - risk_dist * rp.volatility_scaled_tp2(tf, vp)
             tp3        = entry_ref - risk_dist * rp.volatility_scaled_tp3(tf, vp)
+
+        # X4: enforce tp1 < tp2 < tp3 ordering (tight volatility_scaled values can collapse)
+        if direction == "LONG":
+            tp2 = max(tp2, tp1 + atr * 0.1)
+            tp3 = max(tp3, tp2 + atr * 0.1)
+        else:
+            tp2 = min(tp2, tp1 - atr * 0.1)
+            tp3 = min(tp3, tp2 - atr * 0.1)
 
         if risk <= 0:
             return None

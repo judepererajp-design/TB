@@ -45,6 +45,13 @@ class RangeScalperStrategy(BaseStrategy):
             self._cfg = None
 
     async def analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:
+        try:
+            return await self._analyze(symbol, ohlcv_dict)
+        except Exception as e:
+            self._record_analyze_error(self.name, e, symbol)
+            return None
+
+    async def _analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:
         # ── 0. Check regime — only trade in ranging/choppy markets ──
         # RangeScalper is a mean-reversion strategy — it MUST NOT fire in:
         # - VOLATILE: high ATR, whipsaw candles, no mean to revert to

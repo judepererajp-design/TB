@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 
 from config.loader import cfg
+from config.constants import STRATEGY_VALID_REGIMES
 from strategies.base import BaseStrategy, SignalResult, SignalDirection, cfg_min_rr
 from utils.formatting import fmt_price
 from utils.risk_params import rp, compute_vol_percentile
@@ -43,7 +44,7 @@ class FundingRateArb(BaseStrategy):
     description = "Fade overcrowded funding extremes with OI confirmation"
 
     # Funding is regime-independent — works in all market conditions
-    VALID_REGIMES = {"BULL_TREND", "BEAR_TREND", "VOLATILE", "CHOPPY", "UNKNOWN"}
+    VALID_REGIMES = STRATEGY_VALID_REGIMES["FundingRateArb"]
 
     def __init__(self):
         super().__init__()
@@ -55,7 +56,7 @@ class FundingRateArb(BaseStrategy):
         try:
             return await self._analyze(symbol, ohlcv_dict)
         except Exception as e:
-            logger.debug(f"FundingRateArb.analyze {symbol}: {e}")
+            self._record_analyze_error(self.name, e, symbol)
             return None
 
     async def _analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:

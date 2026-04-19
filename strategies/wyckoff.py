@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 
 from config.loader import cfg
+from config.constants import STRATEGY_VALID_REGIMES
 from strategies.base import BaseStrategy, SignalResult, SignalDirection, cfg_min_rr
 from utils.formatting import fmt_price
 from utils.risk_params import rp, compute_vol_percentile
@@ -42,7 +43,7 @@ class WyckoffAccDist(BaseStrategy):
     # Wyckoff accumulation/distribution works in all regimes, but direction must
     # align with trend to receive full confidence.  Counter-trend setups (LONG in
     # BEAR_TREND, SHORT in BULL_TREND) receive a penalty; neutral regimes are flat.
-    VALID_REGIMES = {"BULL_TREND", "BEAR_TREND", "VOLATILE", "CHOPPY", "UNKNOWN"}
+    VALID_REGIMES = STRATEGY_VALID_REGIMES["WyckoffAccDist"]
 
     _REGIME_CONF_WITH_TREND = {
         "BULL_TREND":  +8,
@@ -67,7 +68,7 @@ class WyckoffAccDist(BaseStrategy):
         try:
             return await self._analyze(symbol, ohlcv_dict)
         except Exception as e:
-            logger.debug(f"WyckoffAccDist.analyze {symbol}: {e}")
+            self._record_analyze_error(self.name, e, symbol)
             return None
 
     async def _analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:

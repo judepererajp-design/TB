@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 
 from config.loader import cfg
+from config.constants import STRATEGY_VALID_REGIMES
 from strategies.base import BaseStrategy, SignalResult, SignalDirection, cfg_min_rr
 from utils.formatting import fmt_price
 from utils.risk_params import rp, compute_vol_percentile
@@ -54,7 +55,7 @@ class Momentum(BaseStrategy):
     name = "Momentum"
     description = "MACD crossover with ADX trend filter and volume surge"
 
-    VALID_REGIMES = {"BULL_TREND", "BEAR_TREND", "VOLATILE"}
+    VALID_REGIMES = STRATEGY_VALID_REGIMES["Momentum"]
 
     _REGIME_DIR_CONSTRAINT = {
         "BULL_TREND": "LONG",
@@ -70,7 +71,7 @@ class Momentum(BaseStrategy):
         try:
             return await self._analyze(symbol, ohlcv_dict)
         except Exception as e:
-            logger.debug(f"Momentum.analyze {symbol}: {e}")
+            self._record_analyze_error(self.name, e, symbol)
             return None
 
     async def _analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:

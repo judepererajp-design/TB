@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 
 from config.loader import cfg
-from config.constants import Penalties
+from config.constants import Penalties, STRATEGY_VALID_REGIMES
 from strategies.base import BaseStrategy, SignalResult, SignalDirection, cfg_min_rr
 from utils.formatting import fmt_price
 from utils.risk_params import rp, compute_vol_percentile
@@ -56,7 +56,7 @@ class PriceAction(BaseStrategy):
     description = "Candlestick pattern detection at key structural levels"
 
     # Price action patterns work in any regime — regime bonus/penalty applied
-    VALID_REGIMES = {"BULL_TREND", "BEAR_TREND", "VOLATILE", "CHOPPY", "UNKNOWN"}
+    VALID_REGIMES = STRATEGY_VALID_REGIMES["PriceAction"]
 
     # Direction-aware regime confidence: with-trend gets a boost, counter-trend
     # gets a penalty.  Same fix as SMC — prevents inflating counter-trend signals.
@@ -83,7 +83,7 @@ class PriceAction(BaseStrategy):
         try:
             return await self._analyze(symbol, ohlcv_dict)
         except Exception as e:
-            logger.debug(f"PriceAction.analyze {symbol}: {e}")
+            self._record_analyze_error(self.name, e, symbol)
             return None
 
     async def _analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:

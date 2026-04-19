@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 
 from config.loader import cfg
+from config.constants import STRATEGY_VALID_REGIMES
 from strategies.base import BaseStrategy, SignalResult, SignalDirection, cfg_min_rr
 from utils.formatting import fmt_price
 from utils.risk_params import rp
@@ -90,7 +91,7 @@ class ElliottWave(BaseStrategy):
     name = "ElliottWave"
     description = "Simplified 5-wave Elliott count targeting Wave 3 and Wave 5 entries"
 
-    VALID_REGIMES = {"BULL_TREND", "BEAR_TREND"}
+    VALID_REGIMES = STRATEGY_VALID_REGIMES["ElliottWave"]
 
     # Direction-aware regime confidence: Elliott Wave 3/5 entries should
     # follow the macro trend.  Counter-trend wave counts are lower probability.
@@ -111,8 +112,7 @@ class ElliottWave(BaseStrategy):
         try:
             return await self._analyze(symbol, ohlcv_dict)
         except Exception as e:
-            # EW-6: warn (not debug) so unexpected exceptions surface in production logs.
-            logger.warning(f"ElliottWave.analyze {symbol}: {e}")
+            self._record_analyze_error(self.name, e, symbol)
             return None
 
     async def _analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:

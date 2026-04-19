@@ -14,6 +14,7 @@ import pandas as pd
 from typing import Dict, Optional
 
 from config.loader import cfg
+from config.constants import STRATEGY_VALID_REGIMES
 from strategies.base import BaseStrategy, SignalResult, SignalDirection, cfg_min_rr
 from utils.formatting import fmt_price
 from utils.risk_params import rp, compute_vol_percentile
@@ -31,13 +32,20 @@ class ReversalStrategy(BaseStrategy):
     # VOLATILE is excluded by default: extreme directional moves can extend 3-5×
     # before reverting, making early fades high-risk. Set allow_volatile: true in
     # config to opt back in (e.g., if scanning for panic capitulation setups).
-    VALID_REGIMES = {"CHOPPY"}
+    VALID_REGIMES = STRATEGY_VALID_REGIMES["ExtremeReversal"]
 
     def __init__(self):
         super().__init__()
         self._cfg = cfg.strategies.reversal
 
     async def analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:
+        try:
+            return await self._analyze(symbol, ohlcv_dict)
+        except Exception as e:
+            self._record_analyze_error(self.name, e, symbol)
+            return None
+
+    async def _analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:
         # ── Regime gate ───────────────────────────────────────────────────
         try:
             from analyzers.regime import regime_analyzer
@@ -187,7 +195,10 @@ class ReversalStrategy(BaseStrategy):
             tp3 = min(tp3, tp2 - atr * 0.3)
 
         risk = abs(current - stop_loss)
-        rr   = abs(tp2 - current) / risk if risk > 0 else 0
+        if risk <= 0:
+            return None
+        # X3: use calculate_effective_rr for consistent worst-case fill
+        rr   = self.calculate_effective_rr(direction, entry_low, entry_high, stop_loss, tp2)
         if rr < cfg_min_rr("intraday"):
             return None
 
