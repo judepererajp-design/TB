@@ -48,6 +48,8 @@ class FundingRateArb(BaseStrategy):
     def __init__(self):
         super().__init__()
         self._cfg = cfg.strategies.funding_arb
+        # Per-symbol cache of the previous funding delta for flip detection (B).
+        self._prev_funding_delta: Dict[str, float] = {}
 
     async def analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:
         try:
@@ -164,6 +166,38 @@ class FundingRateArb(BaseStrategy):
         effective_min_oi = min_oi_change * (1.0 + 3.0 * atr_frac)
         oi_confirms = abs(oi_change) >= effective_min_oi
 
+        # ── Pre-compute normalized delta (used for confidence AND TP2 shrink) ──
+        # Normalize by active_threshold so the same raw Δpp has proportional
+        # meaning regardless of asset.  ≥1.0 = meaningful, <0.2 = noise.
+        active_threshold = long_threshold if direction == "SHORT" else abs(short_threshold)
+        normalized_delta = (
+            funding_delta_pct / active_threshold
+            if active_threshold > 0 and funding_delta_pct != 0.0
+            else 0.0
+        )
+
+        # ── Acceleration flip (B) ─────────────────────────────────────────
+        # A sign-flip in funding delta (e.g. rising → falling) often marks an
+        # inflection point.  Reward when the flip aligns with the fade thesis:
+        #   SHORT fade: prev_delta > 0 (funding rising) → now < 0 (falling)
+        #   LONG  fade: prev_delta < 0 (funding falling) → now > 0 (rising)
+        _flip_bonus = 0.0
+        _prev_delta = self._prev_funding_delta.get(symbol)
+        if (
+            _prev_delta is not None
+            and funding_delta_pct != 0.0
+            and _prev_delta != 0.0
+        ):
+            _flipped = (funding_delta_pct > 0) != (_prev_delta > 0)
+            if _flipped:
+                _fade_aligned = (
+                    (direction == "SHORT" and funding_delta_pct < 0) or
+                    (direction == "LONG"  and funding_delta_pct > 0)
+                )
+                if _fade_aligned:
+                    _flip_bonus = 4.0
+        self._prev_funding_delta[symbol] = funding_delta_pct
+
         # ── Confidence ────────────────────────────────────────────────────
         confidence = float(confidence_base)
 
@@ -176,14 +210,10 @@ class FundingRateArb(BaseStrategy):
 
         confidence += min(15, excess * 1.0)
 
-        if oi_confirms:
-            confidence += 8
-
         # Fix #6: Overcrowding exhaustion / blow-off guard — if funding is
         # already ≥ 3× the extreme threshold we may be entering at peak
         # squeeze risk (blow-off phase) where the trade is too late.
         # Penalise early to prevent chasing the very tail of a crowd extreme.
-        active_threshold = long_threshold if direction == "SHORT" else abs(short_threshold)
         if abs(funding_rate_pct) > active_threshold * 3:
             confidence -= 5
 
@@ -194,6 +224,8 @@ class FundingRateArb(BaseStrategy):
         # Fix #3: scale the regime penalty with ADX so a weak trend applies a
         # lighter penalty and a strong trend applies a heavier one.
         adx = self.calculate_adx(highs, lows, closes, period=14)
+        # 40 is a conventional "strong trend" threshold on the 0-100 ADX scale;
+        # at ADX=40 the full −10 applies, at ADX=20 only −5 applies.
         _adx_factor = min(1.5, adx / 40.0) if adx > 0 else 1.0
         if regime == "BULL_TREND" and direction == "SHORT":
             if funding_rate_pct < long_threshold * 2:
@@ -202,62 +234,74 @@ class FundingRateArb(BaseStrategy):
             if abs(funding_rate_pct) < abs(short_threshold) * 2:
                 confidence -= 10 * _adx_factor
 
-        # FA-Q2: Funding trajectory — normalize delta by the entry threshold
-        # so the same raw Δpp has proportionally more weight on a tightly-
-        # triggered asset (threshold ≈ 0.01pp) than on a broadly-triggered
-        # one (threshold ≈ 0.05pp).  normalized_delta ≥ 1.0 = meaningful move,
-        # < 0.2 = noise.  Caps and multipliers are preserved from before.
+        # FA-Q2: Funding trajectory adjustments.
+        # Positive adjustments (unwind reward, acceleration flip, OI liq bonus)
+        # are accumulated and capped so that correlated derivatives signals
+        # cannot stack into an unrealistically inflated confidence (C).
+        _pos_adj = 0.0
+
+        # OI confirms (positive, accumulated under cap)
+        if oi_confirms:
+            _pos_adj += 8
+
         if funding_delta_pct != 0.0:
-            normalized_delta = funding_delta_pct / active_threshold if active_threshold > 0 else 0.0
             if direction == "SHORT":
                 # Fading extreme positive funding
-                if funding_delta_pct < 0:  # Unwinding → reward the fade
-                    adj = min(8, abs(normalized_delta) * 1.5)
-                    confidence += adj
-                else:  # Continuation → penalize the fade
-                    adj = min(12, normalized_delta * 2.0)
-                    confidence -= adj
+                if funding_delta_pct < 0:  # Unwinding → reward the fade (positive)
+                    _pos_adj += min(8, abs(normalized_delta) * 1.5)
+                else:  # Continuation → penalize the fade (negative, direct)
+                    confidence -= min(12, abs(normalized_delta) * 2.0)
             else:
                 # Fading extreme negative funding
-                if funding_delta_pct > 0:  # Unwinding → reward the fade
-                    adj = min(8, abs(normalized_delta) * 1.5)
-                    confidence += adj
-                else:  # Continuation → penalize the fade
-                    adj = min(12, abs(normalized_delta) * 2.0)
-                    confidence -= adj
+                if funding_delta_pct > 0:  # Unwinding → reward the fade (positive)
+                    _pos_adj += min(8, abs(normalized_delta) * 1.5)
+                else:  # Continuation → penalize the fade (negative, direct)
+                    confidence -= min(12, abs(normalized_delta) * 2.0)
 
-        # Regime counter-trend bonus (fading trend = slightly less confidence)
+        # Acceleration flip bonus (B, positive, under cap)
+        _pos_adj += _flip_bonus
+
+        # Regime counter-trend bonus (regime-based, outside derivative cap)
         if regime in ("CHOPPY", "VOLATILE"):
             confidence += 5   # Counter-trend setups work better in ranging markets
 
-        # FA-Q5: Graduated staleness penalty — penalize aging data before the
-        # hard cutoff so that borderline signals based on old snapshots carry
-        # less weight.
+        # FA-Q5: Graduated staleness penalty, amplified by volatility (E).
+        # Old data is worse in fast markets; multiply base penalty by (1 + 2×ATR%).
         if funding_age_sec is not None:
+            _vol_mult = 1.0 + 2.0 * atr_frac
             if funding_age_sec > 600:
-                confidence -= 6
+                confidence -= 6 * _vol_mult
             elif funding_age_sec > 300:
-                confidence -= 3
+                confidence -= 3 * _vol_mult
 
-        # Liquidation context bonus — OI spike into a crowded trade increases
-        # the probability of a squeeze cascade, strengthening the fade thesis.
-        # Fix #5: tiered bonus so MEDIUM and HIGH are treated differently.
+        # Liquidation context bonus — tiered (Fix #5), positive, under cap.
         if oi_confirms:
             if direction == "SHORT":
                 if liquidation_risk == "HIGH":
-                    confidence += 6  # Severe crowding → full cascade risk
+                    _pos_adj += 6  # Severe crowding → full cascade risk
                 elif liquidation_risk == "MEDIUM":
-                    confidence += 3  # Moderate crowding → partial cascade risk
+                    _pos_adj += 3  # Moderate crowding → partial cascade risk
             elif direction == "LONG":
                 if squeeze_risk == "HIGH":
-                    confidence += 6  # Heavy short covering → strong squeeze
+                    _pos_adj += 6  # Heavy short covering → strong squeeze
                 elif squeeze_risk == "MEDIUM":
-                    confidence += 3  # Moderate short covering
+                    _pos_adj += 3  # Moderate short covering
+
+        # Apply capped positive adjustment (C: prevents correlated bonuses from
+        # inflating confidence — max combined derivative signal reward = +12).
+        confidence += min(_pos_adj, 12.0)
 
         # ── Recent swing levels for SL ────────────────────────────────────
         lookback_sl = min(20, len(highs) - 1)
         recent_high = float(np.max(highs[-lookback_sl:]))
         recent_low  = float(np.min(lows[-lookback_sl:]))
+
+        # Entry lateness penalty (D) — if price is already > 1.2×ATR away from
+        # the centre of the recent price range, the expected-fade move has
+        # already partially occurred and we're entering late.
+        recent_mid = (recent_high + recent_low) / 2.0
+        if abs(current_price - recent_mid) > 1.2 * atr:
+            confidence -= 3
 
         # ── Entry / SL / TP ───────────────────────────────────────────────
         buf = atr * rp.entry_zone_tight
@@ -271,25 +315,28 @@ class FundingRateArb(BaseStrategy):
         # so runtime monitoring can trigger an early exit when funding normalizes.
         funding_exit_threshold = long_threshold * 0.5 if direction == "SHORT" else short_threshold * 0.5
 
-        # Fix #1: Enforce funding exit — if funding is already FALLING (i.e.
-        # the crowd is already unwinding) the expected reversal distance is
-        # smaller because the normalization is partially priced in.  Shrink TP2
-        # to 75 % of its full-range distance from entry so we lock in profit
-        # faster and don't overshoot a fading catalyst.
-        _tp2_shrink = 1.0
+        # Fix #1 → A: Continuous TP2 shrink — scaled by unwind strength.
+        # The stronger the unwind already in progress, the smaller the
+        # expected remaining move; scale from 100% (no unwind) to 70% (full
+        # unwind, |normalized_delta| ≥ 1).
+        # Formula: shrink_frac = min(0.30, 0.30 × |normalized_delta|)
+        #          tp2_scale   = 1 − shrink_frac   (range: 0.70 – 1.00)
+        _tp2_unwinding = (
+            (direction == "SHORT" and funding_delta_pct < 0) or
+            (direction == "LONG"  and funding_delta_pct > 0)
+        )
+        _nd_abs = abs(normalized_delta)
+        _shrink_frac = min(0.30, 0.30 * _nd_abs) if _tp2_unwinding else 0.0
+        _tp2_scale = 1.0 - _shrink_frac
+
         _tp2_unwinding_note = None
-        if funding_delta_trend == "FALLING" and direction == "SHORT":
-            _tp2_shrink = 0.75
+        if _shrink_frac > 0:
+            _tp2_pct = round(_tp2_scale * 100)
             _tp2_unwinding_note = (
-                f"⚡ Funding already unwinding (Δ{funding_delta_pct:+.4f}pp) "
-                f"— TP2 capped at 75% range; exit ≤ {funding_exit_threshold:.4f}%"
-            )
-        elif funding_delta_trend == "RISING" and direction == "LONG":
-            _tp2_shrink = 0.75
-            _tp2_unwinding_note = (
-                f"⚡ Funding (neg.) already rising toward neutral "
-                f"(Δ{funding_delta_pct:+.4f}pp) "
-                f"— TP2 capped at 75% range; exit ≥ {funding_exit_threshold:.4f}%"
+                f"⚡ Funding already unwinding (Δ{funding_delta_pct:+.4f}pp, "
+                f"ñΔ={normalized_delta:+.2f}) "
+                f"— TP2 scaled to {_tp2_pct}% of full range; "
+                f"exit ≤ {funding_exit_threshold:.4f}%"
             )
 
         if direction == "LONG":
@@ -298,7 +345,7 @@ class FundingRateArb(BaseStrategy):
             stop_loss   = recent_low - atr * rp.sl_atr_mult
             tp1         = entry_high + atr * rp.volatility_scaled_tp1(tf, vp)
             _tp2_full   = entry_high + atr * rp.volatility_scaled_tp2(tf, vp)
-            tp2         = entry_high + ((_tp2_full - entry_high) * _tp2_shrink)
+            tp2         = entry_high + ((_tp2_full - entry_high) * _tp2_scale)
             tp3         = entry_high + atr * rp.volatility_scaled_tp3(tf, vp)
         else:
             entry_low   = current_price - buf
@@ -306,7 +353,7 @@ class FundingRateArb(BaseStrategy):
             stop_loss   = recent_high + atr * rp.sl_atr_mult
             tp1         = entry_low - atr * rp.volatility_scaled_tp1(tf, vp)
             _tp2_full   = entry_low - atr * rp.volatility_scaled_tp2(tf, vp)
-            tp2         = entry_low - ((entry_low - _tp2_full) * _tp2_shrink)
+            tp2         = entry_low - ((entry_low - _tp2_full) * _tp2_scale)
             tp3         = entry_low - atr * rp.volatility_scaled_tp3(tf, vp)
 
         entry_mid = (entry_low + entry_high) / 2.0
@@ -370,6 +417,7 @@ class FundingRateArb(BaseStrategy):
                 "oi_confirms": oi_confirms,
                 "funding_delta_trend": funding_delta_trend,
                 "funding_delta_pct": funding_delta_pct,
+                "normalized_delta": normalized_delta,
                 "funding_age_sec": funding_age_sec,
                 "funding_exit_threshold": funding_exit_threshold,
                 "effective_min_oi": effective_min_oi,
@@ -380,7 +428,9 @@ class FundingRateArb(BaseStrategy):
                 "atr": atr,
                 "adx": adx,
                 "regime": regime,
-                "tp2_shrink": _tp2_shrink,
+                "tp2_scale": _tp2_scale,
+                "pos_adj_capped": min(_pos_adj, 12.0),
+                "flip_bonus": _flip_bonus,
             },
             regime=regime,
         )
