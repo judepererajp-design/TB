@@ -117,8 +117,10 @@ class Ichimoku(BaseStrategy):
         kumo_size   = kumo_top - kumo_bottom
 
         # IC-Q1: Thin cloud → weak S/R zone → high failure rate.
-        # Require at least 1×ATR of cloud thickness for a meaningful liquidity zone.
-        if kumo_size < atr * 1.0:
+        # Use the larger of 1×ATR or 0.2% of price so the gate scales correctly across
+        # assets where ATR is very small relative to price (e.g. low-vol alts) or very
+        # large relative to price (e.g. high-vol micro-caps).
+        if kumo_size < max(atr * 1.0, current_price * 0.002):
             return None
 
         # Chikou span = close shifted back `displacement` bars
@@ -149,6 +151,7 @@ class Ichimoku(BaseStrategy):
         # ── Condition 2: Price vs Kumo ────────────────────────────────────
         require_cloud = getattr(self._cfg, "require_above_cloud", True)
         _bars_above_cloud = 0
+        _late_strong_entry = False  # set below when bars > 5 but trend is still intact
         if require_cloud:
             if direction == "LONG" and current_price <= kumo_top:
                 return None
@@ -156,8 +159,7 @@ class Ichimoku(BaseStrategy):
                 return None
             # IC-Q2: Breakout recency — price that has been above/below the cloud
             # for many bars signals trend continuation, not a fresh breakout entry.
-            # Count consecutive bars price has cleared the cloud; reject late entries.
-            # Scan 6 bars (one more than the rejection threshold of 5) to detect overruns.
+            # Count consecutive bars price has cleared the cloud.
             _bars_above_cloud = 0
             for _i in range(1, min(len(closes), 7)):
                 if direction == "LONG" and closes[-_i] > kumo_top:
@@ -167,7 +169,15 @@ class Ichimoku(BaseStrategy):
                 else:
                     break
             if _bars_above_cloud > 5:
-                return None
+                # Distinguish two sub-cases:
+                #   • Cloud-hugging (< 0.5×ATR away): price is pulling back toward the cloud
+                #     edge — momentum is fading, breakout is at risk of reverting.  Hard-reject.
+                #   • Strong-but-late (≥ 0.5×ATR away): trend is clearly intact but entry is
+                #     extended.  Allow through; the confidence path applies a −6 penalty below.
+                _close_distance_cloud = abs(current_price - (kumo_top if direction == "LONG" else kumo_bottom))
+                if _close_distance_cloud < 0.5 * atr:
+                    return None  # Cloud-hugging: breakout losing momentum, likely to fade back
+                _late_strong_entry = True  # Extended — penalised in confidence, not hard-rejected
 
         # ── Condition 3: Chikou clear ──────────────────────────────────────
         require_chikou = getattr(self._cfg, "require_chikou_clear", True)
@@ -198,6 +208,10 @@ class Ichimoku(BaseStrategy):
                     break
         if _bars_since_tk_cross > 3:
             return None
+
+        # TK cross quality: compute Tenkan 3-bar slope for use in confidence scoring.
+        # A slope below 5% of ATR indicates a nearly-flat cross (noise tick, not momentum).
+        _tenkan_slope = tenkan[-1] - tenkan[-3] if len(tenkan) >= 3 else 0.0
 
         # Direction-aware regime alignment (used for kijun bonus and regime confidence)
         _is_with_trend = (
@@ -239,15 +253,30 @@ class Ichimoku(BaseStrategy):
         elif direction == "SHORT" and current_price < kumo_bottom:
             confidence += 8
 
-        # Price clearance from cloud
+        # Price clearance from cloud — three-zone model:
+        #   <1×ATR : borderline break (no adjustment — too close to cloud)
+        #   1–2×ATR: optimal clearance (+5 — confirmed break, not overextended)
+        #   >2×ATR : overextended entry (-5 — trend is real but entry is late/stretched)
         cloud_distance = abs(current_price - (kumo_top if direction == "LONG" else kumo_bottom))
-        if cloud_distance > atr * 2:
-            confidence += 5
+        if atr <= cloud_distance < 2 * atr:
+            confidence += 5  # Optimal clearance
+        elif cloud_distance >= 2 * atr:
+            confidence -= 5  # Overextended
 
         # Chikou strength
         chikou_margin = abs(chikou_current_price - chikou_compare_price)
         if chikou_margin > atr:
             confidence += 5
+
+        # TK cross slope quality: a near-flat cross is a noise tick, not a momentum signal.
+        # Threshold: 5% of ATR over 3 bars — anything below is considered structurally flat.
+        if abs(_tenkan_slope) < atr * 0.05:
+            confidence -= 3
+
+        # Late-but-strong-trend penalty: price has been above/below the cloud for 6+ bars
+        # but trend is intact (passed the cloud-hugging hard gate above).  Entry is extended.
+        if _late_strong_entry:
+            confidence -= 6
 
         # ── Entry around TK cross level (or Kijun on pullback) ──────────
         # When flat-Kijun pullback is detected, enter near Kijun level
