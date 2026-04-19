@@ -15,7 +15,6 @@ Uses patterns/wyckoff.py WyckoffAnalyzer for phase detection.
 """
 
 import logging
-import time
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -105,7 +104,7 @@ class WyckoffAccDist(BaseStrategy):
             result   = analyzer.analyze(ohlcv, timeframe=tf)
         except Exception as e:
             _wyckoff_stats["failures"] += 1
-            # W-3+: log failure rate periodically so ops can detect systemic issues
+            # W-3+: log failure rate periodically; individual errors go to debug
             _t = _wyckoff_stats["total"]
             if _t > 0 and int(_t) % _STATS_LOG_INTERVAL == 0:
                 rate = _wyckoff_stats["failures"] / _t
@@ -115,7 +114,7 @@ class WyckoffAccDist(BaseStrategy):
                     f"last error: {e}"
                 )
             else:
-                logger.warning(f"WyckoffAccDist: WyckoffAnalyzer error for {symbol}: {e}")
+                logger.debug(f"WyckoffAccDist: WyckoffAnalyzer error for {symbol}: {e}")
             return None
 
         if result is None:

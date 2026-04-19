@@ -224,7 +224,8 @@ class WyckoffAnalyzer:
         """
         if range_start < 5:
             return False
-        pre_range = volumes[:range_start][-30:]   # up to last 30 bars before range
+        _pre_range_lookback = self._min_range_bars  # same as min range to stay consistent
+        pre_range = volumes[:range_start][-_pre_range_lookback:]
         in_range  = volumes[range_start:]
         if len(pre_range) < 5 or len(in_range) < 5:
             return False
