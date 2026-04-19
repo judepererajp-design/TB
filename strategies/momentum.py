@@ -124,19 +124,21 @@ class Momentum(BaseStrategy):
         fast_period  = getattr(self._cfg, "macd_fast", 12)
         slow_period  = getattr(self._cfg, "macd_slow", 26)
         sig_period   = getattr(self._cfg, "macd_signal", 9)
-        min_adx      = getattr(self._cfg, "min_adx", 30)
+        min_adx      = getattr(self._cfg, "min_adx", 25)
         vol_surge    = getattr(self._cfg, "volume_surge_mult", 2.0)
         confidence_base = getattr(self._cfg, "confidence_base", 70)
 
         # ── MACD calculation ──────────────────────────────────────────────
         macd_line, signal_line, histogram = _macd(closes, fast_period, slow_period, sig_period)
 
-        if len(macd_line) < 3:
+        if len(macd_line) < 4:
             return None
 
-        # Detect crossover on the most recent completed bar ([-2] vs [-1])
-        prev_macd_diff  = macd_line[-2] - signal_line[-2]
-        curr_macd_diff  = macd_line[-1] - signal_line[-1]
+        # M-1: Detect crossover on the two most recent *completed* bars ([-3]→[-2]).
+        # [-1] is the currently-forming candle whose MACD value shifts every tick.
+        # Using confirmed bars eliminates false crossovers from the live candle.
+        prev_macd_diff  = macd_line[-3] - signal_line[-3]
+        curr_macd_diff  = macd_line[-2] - signal_line[-2]
 
         bullish_cross = prev_macd_diff <= 0 < curr_macd_diff
         bearish_cross = prev_macd_diff >= 0 > curr_macd_diff
@@ -146,12 +148,17 @@ class Momentum(BaseStrategy):
 
         direction = "LONG" if bullish_cross else "SHORT"
 
-        # ── Regime direction gate ─────────────────────────────────────────
+        # ── Regime direction gate — soft penalty for counter-trend signals ──
+        # Hard-blocking all counter-trend signals in trending regimes misses
+        # tradeable extended-wick reversals.  Apply a −15 confidence penalty
+        # instead so those setups survive only when all other signals are strong.
+        _counter_trend_penalty = 0
         if regime_dir and direction != regime_dir:
-            return None
+            _counter_trend_penalty = -15
 
         # ── Histogram expansion ───────────────────────────────────────────
-        histogram_expanding = abs(histogram[-1]) > abs(histogram[-2])
+        # M-1: Histogram expansion on confirmed bars ([-2] vs [-3]).
+        histogram_expanding = abs(histogram[-2]) > abs(histogram[-3])
         require_expansion   = getattr(self._cfg, "histogram_expansion", True)
         if require_expansion and not histogram_expanding:
             return None
@@ -162,8 +169,11 @@ class Momentum(BaseStrategy):
             return None
 
         # ── Volume surge ──────────────────────────────────────────────────
+        # M-2: Use last *closed* bar for volume comparison.  The live bar's volume
+        # accumulates throughout the candle period, so comparing volumes[-1] against
+        # a 20-bar average suppresses the ratio for early-in-period checks.
         avg_vol   = float(np.mean(volumes[-20:]))
-        vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 1.0
+        vol_ratio = volumes[-2] / avg_vol if avg_vol > 0 else 1.0
         if vol_ratio < vol_surge:
             return None
 
@@ -194,6 +204,7 @@ class Momentum(BaseStrategy):
         # ── Confidence ────────────────────────────────────────────────────
         confidence = float(confidence_base)
         confidence += _ms_bonus
+        confidence += _counter_trend_penalty
         confidence += _ema_pullback_bonus
         confidence += 5   # MACD crossover
         if histogram_expanding:
@@ -211,16 +222,18 @@ class Momentum(BaseStrategy):
         if direction == "LONG":
             entry_low   = current_close
             entry_high  = current_close + buf
-            swing_low_3 = float(np.min(lows[-4:-1]))
-            stop_loss   = swing_low_3 - atr * 0.5
+            # M-4: 5-bar swing lookback — 3 bars is too short for hourly structure.
+            swing_low = float(np.min(lows[-6:-1]))
+            stop_loss   = swing_low - atr * 0.5
             tp1         = entry_high + atr * rp.volatility_scaled_tp1(tf, vp)
             tp2         = entry_high + atr * rp.volatility_scaled_tp2(tf, vp)
             tp3         = entry_high + atr * rp.volatility_scaled_tp3(tf, vp)
         else:
             entry_high  = current_close
             entry_low   = current_close - buf
-            swing_high_3 = float(np.max(highs[-4:-1]))
-            stop_loss   = swing_high_3 + atr * 0.5
+            # M-4: 5-bar swing lookback (same rationale as LONG path above)
+            swing_high = float(np.max(highs[-6:-1]))
+            stop_loss   = swing_high + atr * 0.5
             tp1         = entry_low - atr * rp.volatility_scaled_tp1(tf, vp)
             tp2         = entry_low - atr * rp.volatility_scaled_tp2(tf, vp)
             tp3         = entry_low - atr * rp.volatility_scaled_tp3(tf, vp)
@@ -237,10 +250,10 @@ class Momentum(BaseStrategy):
 
         confluence: List[str] = [
             f"✅ MACD {'bullish' if direction == 'LONG' else 'bearish'} crossover",
-            f"   MACD: {macd_line[-1]:.4f} | Signal: {signal_line[-1]:.4f}",
+            f"   MACD: {macd_line[-2]:.4f} | Signal: {signal_line[-2]:.4f}",
         ]
         if histogram_expanding:
-            confluence.append(f"✅ Histogram expanding: {histogram[-1]:.4f} > {histogram[-2]:.4f}")
+            confluence.append(f"✅ Histogram expanding: {histogram[-2]:.4f} > {histogram[-3]:.4f}")
         confluence.append(f"✅ ADX: {adx:.1f} > {min_adx} — trend established")
         confluence.append(f"✅ Volume surge: {vol_ratio:.1f}x average")
         if _near_ema and _ema_ref is not None:
@@ -252,6 +265,8 @@ class Momentum(BaseStrategy):
 
         if _ms_bonus != 0:
             confluence.append(f"🧠 Market State: {getattr(_ms_state, 'value', 'N/A')} ({'+' if _ms_bonus >= 0 else ''}{_ms_bonus})")
+        if _counter_trend_penalty != 0:
+            confluence.append(f"⚠️ Counter-trend signal in {regime} ({_counter_trend_penalty})")
 
         confidence = min(93, max(40, confidence))
 
@@ -271,9 +286,9 @@ class Momentum(BaseStrategy):
             analysis_timeframes=[tf],
             confluence=confluence,
             raw_data={
-                "macd": float(macd_line[-1]),
-                "macd_signal": float(signal_line[-1]),
-                "histogram": float(histogram[-1]),
+                "macd": float(macd_line[-2]),
+                "macd_signal": float(signal_line[-2]),
+                "histogram": float(histogram[-2]),
                 "adx": adx,
                 "vol_ratio": vol_ratio,
                 "regime": regime,

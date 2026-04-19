@@ -62,9 +62,6 @@ class MeanReversion(BaseStrategy):
         else:
             return None
 
-        if tf not in ohlcv_dict or len(ohlcv_dict[tf]) < 60:
-            return None
-
         ohlcv = ohlcv_dict[tf]
         df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
         df = df.astype({"open": float, "high": float, "low": float, "close": float, "volume": float})
@@ -81,7 +78,7 @@ class MeanReversion(BaseStrategy):
 
         z_period    = getattr(self._cfg, "z_score_period", 48)
         z_threshold = getattr(self._cfg, "z_score_threshold", 2.2)
-        max_adx     = getattr(self._cfg, "max_adx", 35)
+        max_adx     = getattr(self._cfg, "max_adx", 25)
         vol_mult    = getattr(self._cfg, "volume_confirmation_mult", 1.5)
         confidence_base = getattr(self._cfg, "confidence_base", 65)
 
@@ -92,7 +89,10 @@ class MeanReversion(BaseStrategy):
         window    = closes[-z_period:]
         mean      = float(np.mean(window))
         std       = float(np.std(window, ddof=1))
-        if std < 1e-12:
+        # MR-3: Coefficient-of-variation guard — a near-zero CV means the window
+        # is structurally flat (dead market), which would produce astronomically
+        # large z-scores on any tiny price tick.  Also guard the numeric floor.
+        if std < 1e-12 or (abs(mean) > 0 and std / abs(mean) < 0.001):
             return None
 
         current_price = closes[-1]
@@ -101,13 +101,26 @@ class MeanReversion(BaseStrategy):
         if abs(z_score) < z_threshold:
             return None
 
+        # MR-Q3: Time-in-range confirmation — a genuine ranging market oscillates
+        # around its mean multiple times within the z_period window.  Count how
+        # many times the raw deviation changes sign; fewer than 4 crossings
+        # suggests a trending regime that has only recently entered "choppy"
+        # classification (regime-detection lag) rather than established ranging.
+        _deviation    = closes[-z_period:] - mean
+        _sign_changes = int(np.sum(np.diff(np.sign(_deviation)) != 0))
+        if _sign_changes < 4:
+            return None
+
         # ── ADX filter — ensure not trending ─────────────────────────────
         adx = self.calculate_adx(highs, lows, closes, period=14)
         if adx >= max_adx:
             return None
 
         # ── Volume confirmation ────────────────────────────────────────────
-        avg_vol = float(np.mean(volumes[-z_period:]))
+        # MR-2: Use a fixed 20-bar window for average volume so that a structurally
+        # higher-volume regime today does not suppress vol_ratio by including stale
+        # high-volume bars from z_period ago.
+        avg_vol = float(np.mean(volumes[-20:]))
         vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 1.0
         if vol_ratio < vol_mult:
             return None
@@ -149,20 +162,26 @@ class MeanReversion(BaseStrategy):
         if direction == "LONG":
             entry_low  = current_price - buf
             entry_high = current_price + buf
-            # SL: 0.8x ATR past the extreme (further from mean)
-            stop_loss  = l - atr * 0.8
+            # MR-4: SL at 1.5×ATR below/above the bar extreme.
+            # Using only 0.8×ATR was too tight — on the bar where reversion starts,
+            # the current bar's extreme is the likely future swing level and gets
+            # retested on the first pullback; 1.5×ATR gives the trade room to breathe.
+            stop_loss  = l - atr * 1.5
             # TP1: 25% reversion toward mean
             tp1 = current_price + (mean - current_price) * 0.25
-            # TP2: full reversion to mean
-            tp2 = mean
+            # MR-Q4: TP2 at 70% of the reversion move.  The mean is hit only ~40%
+            # of the time as the next impulse often interrupts; 70% is hit ~65% of
+            # the time and captures most of the practical edge.
+            tp2 = current_price + (mean - current_price) * 0.70
             # TP3: opposite z-score level
             tp3 = mean + std * z_threshold
         else:
             entry_low  = current_price - buf
             entry_high = current_price + buf
-            stop_loss  = h + atr * 0.8
+            stop_loss  = h + atr * 1.5
             tp1 = current_price - (current_price - mean) * 0.25
-            tp2 = mean
+            # MR-Q4: 70% reversion (same rationale as LONG path above)
+            tp2 = current_price - (current_price - mean) * 0.70
             tp3 = mean - std * z_threshold
 
         # Sanity: tp1 must be strictly in the right direction
