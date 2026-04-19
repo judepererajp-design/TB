@@ -641,8 +641,12 @@ class BaseStrategy(ABC):
     # ── Compression / Squeeze Detection ──────────────────────────────
 
     @staticmethod
-    def detect_bb_squeeze(closes: np.ndarray, period: int = 20,
-                          lookback: int = 100) -> Dict[str, Any]:
+    def detect_bb_squeeze(
+        closes: np.ndarray,
+        period: int = 20,
+        lookback: int = 100,
+        sample_stride: int = 5,
+    ) -> Dict[str, Any]:
         """
         Detect Bollinger Band squeeze (compression).
 
@@ -662,30 +666,39 @@ class BaseStrategy(ABC):
         if len(closes) < max(period, 30):
             return result
 
-        # Calculate BB width series for the lookback
-        n = min(lookback, len(closes) - period)
-        widths = []
-        for i in range(n):
-            idx = len(closes) - n + i
-            window = closes[idx - period + 1:idx + 1]
-            if len(window) < period:
-                continue
+        # Calculate contiguous BB widths for the lookback.
+        # Percentiles are then computed on a strided sample to reduce
+        # overlap autocorrelation bias from adjacent 20-bar windows.
+        total_windows = len(closes) - period + 1
+        n = min(lookback, total_windows)
+        start = max(0, total_windows - n)
+        widths_all = []
+        for w_start in range(start, total_windows):
+            window = closes[w_start:w_start + period]
             mid = float(np.mean(window))
             std = float(np.std(window, ddof=1))
             bw = (2 * std * 2.0) / mid if mid > 0 else 0  # 2-sigma width / mid
-            widths.append(bw)
+            widths_all.append(bw)
+
+        if len(widths_all) < 10:
+            return result
+
+        stride = max(1, int(sample_stride))
+        widths = widths_all[::stride]
+        if widths[-1] != widths_all[-1]:
+            widths.append(widths_all[-1])  # Always include current regime context
 
         if len(widths) < 10:
             return result
 
-        current_bw = widths[-1]
+        current_bw = widths_all[-1]
         sorted_bw = sorted(widths)
         pctile = float(np.searchsorted(sorted_bw, current_bw)) / len(sorted_bw)
 
         # Count consecutive compression bars (below 30th percentile)
         threshold_30 = sorted_bw[int(len(sorted_bw) * 0.30)]
         comp_bars = 0
-        for bw in reversed(widths):
+        for bw in reversed(widths_all):
             if bw <= threshold_30:
                 comp_bars += 1
             else:
