@@ -110,6 +110,8 @@ class RangeScalperStrategy(BaseStrategy):
         # ── 2. Config params ──────────────────────────────────────
         lookback     = self._get_cfg('range_lookback', 40)
         edge_pct     = self._get_cfg('edge_pct', 0.20)      # Outer 20% of range
+        edge_atr_floor = self._get_cfg('edge_atr_floor', 0.75)
+        edge_atr_cap = self._get_cfg('edge_atr_cap', 3.0)
         rsi_ob       = self._get_cfg('rsi_overbought', 68)
         rsi_os       = self._get_cfg('rsi_oversold', 32)
         vol_mult     = self._get_cfg('vol_confirmation', 1.3)
@@ -127,6 +129,8 @@ class RangeScalperStrategy(BaseStrategy):
 
         range_high = float(np.percentile(recent_highs, 90))
         range_low  = float(np.percentile(recent_lows, 10))
+        range_high_abs = float(np.max(recent_highs))
+        range_low_abs = float(np.min(recent_lows))
         range_size = range_high - range_low
 
         if range_size < atr * min_range_atr:
@@ -134,6 +138,8 @@ class RangeScalperStrategy(BaseStrategy):
 
         equilibrium = (range_high + range_low) / 2.0
         edge_band = range_size * edge_pct
+        edge_band = max(edge_band, atr * edge_atr_floor)
+        edge_band = min(edge_band, atr * edge_atr_cap, range_size * 0.45)
 
         supply_zone_start = range_high - edge_band
         demand_zone_start = range_low + edge_band
@@ -246,18 +252,18 @@ class RangeScalperStrategy(BaseStrategy):
         # PHASE 2 FIX (P2-A): BOS check for range scalper.
         # If price has broken range structure (making new HL/LH beyond the range),
         # the range is invalid and we should not be fading it.
-        _n = min(20, len(closes))
-        _recent_h = highs[-_n:]
-        _recent_l = lows[-_n:]
+        bos_hold_bars = max(1, int(self._get_cfg('bos_hold_bars', 2)))
+        bos_breach_pct = max(0.0, float(self._get_cfg('bos_breach_pct', 0.002)))
         if direction == "LONG":
-            # Is price making lower lows outside the range?
-            if closes[-1] < _recent_l.min() * 0.998:
+            _bos_level = range_low * (1.0 - bos_breach_pct)
+            if len(closes) >= bos_hold_bars and bool(np.all(closes[-bos_hold_bars:] < _bos_level)):
                 confidence -= 15
-                confluence.append("⚠️ BOS gate: range violated to downside — scalp confidence reduced")
+                confluence.append(f"⚠️ BOS gate: {bos_hold_bars} closes below range low — scalp confidence reduced")
         elif direction == "SHORT":
-            if closes[-1] > _recent_h.max() * 1.002:
+            _bos_level = range_high * (1.0 + bos_breach_pct)
+            if len(closes) >= bos_hold_bars and bool(np.all(closes[-bos_hold_bars:] > _bos_level)):
                 confidence -= 15
-                confluence.append("⚠️ BOS gate: range violated to upside — scalp confidence reduced")
+                confluence.append(f"⚠️ BOS gate: {bos_hold_bars} closes above range high — scalp confidence reduced")
 
         # SL BUFFER FIX: was atr * sl_atr_mult * 0.4 — only 40% of normal.
         # On volatile alts (the majority of the 200+ scan pool), 40% of 1.2 ATR = 0.48 ATR.
@@ -269,7 +275,7 @@ class RangeScalperStrategy(BaseStrategy):
         if direction == "LONG":
             entry_low  = current - atr * rp.entry_zone_atr * 0.75
             entry_high = current + atr * rp.entry_zone_tight
-            stop_loss  = range_low - sl_buffer
+            stop_loss  = range_low_abs - sl_buffer
             tp1        = current + (equilibrium - current) * 0.50    # Halfway to EQ
             tp2        = equilibrium                                   # Full EQ
             # TP3-FIX: Old TP3 targeted 30% into the supply zone (above EQ toward
@@ -281,7 +287,7 @@ class RangeScalperStrategy(BaseStrategy):
         else:
             entry_high = current + atr * rp.entry_zone_atr * 0.75
             entry_low  = current - atr * rp.entry_zone_tight
-            stop_loss  = range_high + sl_buffer
+            stop_loss  = range_high_abs + sl_buffer
             tp1        = current - (current - equilibrium) * 0.50
             tp2        = equilibrium
             # TP3-FIX: Mirror fix — 10% past EQ into demand zone, not 30%.
@@ -305,6 +311,8 @@ class RangeScalperStrategy(BaseStrategy):
         if _ms_compression_penalty:
             confluence.append(f"⚠️ Compression detected: range tightening ({_ms_compression_penalty})")
 
+        if confidence < 45:
+            return None
         confidence = min(88, max(45, confidence))
 
         signal = SignalResult(

@@ -268,6 +268,11 @@ strategies:
     timeframes: ["4h", "1h"]
     confidence_base: 68
     min_volume_24h: 1000000
+    key_level_lookback: 50
+    key_level_tolerance_atr: 0.5
+    vol_confirmation_mult: 1.5
+    mtf_mismatch_penalty: 8
+    reject_mtf_mismatch: false
     patterns:
       pin_bar: true
       engulfing: true
@@ -342,6 +347,10 @@ strategies:
     min_volume_24h: 1000000
     range_lookback: 40
     edge_pct: 0.20
+    edge_atr_floor: 0.75
+    edge_atr_cap: 3.0
+    bos_hold_bars: 2
+    bos_breach_pct: 0.002
     rsi_overbought: 68
     rsi_oversold: 32
     vol_confirmation: 1.3

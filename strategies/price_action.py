@@ -111,15 +111,12 @@ class PriceAction(BaseStrategy):
                 if _mtf_trigger["triggered"]:
                     _mtf_bonus = int(_mtf_trigger["quality"] * 10)  # Up to +10
 
-        tf = "4h"
+        tf = None
         for candidate_tf in ("4h", "1h"):
             if candidate_tf in ohlcv_dict and len(ohlcv_dict[candidate_tf]) >= 55:
                 tf = candidate_tf
                 break
-        else:
-            return None
-
-        if tf not in ohlcv_dict or len(ohlcv_dict[tf]) < 55:
+        if tf is None:
             return None
 
         ohlcv = ohlcv_dict[tf]
@@ -187,7 +184,8 @@ class PriceAction(BaseStrategy):
         primary_pattern = max(signal_patterns, key=lambda p: _PATTERN_WEIGHTS.get(p["pattern"], 0.5) * p["strength"])
 
         # ── Key level detection ────────────────────────────────────────────
-        lookback_kl = 50
+        lookback_kl = int(getattr(self._cfg, "key_level_lookback", 50))
+        lookback_kl = max(10, lookback_kl)
         swing_highs = []
         swing_lows  = []
         lb = min(lookback_kl, len(highs) - 2)
@@ -207,14 +205,22 @@ class PriceAction(BaseStrategy):
         if not np.isfinite(bb_upper) or not np.isfinite(bb_lower):
             return None
 
-        # Round numbers: multiples of 10, 100, 1000 within 0.5%
-        magnitude = 10 ** max(0, int(math.log10(current_price)) - 1)
+        # Round numbers: dynamic magnitude scaled to instrument price.
+        # Keep coarse levels for high-priced assets and usable decimals for sub-$1.
+        if current_price <= 0:
+            return None
+        _log10 = math.floor(math.log10(current_price))
+        if current_price >= 1.0:
+            _exp = max(0, _log10 - 1)
+        else:
+            _exp = _log10 - 1
+        magnitude = 10 ** _exp
         nearest_round = round(current_price / magnitude) * magnitude
         round_proximity = abs(current_price - nearest_round) / current_price
 
         at_key_level = False
         key_level_desc = ""
-        kl_tolerance = atr * 1.5
+        kl_tolerance = atr * float(getattr(self._cfg, "key_level_tolerance_atr", 0.5))
 
         if direction == "LONG":
             # At swing low, BB lower, or round number below
@@ -249,10 +255,23 @@ class PriceAction(BaseStrategy):
         # ── Volume confirmation ────────────────────────────────────────────
         avg_vol    = float(np.mean(volumes[-20:]))
         vol_ratio  = volumes[-1] / avg_vol if avg_vol > 0 else 1.0
-        vol_confirmed = vol_ratio >= 1.5
+        vol_mult = float(getattr(self._cfg, "vol_confirmation_mult", 1.5))
+        vol_confirmed = vol_ratio >= vol_mult
+
+        # ── HTF alignment gate/penalty ───────────────────────────────────────
+        _mtf_mismatch = False
+        _mtf_penalty = 0
+        if _htf_bias["bias"] in ("BULLISH", "BEARISH") and _htf_bias["confidence"] > 55:
+            _htf_dir = "LONG" if _htf_bias["bias"] == "BULLISH" else "SHORT"
+            if direction != _htf_dir:
+                _mtf_mismatch = True
+                if bool(getattr(self._cfg, "reject_mtf_mismatch", False)):
+                    return None
+                _mtf_penalty = int(getattr(self._cfg, "mtf_mismatch_penalty", 8))
+                _mtf_bonus = 0
 
         # ── Confidence ────────────────────────────────────────────────────
-        confidence = float(confidence_base) + regime_bonus + _mtf_bonus
+        confidence = float(confidence_base) + regime_bonus + _mtf_bonus - _mtf_penalty
         confidence += primary_pattern["strength"] * 15
         if at_key_level:
             confidence += 12
@@ -285,6 +304,9 @@ class PriceAction(BaseStrategy):
             tp2_candidates = [sh for sh in swing_highs[:3] if sh > entry_high + atr]
             tp2 = min(tp2_candidates) if tp2_candidates else (entry_high + atr * rp.volatility_scaled_tp2(tf, vp))
             tp3 = entry_high + atr * rp.volatility_scaled_tp3(tf, vp)
+            _tp_gap = atr * 0.2
+            tp2 = max(tp2, tp1 + _tp_gap)
+            tp3 = max(tp3, tp2 + _tp_gap)
         else:
             pattern_high = current_high
             entry_high   = current_price + atr * rp.entry_zone_tight
@@ -300,6 +322,9 @@ class PriceAction(BaseStrategy):
             tp2_candidates = [sl for sl in swing_lows[:3] if sl < entry_low - atr]
             tp2 = max(tp2_candidates) if tp2_candidates else (entry_low - atr * rp.volatility_scaled_tp2(tf, vp))
             tp3 = entry_low - atr * rp.volatility_scaled_tp3(tf, vp)
+            _tp_gap = atr * 0.2
+            tp2 = min(tp2, tp1 - _tp_gap)
+            tp3 = min(tp3, tp2 - _tp_gap)
 
         risk = (entry_low - stop_loss) if direction == "LONG" else (stop_loss - entry_high)
         if risk <= 0:
@@ -319,6 +344,8 @@ class PriceAction(BaseStrategy):
             confluence.append(f"✅ Key level: {key_level_desc}")
         if vol_confirmed:
             confluence.append(f"✅ Volume: {vol_ratio:.1f}x average")
+        if _mtf_mismatch:
+            confluence.append(f"⚠️ HTF mismatch: 4h {_htf_bias['bias']} vs signal {direction} (-{_mtf_penalty})")
         confluence.append(f"📊 Regime: {regime} | TF: {tf}")
         if _mtf_bonus > 0:
             confluence.append(

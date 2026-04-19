@@ -230,8 +230,13 @@ class ReversalStrategy(BaseStrategy):
                 # RSI at both swing lows
                 abs_recent = len(closes) - lookback + recent_idx
                 abs_prior  = len(closes) - lookback + prior_idx
-                rsi_recent = self.calculate_rsi(closes[:abs_recent + 1], 14)
-                rsi_prior  = self.calculate_rsi(closes[:abs_prior + 1],  14)
+                rsi_series = self._calculate_rsi_series(closes, 14)
+                if abs_recent >= len(rsi_series) or abs_prior >= len(rsi_series):
+                    return False
+                rsi_recent = rsi_series[abs_recent]
+                rsi_prior  = rsi_series[abs_prior]
+                if not np.isfinite(rsi_recent) or not np.isfinite(rsi_prior):
+                    return False
 
                 # RSI must be higher at lower price, by at least MIN_RSI_DELTA
                 return (rsi_recent - rsi_prior) >= MIN_RSI_DELTA
@@ -250,14 +255,38 @@ class ReversalStrategy(BaseStrategy):
 
                 abs_recent = len(closes) - lookback + recent_idx
                 abs_prior  = len(closes) - lookback + prior_idx
-                rsi_recent = self.calculate_rsi(closes[:abs_recent + 1], 14)
-                rsi_prior  = self.calculate_rsi(closes[:abs_prior + 1],  14)
+                rsi_series = self._calculate_rsi_series(closes, 14)
+                if abs_recent >= len(rsi_series) or abs_prior >= len(rsi_series):
+                    return False
+                rsi_recent = rsi_series[abs_recent]
+                rsi_prior  = rsi_series[abs_prior]
+                if not np.isfinite(rsi_recent) or not np.isfinite(rsi_prior):
+                    return False
 
                 # RSI must be lower at higher price, by at least MIN_RSI_DELTA
                 return (rsi_prior - rsi_recent) >= MIN_RSI_DELTA
 
         except Exception:
             return False
+
+    @staticmethod
+    def _calculate_rsi_series(closes, period: int = 14):
+        closes = np.asarray(closes, dtype=float)
+        rsi = np.full(len(closes), np.nan, dtype=float)
+        if len(closes) < period + 1:
+            return rsi
+        deltas = np.diff(closes)
+        gains = np.where(deltas > 0, deltas, 0.0)
+        losses = np.where(deltas < 0, -deltas, 0.0)
+        avg_gain = np.mean(gains[:period])
+        avg_loss = np.mean(losses[:period])
+        rsi[period] = 100.0 if avg_loss == 0 else 100.0 - (100.0 / (1.0 + (avg_gain / avg_loss)))
+        for i in range(period, len(gains)):
+            avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+            avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+            idx = i + 1
+            rsi[idx] = 100.0 if avg_loss == 0 else 100.0 - (100.0 / (1.0 + (avg_gain / avg_loss)))
+        return rsi
 
     @staticmethod
     def _find_swing_points_in_window(values, is_high: bool):
