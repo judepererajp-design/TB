@@ -174,7 +174,14 @@ class DerivativesAnalyzer:
                     or info.get('timestamp')
                 )
         try:
-            ts_int = int(float(ts))
+            if isinstance(ts, str):
+                ts = ts.strip()
+                try:
+                    ts_int = int(ts)
+                except ValueError:
+                    ts_int = int(float(ts))
+            else:
+                ts_int = int(ts)
             return ts_int if ts_int > 0 else None
         except (TypeError, ValueError):
             return None

@@ -32,7 +32,7 @@ def _normalize_threshold_pct(value: float) -> float:
     Backward-compat: accept fractional form (e.g. 0.0005 = 0.05%) and convert.
     """
     v = float(value)
-    if 0 < abs(v) < 0.001:
+    if abs(v) < 0.001 and v != 0:
         return v * 100.0
     return v
 
@@ -156,9 +156,9 @@ class FundingRateArb(BaseStrategy):
 
         # Funding magnitude bonus: +1 per 0.01% above threshold
         if direction == "SHORT":
-            excess = (funding_rate_pct - long_threshold) * 100
+            excess = (funding_rate_pct - long_threshold) * 100  # pp -> 0.01% steps
         else:
-            excess = (abs(funding_rate_pct) - abs(short_threshold)) * 100
+            excess = (abs(funding_rate_pct) - abs(short_threshold)) * 100  # pp -> 0.01% steps
 
         confidence += min(15, excess * 1.0)
 
