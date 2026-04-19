@@ -149,6 +149,14 @@ class BaseStrategy(ABC):
     # Cleared by clear_indicator_cache() before each symbol is processed.
     _class_indicator_cache: Dict[str, Any] = {}
 
+    # B-7: error-rate counter for parabolic_detector enrichment failures.
+    # Incremented each time the enrichment except-branch fires; reset to zero
+    # on a successful enrichment.  A WARNING is emitted at every
+    # _PARABOLIC_ERROR_WARN_EVERY-th failure so persistent regressions in
+    # analyzers.parabolic_detector are visible without spamming the log.
+    _parabolic_error_count: int = 0
+    _PARABOLIC_ERROR_WARN_EVERY: int = 5
+
     def __init__(self):
         self._indicator_cache: Dict[str, Any] = {}
 
@@ -580,16 +588,26 @@ class BaseStrategy(ABC):
         stop_loss: float,
         tp2: float,
     ) -> float:
-        """Calculate R:R from entry midpoint, matching aggregator enforcement."""
+        """
+        Calculate R:R using worst-case fill — the deeper end of the entry zone.
+
+        LONG fills at entry_high (top of zone = worst fill for buyer).
+        SHORT fills at entry_low (bottom of zone = worst fill for seller).
+
+        This is ~5-10% more conservative than the midpoint formula.
+        The aggregator's own geometry check still uses entry_mid for enforcement,
+        so signals with tight zones will have their rr_ratio overwritten downstream.
+        """
         direction_str = direction.value if hasattr(direction, "value") else str(direction)
-        entry_mid = (entry_low + entry_high) / 2.0
 
         if direction_str == SignalDirection.LONG.value:
-            risk = entry_mid - stop_loss
-            reward = tp2 - entry_mid
+            fill = entry_high       # worst-case fill for a limit LONG = top of zone
+            risk = fill - stop_loss
+            reward = tp2 - fill
         else:
-            risk = stop_loss - entry_mid
-            reward = entry_mid - tp2
+            fill = entry_low        # worst-case fill for a limit SHORT = bottom of zone
+            risk = stop_loss - fill
+            reward = fill - tp2
 
         if risk <= 0 or reward <= 0:
             return 0.0
@@ -723,13 +741,26 @@ class BaseStrategy(ABC):
 
         acceleration = roc_of_roc[-1]
 
-        # Determine direction and parabolic threshold
-        # Parabolic = acceleration consistently in one direction and exceeding 0.5% per bar
+        # Determine direction and parabolic threshold.
+        # B-Q3: scale the threshold from the asset's own ROC-of-ROC distribution
+        # rather than using a hardcoded 0.5% per bar.  A fixed 0.5% is extreme
+        # for BTC 1h but trivial for a meme-coin on 15m.  Using 1.5× the
+        # standard deviation of the full roc_of_roc series as the threshold
+        # means we require acceleration that is "unusually large" relative to
+        # the instrument's recent volatility.  The clamp [0.001, 0.05] prevents
+        # the threshold from collapsing on perfectly smooth moves or exploding
+        # on black-swan data.
         _recent_accel = roc_of_roc[-3:] if len(roc_of_roc) >= 3 else roc_of_roc
         _avg_accel = float(np.mean(_recent_accel))
         _all_same_sign = all(a > 0 for a in _recent_accel) or all(a < 0 for a in _recent_accel)
 
-        is_parabolic = _all_same_sign and abs(_avg_accel) > 0.005  # 0.5% acceleration per bar
+        if len(roc_of_roc) >= 5:
+            _rr_std = float(np.std(roc_of_roc))
+            _dynamic_threshold = max(0.001, min(0.05, 1.5 * _rr_std)) if _rr_std > 0 else 0.005
+        else:
+            _dynamic_threshold = 0.005  # fallback for very short series
+
+        is_parabolic = _all_same_sign and abs(_avg_accel) > _dynamic_threshold
 
         if current_roc > 0.01:
             price_direction = "UP"
@@ -765,10 +796,22 @@ class BaseStrategy(ABC):
                     result["direction"] = _full.direction
             except Exception:
                 # Enrichment is best-effort — fall back to base result on any error.
-                # Include traceback at debug so regressions in parabolic_detector
-                # are visible when debug logging is on without impacting the
-                # hot path at higher log levels.
-                logger.debug("parabolic_detector enrichment skipped", exc_info=True)
+                # B-7: track the error rate so persistent failures are visible.
+                BaseStrategy._parabolic_error_count += 1
+                _ec = BaseStrategy._parabolic_error_count
+                if _ec % BaseStrategy._PARABOLIC_ERROR_WARN_EVERY == 0:
+                    logger.warning(
+                        "parabolic_detector enrichment has failed %d consecutive times — "
+                        "check analyzers.parabolic_detector for regressions.",
+                        _ec,
+                        exc_info=True,
+                    )
+                else:
+                    logger.debug("parabolic_detector enrichment skipped", exc_info=True)
+            else:
+                # Success path: reset error counter so we don't warn again until
+                # the next run of consecutive failures.
+                BaseStrategy._parabolic_error_count = 0
 
         return result
 
@@ -806,28 +849,38 @@ class BaseStrategy(ABC):
         if len(closes) < 10:
             return {"is_exhausted": False, "signals": [], "score": 0.0}
 
-        # 1. Histogram deceleration
-        if histogram is not None and len(histogram) >= 4:
-            h = np.asarray(histogram, dtype=float)
-            # Check if absolute histogram is shrinking for 3+ bars
-            if (abs(h[-1]) < abs(h[-2]) < abs(h[-3])):
-                signals.append("histogram_deceleration")
-                score += 0.3
+        # B-Q4: weighted voting rather than raw signal count.
+        # Weights reflect the information content of each signal; a volume climax
+        # at an extreme carries far more weight than simple range contraction.
+        # Exhaustion is declared when the weighted score reaches 0.50 or higher.
+        #
+        # Gate rule: when a MACD histogram is supplied, its deceleration is treated
+        # as a required gate — price-only signals alone are insufficient to confirm
+        # momentum exhaustion if the histogram is available but NOT decelerating.
 
-        # 2. Candle range contraction
+        # 1. Histogram deceleration (weight 0.40 — highest single-signal weight)
+        histogram_provided = histogram is not None
+        histogram_decelerating = False
+        if histogram_provided and len(histogram) >= 4:
+            h = np.asarray(histogram, dtype=float)
+            if abs(h[-1]) < abs(h[-2]) < abs(h[-3]):
+                signals.append("histogram_deceleration")
+                score += 0.40
+                histogram_decelerating = True
+
+        # 2. Candle range contraction (weight 0.20)
         ranges = highs - lows
         if len(ranges) >= 5:
-            # 3 consecutive shrinking candle ranges
             if ranges[-1] < ranges[-2] < ranges[-3]:
                 signals.append("range_contraction")
-                score += 0.25
-            # Tiny candles relative to recent average
+                score += 0.20
+            # Tiny candles relative to recent average (weight 0.10)
             avg_range = float(np.mean(ranges[-20:]))
             if avg_range > 0 and ranges[-1] < avg_range * 0.4:
                 signals.append("doji_exhaustion")
-                score += 0.15
+                score += 0.10
 
-        # 3. Volume climax (spike volume at extreme)
+        # 3. Volume climax — spike at extreme (weight 0.35 / 0.15)
         if len(volumes) >= 20:
             avg_vol = float(np.mean(volumes[-20:]))
             if avg_vol > 0:
@@ -839,19 +892,25 @@ class BaseStrategy(ABC):
                     signals.append("volume_spike")
                     score += 0.15
 
-        # 4. Waning momentum: smaller bodies with bigger wicks
+        # 4. Waning momentum: smaller bodies with bigger wicks (weight 0.15)
         if len(closes) >= 3:
             bodies = [abs(closes[-i] - opens[-i]) for i in range(1, 4)]
             total_ranges = [highs[-i] - lows[-i] for i in range(1, 4)]
-            # Body shrinking while range stays same = indecision
             if (total_ranges[0] > 0 and total_ranges[1] > 0
                     and bodies[0] < bodies[1] * 0.6
                     and total_ranges[0] >= total_ranges[1] * 0.7):
                 signals.append("waning_momentum")
-                score += 0.2
+                score += 0.15
+
+        # Gate: if histogram data was provided but is NOT decelerating, that is a
+        # counter-signal to exhaustion — a still-expanding histogram means momentum
+        # is intact regardless of price-structure signals.
+        histogram_gate_ok = (not histogram_provided) or histogram_decelerating
+
+        is_exhausted = score >= 0.50 and histogram_gate_ok
 
         return {
-            "is_exhausted": len(signals) >= 2,
+            "is_exhausted": is_exhausted,
             "signals": signals,
             "score": min(1.0, round(score, 3)),
         }
@@ -921,17 +980,25 @@ class BaseStrategy(ABC):
 
 _STRATEGY_CONFIDENCE_RANGE: Dict[str, Tuple[float, float]] = {
     # strategy_name: (floor, cap)
+    #
+    # B-8: caps are set to each strategy's realistic output maximum based on
+    # how many independent conditions must align.  High-conviction, multi-leg
+    # strategies (SMC, Wyckoff, ExtremeReversal) can legitimately reach 95.
+    # Single-dimension strategies (MeanReversion, FundingRateArb, RangeScalper)
+    # rarely exceed 88-90 even in ideal setups.  Differentiating these caps
+    # ensures the linear rescale below produces meaningfully different
+    # normalized values rather than identity-mapping the majority of strategies.
     "SmartMoneyConcepts":    (40, 95),
     "InstitutionalBreakout": (40, 95),
     "ExtremeReversal":       (40, 95),
-    "MeanReversion":         (40, 92),
-    "PriceAction":           (40, 93),
-    "Momentum":              (40, 93),
-    "MomentumContinuation":  (40, 93),
-    "Ichimoku":              (40, 94),
-    "IchimokuCloud":         (40, 94),
-    "ElliottWave":           (40, 94),
-    "FundingRateArb":        (40, 92),
+    "MeanReversion":         (40, 88),
+    "PriceAction":           (40, 92),
+    "Momentum":              (40, 90),
+    "MomentumContinuation":  (40, 90),
+    "Ichimoku":              (40, 91),
+    "IchimokuCloud":         (40, 91),
+    "ElliottWave":           (40, 91),
+    "FundingRateArb":        (40, 88),
     "RangeScalper":          (40, 88),
     "WyckoffAccDist":        (40, 95),
     "Wyckoff":               (40, 95),
@@ -952,6 +1019,14 @@ def normalize_confidence(strategy_name: str, raw_confidence: float) -> float:
     to the common [NORM_FLOOR, NORM_CAP] range so that a 75 from
     RangeScalper and a 75 from SMC carry equivalent conviction.
 
+    B-8: strategies with (src_floor, src_cap) == (NORM_FLOOR, NORM_CAP) would
+    receive identity mapping — no rescaling.  To ensure every registered
+    strategy benefits from normalization, their caps are set to realistic
+    output maxima (see _STRATEGY_CONFIDENCE_RANGE).  Strategies with cap < 95
+    will have their scores scaled upward at the top end, making the full
+    [40, 95] normalized range accessible even for strategies that inherently
+    produce narrower raw ranges.
+
     If the strategy is unknown, the raw value is returned unchanged
     (safe default — avoids breaking new strategies).
     """
@@ -963,6 +1038,10 @@ def normalize_confidence(strategy_name: str, raw_confidence: float) -> float:
     # Guard against division by zero (floor == cap)
     if src_cap <= src_floor:
         return raw_confidence
+
+    # Short-circuit for the identity case (no work needed).
+    if src_floor == NORM_FLOOR and src_cap == NORM_CAP:
+        return round(max(NORM_FLOOR, min(NORM_CAP, raw_confidence)), 2)
 
     # Linear rescale: [src_floor, src_cap] → [NORM_FLOOR, NORM_CAP]
     clamped = max(src_floor, min(src_cap, raw_confidence))
