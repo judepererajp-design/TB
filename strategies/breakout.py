@@ -100,6 +100,7 @@ class BreakoutStrategy(BaseStrategy):
         closes = df['close'].values
         highs = df['high'].values
         lows = df['low'].values
+        opens = df['open'].values
         volumes = df['volume'].values
 
         lookback = getattr(self._cfg, 'donchian_period', 20)
@@ -127,6 +128,7 @@ class BreakoutStrategy(BaseStrategy):
         current_close = closes[-1]
         current_high  = highs[-1]
         current_low   = lows[-1]
+        current_open  = opens[-1]
         current_vol   = volumes[-1]
         # BR-2: exclude current bar from denominator so vol_ratio is not
         # deflated at precisely the moment we need it sharpest.
@@ -144,7 +146,10 @@ class BreakoutStrategy(BaseStrategy):
         # Slope: compare current ADX against the value 3 bars ago.
         _adx_prev = self.calculate_adx(highs[:-3], lows[:-3], closes[:-3], period=14) if len(closes) > 17 else adx
         _adx_rising = (adx - _adx_prev) >= 1.5   # Rising at least 1.5 pts over 3 bars
-        if adx < min_adx and not _adx_rising:
+        # BR-Q2b: require adx > 15 when using the rising-slope bypass.  Without the
+        # floor, ADX crawling from 10 → 12 passes as "rising" — that's directionless
+        # noise, not accumulation.  The target range for rising-slope alts is 15-22.
+        if adx < min_adx and not (_adx_rising and adx > 15):
             return None
 
         # Volume spike check
@@ -184,6 +189,32 @@ class BreakoutStrategy(BaseStrategy):
             confluence.append(f"✅ Volume: {vol_ratio:.1f}x average")
         else:
             return None
+
+        # BR-Q5: breakout quality scoring — body % and distance from level.
+        # A real breakout candle closes well into new territory with a solid body;
+        # a wick-only probe or doji at the level is a low-quality entry signal.
+        candle_range = current_high - current_low
+        if candle_range > 0:
+            body = abs(current_close - current_open)
+            body_pct = body / candle_range           # 0.0 – 1.0
+            if body_pct >= 0.65:                     # Marubozu-class: strong conviction
+                confidence += 5
+                confluence.append(f"💪 Strong body: {body_pct:.0%} of candle range")
+            elif body_pct < 0.35:                    # Doji / wick: low conviction
+                confidence -= 5
+                confluence.append(f"⚠️ Weak body: {body_pct:.0%} — possible wick probe")
+
+        # BR-Q5b: distance from level — price well beyond the channel adds conviction.
+        if direction == "LONG" and atr > 0:
+            dist_atr = (current_close - channel_high) / atr
+            if dist_atr >= 0.5:
+                confidence += 3
+                confluence.append(f"📐 Strong close: {dist_atr:.1f}× ATR beyond level")
+        elif direction == "SHORT" and atr > 0:
+            dist_atr = (channel_low - current_close) / atr
+            if dist_atr >= 0.5:
+                confidence += 3
+                confluence.append(f"📐 Strong close: {dist_atr:.1f}× ATR beyond level")
 
         # DIRECTIONAL-GATE FIX: Block counter-trend breakouts in strong trends.
         # In BEAR_TREND, a breakout LONG is fighting weekly structure. In BULL_TREND,
