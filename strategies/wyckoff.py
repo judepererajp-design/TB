@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 # ── W-3+: Module-level failure rate counter ───────────────────────────────────
 # Tracks analyzer call outcomes so we can detect systemic failure spikes without
 # needing a full external metrics backend.
-_wyckoff_stats: Dict[str, float] = {"failures": 0.0, "total": 0.0}
+_wyckoff_stats: Dict[str, float] = {"failures": 0.0, "total": 0.0, "struct_rejected": 0.0}
 _STATS_LOG_INTERVAL = 50  # log failure rate every N total calls
 
 
@@ -111,7 +111,8 @@ class WyckoffAccDist(BaseStrategy):
                 rate = _wyckoff_stats["failures"] / _t
                 logger.warning(
                     f"WyckoffAnalyzer failure rate: {rate:.1%} "
-                    f"({int(_wyckoff_stats['failures'])}/{int(_t)} calls) — "
+                    f"({int(_wyckoff_stats['failures'])}/{int(_t)} calls) "
+                    f"struct_rejected={int(_wyckoff_stats['struct_rejected'])} — "
                     f"last error: {e}"
                 )
             else:
@@ -143,24 +144,30 @@ class WyckoffAccDist(BaseStrategy):
         _max_range_atr  = getattr(self._cfg, "max_range_atr_mult", 12.0)
 
         if result.range_bars > 0 and result.range_bars < _min_range_bars:
+            _wyckoff_stats["struct_rejected"] += 1
             logger.debug(
                 f"WyckoffAccDist {symbol}: range too short ({result.range_bars} bars "
-                f"< min {_min_range_bars}) — skipping"
+                f"< min {_min_range_bars}) — skipping "
+                f"[struct_rejected={int(_wyckoff_stats['struct_rejected'])}]"
             )
             return None
 
         if result.range_high > 0 and result.range_low > 0 and atr > 0:
             range_height_atr = (result.range_high - result.range_low) / atr
             if range_height_atr < _min_range_atr:
+                _wyckoff_stats["struct_rejected"] += 1
                 logger.debug(
                     f"WyckoffAccDist {symbol}: range height {range_height_atr:.1f}× ATR "
-                    f"< min {_min_range_atr}× — noise band, skipping"
+                    f"< min {_min_range_atr}× — noise band, skipping "
+                    f"[struct_rejected={int(_wyckoff_stats['struct_rejected'])}]"
                 )
                 return None
             if range_height_atr > _max_range_atr:
+                _wyckoff_stats["struct_rejected"] += 1
                 logger.debug(
                     f"WyckoffAccDist {symbol}: range height {range_height_atr:.1f}× ATR "
-                    f"> max {_max_range_atr}× — too wide to be a range, skipping"
+                    f"> max {_max_range_atr}× — too wide to be a range, skipping "
+                    f"[struct_rejected={int(_wyckoff_stats['struct_rejected'])}]"
                 )
                 return None
 
