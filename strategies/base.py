@@ -756,7 +756,9 @@ class BaseStrategy(ABC):
 
         if len(roc_of_roc) >= 5:
             _rr_std = float(np.std(roc_of_roc))
-            _dynamic_threshold = max(0.001, min(0.05, 1.5 * _rr_std)) if _rr_std > 0 else 0.005
+            # max(0.001, ...) handles the _rr_std==0 edge-case; the explicit guard
+            # is not needed because 1.5*0 = 0 and max(0.001, 0) = 0.001.
+            _dynamic_threshold = max(0.001, min(0.05, 1.5 * _rr_std))
         else:
             _dynamic_threshold = 0.005  # fallback for very short series
 
@@ -833,10 +835,18 @@ class BaseStrategy(ABC):
           - Volume climax (spike volume at extreme = capitulation)
 
         Returns dict with:
-          - is_exhausted: bool — 2+ exhaustion signals present
+          - is_exhausted: bool — weighted score ≥ 0.50 (with histogram gate)
           - signals: list of detected exhaustion signals
           - score: float 0-1 — exhaustion intensity
         """
+        # B-Q4 weight constants — named here for readability and ease of tuning.
+        _W_HISTOGRAM_DECEL = 0.40   # strongest single signal; momentum slowing visibly
+        _W_VOLUME_CLIMAX   = 0.35   # capitulation / blow-off top
+        _W_RANGE_CONTRACT  = 0.20   # consecutive narrowing candles
+        _W_VOLUME_SPIKE    = 0.15   # elevated but not extreme volume
+        _W_WANING_MOMENTUM = 0.15   # small bodies with persistent range
+        _W_DOJI_EXHAUSTION = 0.10   # candles well below recent average size
+
         opens   = np.asarray(opens,   dtype=float)
         highs   = np.asarray(highs,   dtype=float)
         lows    = np.asarray(lows,    dtype=float)
@@ -865,34 +875,34 @@ class BaseStrategy(ABC):
             h = np.asarray(histogram, dtype=float)
             if abs(h[-1]) < abs(h[-2]) < abs(h[-3]):
                 signals.append("histogram_deceleration")
-                score += 0.40
+                score += _W_HISTOGRAM_DECEL
                 histogram_decelerating = True
 
-        # 2. Candle range contraction (weight 0.20)
+        # 2. Candle range contraction
         ranges = highs - lows
         if len(ranges) >= 5:
             if ranges[-1] < ranges[-2] < ranges[-3]:
                 signals.append("range_contraction")
-                score += 0.20
-            # Tiny candles relative to recent average (weight 0.10)
+                score += _W_RANGE_CONTRACT
+            # Tiny candles relative to recent average
             avg_range = float(np.mean(ranges[-20:]))
             if avg_range > 0 and ranges[-1] < avg_range * 0.4:
                 signals.append("doji_exhaustion")
-                score += 0.10
+                score += _W_DOJI_EXHAUSTION
 
-        # 3. Volume climax — spike at extreme (weight 0.35 / 0.15)
+        # 3. Volume climax — spike at extreme
         if len(volumes) >= 20:
             avg_vol = float(np.mean(volumes[-20:]))
             if avg_vol > 0:
                 vol_ratio = volumes[-1] / avg_vol
                 if vol_ratio > 3.0:
                     signals.append("volume_climax")
-                    score += 0.35
+                    score += _W_VOLUME_CLIMAX
                 elif vol_ratio > 2.0:
                     signals.append("volume_spike")
-                    score += 0.15
+                    score += _W_VOLUME_SPIKE
 
-        # 4. Waning momentum: smaller bodies with bigger wicks (weight 0.15)
+        # 4. Waning momentum: smaller bodies with bigger wicks
         if len(closes) >= 3:
             bodies = [abs(closes[-i] - opens[-i]) for i in range(1, 4)]
             total_ranges = [highs[-i] - lows[-i] for i in range(1, 4)]
@@ -900,11 +910,13 @@ class BaseStrategy(ABC):
                     and bodies[0] < bodies[1] * 0.6
                     and total_ranges[0] >= total_ranges[1] * 0.7):
                 signals.append("waning_momentum")
-                score += 0.15
+                score += _W_WANING_MOMENTUM
 
-        # Gate: if histogram data was provided but is NOT decelerating, that is a
-        # counter-signal to exhaustion — a still-expanding histogram means momentum
-        # is intact regardless of price-structure signals.
+        # Gate: when histogram data is provided but NOT decelerating, that is a
+        # counter-signal to exhaustion — a still-expanding histogram means price
+        # momentum is intact regardless of what structure signals say.  When no
+        # histogram is passed (caller doesn't have MACD data), we cannot use it
+        # to veto, so the gate passes by default.
         histogram_gate_ok = (not histogram_provided) or histogram_decelerating
 
         is_exhausted = score >= 0.50 and histogram_gate_ok
