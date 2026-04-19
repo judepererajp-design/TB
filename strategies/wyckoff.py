@@ -173,6 +173,7 @@ class WyckoffAccDist(BaseStrategy):
                 return None
 
         _sl_atr_max = getattr(self._cfg, "sl_atr_max", 3)
+        _swing_lookback = getattr(self._cfg, "swing_lookback_bars", 50)
         vp = compute_vol_percentile(highs, lows, closes)
         if direction == "LONG":
             entry_low   = wy_entry_low
@@ -184,12 +185,12 @@ class WyckoffAccDist(BaseStrategy):
             # W-Q3: TP2 prefers structurally validated swing highs (multi-touch)
             swing_highs = []
             _tol = atr * 0.5
-            for i in range(1, min(50, len(highs) - 1)):
+            for i in range(1, min(_swing_lookback, len(highs) - 1)):
                 idx = -(i + 1)
                 if highs[idx] > highs[idx - 1] and highs[idx] > highs[idx + 1]:
                     if highs[idx] > entry_high + atr:
                         level = highs[idx]
-                        touches = sum(1 for h in highs[-50:] if abs(h - level) <= _tol)
+                        touches = sum(1 for h in highs[-_swing_lookback:] if abs(h - level) <= _tol)
                         swing_highs.append((touches, level))
             # Prefer levels tested 2+ times; fall back to any pivot if none qualify
             validated = [lvl for (cnt, lvl) in swing_highs if cnt >= 2]
@@ -208,12 +209,12 @@ class WyckoffAccDist(BaseStrategy):
             # W-Q3: TP2 prefers structurally validated swing lows (multi-touch)
             swing_lows  = []
             _tol = atr * 0.5
-            for i in range(1, min(50, len(lows) - 1)):
+            for i in range(1, min(_swing_lookback, len(lows) - 1)):
                 idx = -(i + 1)
                 if lows[idx] < lows[idx - 1] and lows[idx] < lows[idx + 1]:
                     if lows[idx] < entry_low - atr:
                         level = lows[idx]
-                        touches = sum(1 for l in lows[-50:] if abs(l - level) <= _tol)
+                        touches = sum(1 for l in lows[-_swing_lookback:] if abs(l - level) <= _tol)
                         swing_lows.append((touches, level))
             validated = [lvl for (cnt, lvl) in swing_lows if cnt >= 2]
             tp2 = max(validated) if validated else (

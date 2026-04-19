@@ -368,6 +368,7 @@ strategies:
     min_volume_24h: 5000000
     entry_staleness_atr: 2      # max ATR distance from entry zone mid before rejecting (W-2)
     sl_atr_max: 3               # max ATRs from entry zone edge for stop loss (W-4)
+    swing_lookback_bars: 50     # bars to scan for TP2 swing pivots (W-Q3)
     accumulation:
       ps_volume_mult: 1.5
       sc_volume_mult: 2.0
