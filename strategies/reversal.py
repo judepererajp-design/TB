@@ -73,7 +73,7 @@ class ReversalStrategy(BaseStrategy):
         rsi    = self.calculate_rsi(closes, rsi_period)
         bb_mid, bb_up, bb_lo = self.calculate_bollinger(closes, bb_period, bb_std)
         atr    = self.calculate_atr(highs, lows, closes, 14)
-        if atr == 0:
+        if atr == 0 or not np.isfinite(bb_mid) or not np.isfinite(bb_up) or not np.isfinite(bb_lo):
             return None
 
         current = closes[-1]

@@ -204,6 +204,8 @@ class PriceAction(BaseStrategy):
 
         # Bollinger extremes
         _, bb_upper, bb_lower = self.calculate_bollinger(closes, period=20, std_mult=2.0)
+        if not np.isfinite(bb_upper) or not np.isfinite(bb_lower):
+            return None
 
         # Round numbers: multiples of 10, 100, 1000 within 0.5%
         magnitude = 10 ** max(0, int(math.log10(current_price)) - 1)

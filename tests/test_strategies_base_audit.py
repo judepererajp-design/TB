@@ -1,6 +1,8 @@
 import inspect
 
 from strategies.base import BaseStrategy
+from strategies.price_action import PriceActionStrategy
+from strategies.reversal import ReversalStrategy
 
 
 def test_mtf_find_zone_bearish_uses_zone_high_anchor():
@@ -24,3 +26,10 @@ def test_indicator_cache_is_populated_for_repeated_calls():
     assert 'cache_key = ("rsi", period, cls._array_fingerprint(closes))' in src
     assert '"atr",' in src and '"adx",' in src and '"bb", period, std_mult' in src
     assert "cls._class_indicator_cache[cache_key] = result" in src
+
+
+def test_bollinger_nan_is_guarded_in_strategies():
+    rev_src = inspect.getsource(ReversalStrategy.analyze)
+    pa_src = inspect.getsource(PriceActionStrategy)
+    assert "np.isfinite(bb_mid)" in rev_src
+    assert "np.isfinite(bb_upper)" in pa_src

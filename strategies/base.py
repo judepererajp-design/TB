@@ -212,6 +212,8 @@ class BaseStrategy(ABC):
         swing_lows = []
         for i in range(2, min(20, len(highs) - 1)):
             idx = -(i + 1)
+            if idx - 1 < -len(highs):
+                continue
             if highs[idx] > highs[idx - 1] and highs[idx] > highs[idx + 1]:
                 swing_highs.append(highs[idx])
             if lows[idx] < lows[idx - 1] and lows[idx] < lows[idx + 1]:
