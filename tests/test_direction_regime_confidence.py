@@ -454,10 +454,10 @@ class TestUnconstrainedStrategies:
         assert not hasattr(RangeScalperStrategy, '_REGIME_CONF_COUNTER_TREND')
 
     def test_wyckoff_no_regime_dir(self):
-        """Wyckoff accumulation/distribution is phase-based, not trend-following."""
+        """Wyckoff now has direction-aware regime confidence to prevent counter-trend signals."""
         from strategies.wyckoff import WyckoffAccDist
-        assert not hasattr(WyckoffAccDist, '_REGIME_CONF_WITH_TREND')
-        assert not hasattr(WyckoffAccDist, '_REGIME_CONF_COUNTER_TREND')
+        assert hasattr(WyckoffAccDist, '_REGIME_CONF_WITH_TREND')
+        assert hasattr(WyckoffAccDist, '_REGIME_CONF_COUNTER_TREND')
 
     def test_funding_arb_no_regime_dir(self):
         """Funding rate arbitrage is regime-independent."""
