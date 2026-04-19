@@ -1863,3 +1863,29 @@ STRATEGY_KEY_MAP: dict[str, str] = {
     'HarmonicDetector': 'harmonic',
     'GeometricPatterns': 'geometric',
 }
+
+# ════════════════════════════════════════════════════════════════
+# X6. STRATEGY VALID-REGIME MAPPING — single source of truth
+# ════════════════════════════════════════════════════════════════
+# Centralised here so that adding a new Regime value (e.g. BULL_EUPHORIA)
+# requires updating exactly one place.  Each strategy's VALID_REGIMES class
+# attribute is derived from this dict.
+#
+# Key  = strategy `name` attribute (same as STRATEGY_FILE_MAP above)
+# Value = frozenset of regime strings that the strategy is permitted to run in
+#
+# Regime strings must match analyzers.regime.Regime enum values:
+#   BULL_TREND, BEAR_TREND, CHOPPY, VOLATILE, VOLATILE_PANIC, NEUTRAL
+
+STRATEGY_VALID_REGIMES: "dict[str, frozenset]" = {
+    "InstitutionalBreakout": frozenset({"BULL_TREND", "BEAR_TREND", "VOLATILE"}),
+    "ElliottWave":           frozenset({"BULL_TREND", "BEAR_TREND"}),
+    "FundingRateArb":        frozenset({"BULL_TREND", "BEAR_TREND", "VOLATILE", "CHOPPY", "UNKNOWN"}),
+    "Ichimoku":              frozenset({"BULL_TREND", "BEAR_TREND", "VOLATILE"}),
+    "MeanReversion":         frozenset({"CHOPPY"}),
+    "Momentum":              frozenset({"BULL_TREND", "BEAR_TREND", "VOLATILE"}),
+    "PriceAction":           frozenset({"BULL_TREND", "BEAR_TREND", "VOLATILE", "CHOPPY", "UNKNOWN"}),
+    "ExtremeReversal":       frozenset({"CHOPPY"}),
+    "SmartMoneyConcepts":    frozenset({"BULL_TREND", "BEAR_TREND", "VOLATILE", "VOLATILE_PANIC", "CHOPPY", "UNKNOWN"}),
+    "WyckoffAccDist":        frozenset({"BULL_TREND", "BEAR_TREND", "VOLATILE", "CHOPPY", "UNKNOWN"}),
+}

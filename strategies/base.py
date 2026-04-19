@@ -157,6 +157,31 @@ class BaseStrategy(ABC):
     _parabolic_error_count: int = 0
     _PARABOLIC_ERROR_WARN_EVERY: int = 5
 
+    # X5: per-strategy error-rate telemetry.
+    # Tracks how many times each strategy's top-level analyze() handler fires
+    # the except-branch (real bugs vs legitimate None returns).
+    # Key: strategy name  Value: cumulative exception count
+    _strategy_error_counts: Dict[str, int] = {}
+    _STRATEGY_ERROR_WARN_EVERY: int = 20
+
+    @classmethod
+    def _record_analyze_error(cls, strategy_name: str, exc: Exception, symbol: str = "") -> None:
+        """
+        Increment the per-strategy exception counter and emit a WARNING every
+        _STRATEGY_ERROR_WARN_EVERY failures so silent exception swallowing
+        stays visible without flooding the log.
+        """
+        cls._strategy_error_counts[strategy_name] = (
+            cls._strategy_error_counts.get(strategy_name, 0) + 1
+        )
+        count = cls._strategy_error_counts[strategy_name]
+        logger.debug(f"{strategy_name}.analyze {symbol}: {exc}")
+        if count % cls._STRATEGY_ERROR_WARN_EVERY == 0:
+            logger.warning(
+                f"{strategy_name}.analyze has raised {count} exceptions "
+                f"(latest: {exc!r}); check for config or data issues."
+            )
+
     def __init__(self):
         self._indicator_cache: Dict[str, Any] = {}
 

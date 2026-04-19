@@ -21,11 +21,18 @@ import numpy as np
 import pandas as pd
 
 from config.loader import cfg
+from config.constants import STRATEGY_VALID_REGIMES
 from strategies.base import BaseStrategy, SignalResult, SignalDirection, cfg_min_rr
 from utils.formatting import fmt_price
 from utils.risk_params import rp, compute_vol_percentile
 
 logger = logging.getLogger(__name__)
+
+# ── W-3+: Module-level failure rate counter ───────────────────────────────────
+# Tracks analyzer call outcomes so we can detect systemic failure spikes without
+# needing a full external metrics backend.
+_wyckoff_stats: Dict[str, float] = {"failures": 0.0, "total": 0.0, "struct_rejected": 0.0}
+_STATS_LOG_INTERVAL = 50  # log failure rate every N total calls
 
 
 class WyckoffAccDist(BaseStrategy):
@@ -33,8 +40,25 @@ class WyckoffAccDist(BaseStrategy):
     name = "WyckoffAccDist"
     description = "Wyckoff Spring/UTAD and SOS/SOW phase entries"
 
-    # Wyckoff accumulation/distribution works in all regimes
-    VALID_REGIMES = {"BULL_TREND", "BEAR_TREND", "VOLATILE", "CHOPPY", "UNKNOWN"}
+    # Wyckoff accumulation/distribution works in all regimes, but direction must
+    # align with trend to receive full confidence.  Counter-trend setups (LONG in
+    # BEAR_TREND, SHORT in BULL_TREND) receive a penalty; neutral regimes are flat.
+    VALID_REGIMES = STRATEGY_VALID_REGIMES["WyckoffAccDist"]
+
+    _REGIME_CONF_WITH_TREND = {
+        "BULL_TREND":  +8,
+        "BEAR_TREND":  +8,
+        "VOLATILE":    +3,
+        "CHOPPY":      -5,
+        "UNKNOWN":     0,
+    }
+    _REGIME_CONF_COUNTER_TREND = {
+        "BULL_TREND":  -12,   # SHORT in bull — counter-trend risk
+        "BEAR_TREND":  -12,   # LONG in bear — counter-trend risk
+        "VOLATILE":    +3,    # No dominant trend to counter
+        "CHOPPY":      -5,
+        "UNKNOWN":     0,
+    }
 
     def __init__(self):
         super().__init__()
@@ -44,7 +68,7 @@ class WyckoffAccDist(BaseStrategy):
         try:
             return await self._analyze(symbol, ohlcv_dict)
         except Exception as e:
-            logger.debug(f"WyckoffAccDist.analyze {symbol}: {e}")
+            self._record_analyze_error(self.name, e, symbol)
             return None
 
     async def _analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:
@@ -74,18 +98,78 @@ class WyckoffAccDist(BaseStrategy):
         confidence_base = getattr(self._cfg, "confidence_base", 76)
 
         # ── Run Wyckoff analysis ───────────────────────────────────────────
+        _wyckoff_stats["total"] += 1
         try:
             from patterns.wyckoff import WyckoffAnalyzer, WyckoffPhase
             analyzer = WyckoffAnalyzer()
             result   = analyzer.analyze(ohlcv, timeframe=tf)
         except Exception as e:
-            logger.debug(f"WyckoffAccDist: WyckoffAnalyzer error for {symbol}: {e}")
+            _wyckoff_stats["failures"] += 1
+            # W-3+: log failure rate periodically; individual errors go to debug
+            _t = _wyckoff_stats["total"]
+            if _t > 0 and int(_t) % _STATS_LOG_INTERVAL == 0:
+                rate = _wyckoff_stats["failures"] / _t
+                logger.warning(
+                    f"WyckoffAnalyzer failure rate: {rate:.1%} "
+                    f"({int(_wyckoff_stats['failures'])}/{int(_t)} calls) "
+                    f"struct_rejected={int(_wyckoff_stats['struct_rejected'])} — "
+                    f"last error: {e}"
+                )
+            else:
+                logger.debug(f"WyckoffAccDist: WyckoffAnalyzer error for {symbol}: {e}")
             return None
 
         if result is None:
             return None
 
         phase = result.phase
+
+        # W-Q1: Meta-confidence gate — reject low-conviction analyzer outputs.
+        # If the pattern detector itself is uncertain, don't trade it.
+        _min_analyzer_confidence = getattr(self._cfg, "min_analyzer_confidence", 60)
+        if result.confidence < _min_analyzer_confidence:
+            logger.debug(
+                f"WyckoffAccDist {symbol}: analyzer confidence {result.confidence:.0f} "
+                f"< min {_min_analyzer_confidence} — skipping"
+            )
+            return None
+
+        # W-S1: Independent structural validation — runs against raw OHLCV data,
+        # independent of analyzer confidence, to ensure the detected range has
+        # adequate duration and a realistic ATR-relative size.  This breaks the
+        # single analyzer-trust chain: a high-confidence but structurally poor
+        # range can still be rejected here.
+        _min_range_bars = getattr(self._cfg, "min_range_bars", 20)
+        _min_range_atr  = getattr(self._cfg, "min_range_atr_mult", 1.5)
+        _max_range_atr  = getattr(self._cfg, "max_range_atr_mult", 12.0)
+
+        if result.range_bars > 0 and result.range_bars < _min_range_bars:
+            _wyckoff_stats["struct_rejected"] += 1
+            logger.debug(
+                f"WyckoffAccDist {symbol}: range too short ({result.range_bars} bars "
+                f"< min {_min_range_bars}) — skipping "
+                f"[struct_rejected={int(_wyckoff_stats['struct_rejected'])}]"
+            )
+            return None
+
+        if result.range_high > 0 and result.range_low > 0 and atr > 0:
+            range_height_atr = (result.range_high - result.range_low) / atr
+            if range_height_atr < _min_range_atr:
+                _wyckoff_stats["struct_rejected"] += 1
+                logger.debug(
+                    f"WyckoffAccDist {symbol}: range height {range_height_atr:.1f}× ATR "
+                    f"< min {_min_range_atr}× — noise band, skipping "
+                    f"[struct_rejected={int(_wyckoff_stats['struct_rejected'])}]"
+                )
+                return None
+            if range_height_atr > _max_range_atr:
+                _wyckoff_stats["struct_rejected"] += 1
+                logger.debug(
+                    f"WyckoffAccDist {symbol}: range height {range_height_atr:.1f}× ATR "
+                    f"> max {_max_range_atr}× — too wide to be a range, skipping "
+                    f"[struct_rejected={int(_wyckoff_stats['struct_rejected'])}]"
+                )
+                return None
 
         # ── Phase gate — only act on Phase C and D ─────────────────────────
         from patterns.wyckoff import WyckoffPhase as WP
@@ -119,6 +203,27 @@ class WyckoffAccDist(BaseStrategy):
             confidence += 8
         if result.utad_detected:
             confidence += 8
+        # W-Q2: real Wyckoff volume narrative bonuses
+        if result.volume_contraction_in_range:
+            confidence += 8    # volume contracted during range — institutional narrative ✔
+        if result.dryup_before_event:
+            confidence += 5    # dry-up → expansion sequence confirmed
+
+        # ── W-1: Direction-aware regime bonus/penalty ─────────────────────
+        _is_with_trend = (
+            (direction == "LONG"  and regime == "BULL_TREND") or
+            (direction == "SHORT" and regime == "BEAR_TREND")
+        )
+        if _is_with_trend or regime not in ("BULL_TREND", "BEAR_TREND"):
+            regime_bonus = self._REGIME_CONF_WITH_TREND.get(regime, 0)
+        else:
+            regime_bonus = self._REGIME_CONF_COUNTER_TREND.get(regime, 0)
+            # Regime scaling: high-conviction phase signals (analyzer ≥ 80) earn a partial
+            # reprieve — a genuine Spring at macro support is not the same as a random
+            # counter-trend guess.  Still penalised, just less harshly.
+            if result.confidence >= 80:
+                regime_bonus += 4
+        confidence += regime_bonus
 
         # ── Entry zone from WyckoffResult ──────────────────────────────────
         entry_zone = result.entry_zone
@@ -128,37 +233,74 @@ class WyckoffAccDist(BaseStrategy):
         wy_stop_loss = result.stop_loss
         current_price = closes[-1]
 
-        # Validate that entry zone makes sense (price should be near it)
-        if abs(current_price - (wy_entry_low + wy_entry_high) / 2) > atr * 5:
+        # W-2+: Dynamic staleness — tighten in high-vol regimes to avoid chasing
+        # Compute vol_percentile early so we can use it for both staleness and TPs
+        vp = compute_vol_percentile(highs, lows, closes)
+        _staleness_atr = getattr(self._cfg, "entry_staleness_atr", 2)
+        _staleness_mult = 0.75 if vp >= 0.70 else 1.0   # tighter in high-vol environments
+        if abs(current_price - (wy_entry_low + wy_entry_high) / 2) > atr * _staleness_atr * _staleness_mult:
             return None
 
-        vp = compute_vol_percentile(highs, lows, closes)
+        # W-Q4: Phase D requires Phase E onset — price must break the range boundary
+        # with volume confirmation before entry (avoid buying "hope it works" zones)
+        if phase in (WP.ACCUMULATION_D, WP.DISTRIBUTION_D):
+            key = result.key_level
+            phase_e_confirmed = (
+                (direction == "LONG"  and current_price > key and result.volume_confirms) or
+                (direction == "SHORT" and current_price < key and result.volume_confirms)
+            )
+            if not phase_e_confirmed:
+                return None
+
+        _sl_atr_max = getattr(self._cfg, "sl_atr_max", 3)
+        _swing_lookback = getattr(self._cfg, "swing_lookback_bars", 50)
+        # vp already computed above for staleness check
         if direction == "LONG":
             entry_low   = wy_entry_low
             entry_high  = wy_entry_high
+            # W-4: clamp SL so it never trails more than sl_atr_max below entry
             stop_loss   = min(wy_stop_loss, entry_low - atr * 0.3)
+            stop_loss   = max(stop_loss,    entry_low - atr * _sl_atr_max)
             tp1         = entry_high + atr * rp.volatility_scaled_tp1(tf, vp)
-            # TP2: key structural level or swing high
+            # W-Q3: TP2 prefers structurally validated swing highs (multi-touch)
             swing_highs = []
-            for i in range(1, min(30, len(highs) - 1)):
+            _tol = atr * 0.5
+            for i in range(1, min(_swing_lookback, len(highs) - 1)):
                 idx = -(i + 1)
                 if highs[idx] > highs[idx - 1] and highs[idx] > highs[idx + 1]:
                     if highs[idx] > entry_high + atr:
-                        swing_highs.append(highs[idx])
-            tp2 = min(swing_highs) if swing_highs else entry_high + atr * rp.volatility_scaled_tp2(tf, vp)
+                        level = highs[idx]
+                        touches = sum(1 for h in highs[-_swing_lookback:] if abs(h - level) <= _tol)
+                        swing_highs.append((touches, level))
+            # Prefer levels tested 2+ times; fall back to any pivot if none qualify
+            validated = [lvl for (cnt, lvl) in swing_highs if cnt >= 2]
+            tp2 = min(validated) if validated else (
+                min(lvl for _, lvl in swing_highs) if swing_highs
+                else entry_high + atr * rp.volatility_scaled_tp2(tf, vp)
+            )
             tp3 = entry_high + atr * rp.volatility_scaled_tp3(tf, vp)
         else:
             entry_low   = wy_entry_low
             entry_high  = wy_entry_high
+            # W-4: clamp SL so it never exceeds sl_atr_max above entry
             stop_loss   = max(wy_stop_loss, entry_high + atr * 0.3)
+            stop_loss   = min(stop_loss,    entry_high + atr * _sl_atr_max)
             tp1         = entry_low - atr * rp.volatility_scaled_tp1(tf, vp)
+            # W-Q3: TP2 prefers structurally validated swing lows (multi-touch)
             swing_lows  = []
-            for i in range(1, min(30, len(lows) - 1)):
+            _tol = atr * 0.5
+            for i in range(1, min(_swing_lookback, len(lows) - 1)):
                 idx = -(i + 1)
                 if lows[idx] < lows[idx - 1] and lows[idx] < lows[idx + 1]:
                     if lows[idx] < entry_low - atr:
-                        swing_lows.append(lows[idx])
-            tp2 = max(swing_lows) if swing_lows else entry_low - atr * rp.volatility_scaled_tp2(tf, vp)
+                        level = lows[idx]
+                        touches = sum(1 for l in lows[-_swing_lookback:] if abs(l - level) <= _tol)
+                        swing_lows.append((touches, level))
+            validated = [lvl for (cnt, lvl) in swing_lows if cnt >= 2]
+            tp2 = max(validated) if validated else (
+                max(lvl for _, lvl in swing_lows) if swing_lows
+                else entry_low - atr * rp.volatility_scaled_tp2(tf, vp)
+            )
             tp3 = entry_low - atr * rp.volatility_scaled_tp3(tf, vp)
 
         risk = (entry_low - stop_loss) if direction == "LONG" else (stop_loss - entry_high)
@@ -181,11 +323,17 @@ class WyckoffAccDist(BaseStrategy):
                 confluence.append(f"   {note}")
         if result.volume_confirms:
             confluence.append("✅ Volume confirms the Wyckoff phase")
+        if result.volume_contraction_in_range:
+            confluence.append("✅ Volume contracted in range — institutional accumulation/distribution")
+        if result.dryup_before_event:
+            confluence.append("✅ Volume dry-up → expansion — textbook Wyckoff sequence")
         if result.spring_detected:
             confluence.append("✅ Spring detected — stop hunt below range support")
         if result.utad_detected:
             confluence.append("✅ UTAD detected — trap above range resistance")
-        confluence.append(f"📊 Regime: {regime} | TF: {tf}")
+        if result.range_bars > 0:
+            confluence.append(f"📐 Range: {result.range_bars} bars | height {(result.range_high - result.range_low) / atr:.1f}× ATR")
+        confluence.append(f"📊 Regime: {regime} ({'+' if regime_bonus >= 0 else ''}{regime_bonus}) | TF: {tf}")
         confluence.append(f"🎯 R:R {rr_ratio:.2f} | ATR: {fmt_price(atr)}")
 
         confidence = min(95, max(40, confidence))
@@ -210,8 +358,13 @@ class WyckoffAccDist(BaseStrategy):
                 "spring_detected": result.spring_detected,
                 "utad_detected": result.utad_detected,
                 "volume_confirms": result.volume_confirms,
+                "volume_contraction_in_range": result.volume_contraction_in_range,
+                "dryup_before_event": result.dryup_before_event,
                 "wyckoff_confidence": result.confidence,
                 "key_level": result.key_level,
+                "range_high": result.range_high,
+                "range_low": result.range_low,
+                "range_bars": result.range_bars,
                 "atr": atr,
                 "regime": regime,
             },

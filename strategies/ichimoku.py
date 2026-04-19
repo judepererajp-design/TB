@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 
 from config.loader import cfg
+from config.constants import STRATEGY_VALID_REGIMES
 from strategies.base import BaseStrategy, SignalResult, SignalDirection, cfg_min_rr
 from utils.formatting import fmt_price
 from utils.risk_params import rp, compute_vol_percentile
@@ -39,7 +40,7 @@ class Ichimoku(BaseStrategy):
     name = "Ichimoku"
     description = "Full Ichimoku cloud strategy: TK cross + Kumo + Chikou"
 
-    VALID_REGIMES = {"BULL_TREND", "BEAR_TREND", "VOLATILE"}
+    VALID_REGIMES = STRATEGY_VALID_REGIMES["Ichimoku"]
 
     # Direction-aware regime confidence: Ichimoku is a trend-following indicator.
     # Counter-trend signals (LONG in BEAR, SHORT in BULL) get penalized.
@@ -62,7 +63,7 @@ class Ichimoku(BaseStrategy):
         try:
             return await self._analyze(symbol, ohlcv_dict)
         except Exception as e:
-            logger.debug(f"Ichimoku.analyze {symbol}: {e}")
+            self._record_analyze_error(self.name, e, symbol)
             return None
 
     async def _analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:

@@ -14,6 +14,7 @@ import pandas as pd
 from typing import Dict, Optional
 
 from config.loader import cfg
+from config.constants import STRATEGY_VALID_REGIMES
 from strategies.base import BaseStrategy, SignalResult, SignalDirection, cfg_min_rr
 from utils.formatting import fmt_price
 from utils.risk_params import rp, compute_vol_percentile
@@ -26,21 +27,34 @@ class ReversalStrategy(BaseStrategy):
     name = "ExtremeReversal"
     description = "RSI extreme + Bollinger Band reversal with divergence"
 
-    # Reversals work at EXTREMES — which only happen after clear moves.
-    # Valid in CHOPPY (fading range boundaries) and VOLATILE (panic reversals).
-    # NEVER in a clean trend where "overbought" stays overbought.
-    VALID_REGIMES = {"CHOPPY", "VOLATILE"}
+    # Reversals work at EXTREMES — which happen after clear moves in tight conditions.
+    # Valid in CHOPPY (fading range boundaries).
+    # VOLATILE is excluded by default: extreme directional moves can extend 3-5×
+    # before reverting, making early fades high-risk. Set allow_volatile: true in
+    # config to opt back in (e.g., if scanning for panic capitulation setups).
+    VALID_REGIMES = STRATEGY_VALID_REGIMES["ExtremeReversal"]
 
     def __init__(self):
         super().__init__()
         self._cfg = cfg.strategies.reversal
 
     async def analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:
+        try:
+            return await self._analyze(symbol, ohlcv_dict)
+        except Exception as e:
+            self._record_analyze_error(self.name, e, symbol)
+            return None
+
+    async def _analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:
         # ── Regime gate ───────────────────────────────────────────────────
         try:
             from analyzers.regime import regime_analyzer
             regime = getattr(regime_analyzer.regime, 'value', 'UNKNOWN')
-            if regime not in self.VALID_REGIMES:
+            allow_volatile = bool(getattr(self._cfg, 'allow_volatile', False))
+            _valid = set(self.VALID_REGIMES)
+            if allow_volatile:
+                _valid = _valid | {"VOLATILE"}
+            if regime not in _valid:
                 return None  # RSI stays extreme in trends — don't fade
             # Volatile regime: increase thresholds (extremes are more extreme)
             _vol_adj = 5 if regime == "VOLATILE" else 0
@@ -101,11 +115,14 @@ class ReversalStrategy(BaseStrategy):
             return None
 
         # ── RSI divergence check ──────────────────────────────
+        div_strength = 0.0
         if req_div:
-            divergence = self._check_divergence(closes, highs, lows, direction, lookback=20)
-            if divergence:
-                confluence.append(f"✅ RSI divergence confirmed")
-                confidence += 10
+            div_strength = self._check_divergence(closes, highs, lows, direction, lookback=20)
+            if div_strength > 0:
+                # Scale bonus: +10 at minimum qualifying divergence, up to +18 for strong
+                _div_bonus = int(min(18, 10 + (div_strength - 1.0) * 8))
+                confluence.append(f"✅ RSI divergence confirmed (strength: {div_strength:.1f}x, +{_div_bonus})")
+                confidence += _div_bonus
             else:
                 confidence -= 5  # No divergence = weaker setup
 
@@ -118,9 +135,32 @@ class ReversalStrategy(BaseStrategy):
 
         # ── Volume confirmation ───────────────────────────────
         vol_ratio = cur_vol / avg_vol if avg_vol > 0 else 1.0
-        if vol_ratio >= 1.5:
+        vol_conf_mult = float(getattr(self._cfg, 'vol_confirmation_mult', 2.0))
+        if vol_ratio >= vol_conf_mult:
             confluence.append(f"✅ Volume: {vol_ratio:.1f}x average")
             confidence += 5
+        # Climactic volume: genuine capitulation/euphoria spikes are 3–5× normal.
+        if vol_ratio > 3.0:
+            confluence.append(f"🔥 Climactic volume: {vol_ratio:.1f}x — capitulation signal (+4)")
+            confidence += 4
+
+        # ── Late-divergence guard ─────────────────────────────
+        # If price has already bounced more than 1.5 ATR from the BB extreme,
+        # the reversal is underway and entering now is chasing.
+        _signal_extreme = bb_lo if direction == "LONG" else bb_up
+        if abs(current - _signal_extreme) > 1.5 * atr:
+            confluence.append(
+                f"⚠️ Late entry: {abs(current - _signal_extreme) / atr:.1f}× ATR from BB extreme (-4)"
+            )
+            confidence -= 4
+
+        # ── Divergence + volume coupling ─────────────────────
+        # Strong divergence without participation is a weaker signal: smart-money
+        # divergence must be accompanied by at least baseline volume to be credible.
+        vol_conf_mult_for_div = float(getattr(self._cfg, 'vol_confirmation_mult', 2.0))
+        if div_strength > 1.0 and vol_ratio < vol_conf_mult_for_div:
+            confluence.append("⚠️ Strong divergence but low volume — signal weaker (-3)")
+            confidence -= 3
 
         # ── Targets ───────────────────────────────────────────
         # Wire timeframe+volatility-scaled TPs for realistic targets per setup class
@@ -129,10 +169,12 @@ class ReversalStrategy(BaseStrategy):
         tp2_m = rp.volatility_scaled_tp2(tf, vp)
         tp3_m = rp.volatility_scaled_tp3(tf, vp)
 
+        # ── SL lookback: wider window for volatile extremes ──────
+        sl_lookback = max(3, int(getattr(self._cfg, 'sl_bar_lookback', 5)))
         if direction == "LONG":
             entry_low  = current - atr * rp.entry_zone_tight
             entry_high = current + atr * rp.entry_zone_atr
-            stop_loss  = lows[-3:].min() - atr * rp.sl_atr_mult
+            stop_loss  = lows[-sl_lookback:].min() - atr * rp.sl_atr_mult
             tp1 = current + atr * tp1_m
             tp2 = bb_mid  # Mean reversion target
             tp3 = current + atr * tp3_m
@@ -143,7 +185,7 @@ class ReversalStrategy(BaseStrategy):
         else:
             entry_high = current + atr * rp.entry_zone_tight
             entry_low  = current - atr * rp.entry_zone_atr
-            stop_loss  = highs[-3:].max() + atr * rp.sl_atr_mult
+            stop_loss  = highs[-sl_lookback:].max() + atr * rp.sl_atr_mult
             tp1 = current - atr * tp1_m
             tp2 = bb_mid
             tp3 = current - atr * tp3_m
@@ -153,7 +195,10 @@ class ReversalStrategy(BaseStrategy):
             tp3 = min(tp3, tp2 - atr * 0.3)
 
         risk = abs(current - stop_loss)
-        rr   = abs(tp2 - current) / risk if risk > 0 else 0
+        if risk <= 0:
+            return None
+        # X3: use calculate_effective_rr for consistent worst-case fill
+        rr   = self.calculate_effective_rr(direction, entry_low, entry_high, stop_loss, tp2)
         if rr < cfg_min_rr("intraday"):
             return None
 
@@ -177,9 +222,16 @@ class ReversalStrategy(BaseStrategy):
             return None
         return _candidate
 
-    def _check_divergence(self, closes, highs, lows, direction, lookback=20) -> bool:
+    def _check_divergence(self, closes, highs, lows, direction, lookback=20) -> float:
         """
-        Detect RSI divergence over last N bars.
+        Detect RSI divergence over last N bars and return a strength score.
+
+        Returns:
+            0.0  — no qualifying divergence
+            ≥1.0 — divergence detected; score = rsi_delta / MIN_RSI_DELTA so that
+                   1.0 = minimum qualifying (delta=5), 2.0 = double minimum (delta=10).
+                   Higher scores indicate stronger divergences that warrant more
+                   confidence. Callers should cap total bonus (e.g. min(18, …)).
 
         Requires two genuine swing extremes within the lookback window:
         - A swing low/high is a local extreme where both adjacent bars are higher/lower.
@@ -207,7 +259,7 @@ class ReversalStrategy(BaseStrategy):
             lows   = np.array(lows,   dtype=float)
 
             if len(closes) < lookback + 14:
-                return False
+                return 0.0
 
             window_highs = highs[-lookback:]
             window_lows  = lows[-lookback:]
@@ -217,7 +269,7 @@ class ReversalStrategy(BaseStrategy):
                 # Find the two most recent swing lows (local minima) in the window
                 swing_lows = self._find_swing_points_in_window(window_lows, is_high=False)
                 if len(swing_lows) < 2:
-                    return False
+                    return 0.0
 
                 # Most recent swing low and the one before it
                 recent_idx, recent_price = swing_lows[-1]
@@ -225,39 +277,79 @@ class ReversalStrategy(BaseStrategy):
 
                 # Price must make a lower low
                 if recent_price >= prior_price:
-                    return False
+                    return 0.0
 
                 # RSI at both swing lows
                 abs_recent = len(closes) - lookback + recent_idx
                 abs_prior  = len(closes) - lookback + prior_idx
-                rsi_recent = self.calculate_rsi(closes[:abs_recent + 1], 14)
-                rsi_prior  = self.calculate_rsi(closes[:abs_prior + 1],  14)
+                rsi_series = self._calculate_rsi_series(closes, 14)
+                if abs_recent >= len(rsi_series) or abs_prior >= len(rsi_series):
+                    return 0.0
+                rsi_recent = rsi_series[abs_recent]
+                rsi_prior  = rsi_series[abs_prior]
+                if not np.isfinite(rsi_recent) or not np.isfinite(rsi_prior):
+                    return 0.0
 
                 # RSI must be higher at lower price, by at least MIN_RSI_DELTA
-                return (rsi_recent - rsi_prior) >= MIN_RSI_DELTA
+                rsi_delta = rsi_recent - rsi_prior
+                if rsi_delta < MIN_RSI_DELTA:
+                    return 0.0
+                return rsi_delta / MIN_RSI_DELTA
 
             else:
                 # Bearish divergence: price makes higher high, RSI makes lower high
                 swing_highs = self._find_swing_points_in_window(window_highs, is_high=True)
                 if len(swing_highs) < 2:
-                    return False
+                    return 0.0
 
                 recent_idx, recent_price = swing_highs[-1]
                 prior_idx, prior_price   = swing_highs[-2]
 
                 if recent_price <= prior_price:
-                    return False
+                    return 0.0
 
                 abs_recent = len(closes) - lookback + recent_idx
                 abs_prior  = len(closes) - lookback + prior_idx
-                rsi_recent = self.calculate_rsi(closes[:abs_recent + 1], 14)
-                rsi_prior  = self.calculate_rsi(closes[:abs_prior + 1],  14)
+                rsi_series = self._calculate_rsi_series(closes, 14)
+                if abs_recent >= len(rsi_series) or abs_prior >= len(rsi_series):
+                    return 0.0
+                rsi_recent = rsi_series[abs_recent]
+                rsi_prior  = rsi_series[abs_prior]
+                if not np.isfinite(rsi_recent) or not np.isfinite(rsi_prior):
+                    return 0.0
 
                 # RSI must be lower at higher price, by at least MIN_RSI_DELTA
-                return (rsi_prior - rsi_recent) >= MIN_RSI_DELTA
+                rsi_delta = rsi_prior - rsi_recent
+                if rsi_delta < MIN_RSI_DELTA:
+                    return 0.0
+                return rsi_delta / MIN_RSI_DELTA
 
         except Exception:
-            return False
+            return 0.0
+
+    @staticmethod
+    def _calculate_rsi_series(closes, period: int = 14):
+        def _to_rsi(avg_gain: float, avg_loss: float) -> float:
+            if avg_loss == 0:
+                return 100.0
+            return 100.0 - (100.0 / (1.0 + (avg_gain / avg_loss)))
+
+        closes = np.asarray(closes, dtype=float)
+        rsi = np.full(len(closes), np.nan, dtype=float)
+        if len(closes) < period + 1:
+            return rsi
+        deltas = np.diff(closes)
+        gains = np.where(deltas > 0, deltas, 0.0)
+        losses = np.where(deltas < 0, -deltas, 0.0)
+        avg_gain = np.mean(gains[:period])
+        avg_loss = np.mean(losses[:period])
+        rsi[period] = _to_rsi(avg_gain, avg_loss)
+        for i in range(period, len(gains)):
+            avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+            avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+            idx = i + 1
+            rsi[idx] = _to_rsi(avg_gain, avg_loss)
+        return rsi
 
     @staticmethod
     def _find_swing_points_in_window(values, is_high: bool):

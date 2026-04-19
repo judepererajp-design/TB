@@ -210,8 +210,8 @@ strategies:
       lookback_swings: 20
       min_break_pct: 0.002
     order_blocks:
-      min_impulse_pct: 0.008
-      max_ob_age_bars: 50
+      min_impulse_pct: 0.5          # fraction of ATR the impulse body must exceed (was 0.008 × OB body — too loose)
+      max_ob_age_bars: 20           # max bars since OB formation (was 50 — 8+ days on 4h is too stale)
       require_volume_spike: true
       volume_spike_mult: 1.5
     fvg:
@@ -222,11 +222,11 @@ strategies:
       lookback: 30
       min_wick_pct: 0.003
     killzones:
-      london_open: [7, 10]
-      ny_open: [12, 15]
-      london_close: [15, 17]
-      asia_open: [0, 3]
-      killzone_bonus: 10
+      asia_open: [2, 4]             # Asia session: 02:00-04:00 UTC (2h)
+      london_open: [7, 9]           # London open: 07:00-09:00 UTC (2h)
+      ny_open: [13, 15]             # NY open: 13:00-15:00 UTC (2h)
+      london_close: [15, 17]        # London close: 15:00-17:00 UTC (2h, overlaps NY)
+      killzone_bonus: 10            # total active ~8h vs prior 14h (was >50% of day)
 
   breakout:
     enabled: true
@@ -245,12 +245,15 @@ strategies:
     confidence_base: 72
     min_volume_24h: 3000000
     rsi_period: 14
-    rsi_oversold: 28
-    rsi_overbought: 72
+    rsi_oversold: 20   # Crypto-appropriate: RSI regularly extends to 15 before reverting
+    rsi_overbought: 80  # Crypto-appropriate: RSI regularly extends to 85+ before reverting
     bb_period: 20
     bb_std: 2.5
     require_divergence: true
     require_rejection_candle: true
+    vol_confirmation_mult: 2.0
+    sl_bar_lookback: 5
+    allow_volatile: false
 
   mean_reversion:
     enabled: true
@@ -268,6 +271,12 @@ strategies:
     timeframes: ["4h", "1h"]
     confidence_base: 68
     min_volume_24h: 1000000
+    key_level_lookback: 50
+    key_level_tolerance_atr: 0.5
+    vol_confirmation_mult: 1.5
+    mtf_mismatch_penalty: 8
+    reject_mtf_mismatch: false
+    tp_min_gap_atr: 0.2
     patterns:
       pin_bar: true
       engulfing: true
@@ -342,6 +351,10 @@ strategies:
     min_volume_24h: 1000000
     range_lookback: 40
     edge_pct: 0.20
+    edge_atr_floor: 0.75
+    edge_atr_cap: 3.0
+    bos_hold_bars: 2
+    bos_breach_pct: 0.002
     rsi_overbought: 68
     rsi_oversold: 32
     vol_confirmation: 1.3
@@ -353,6 +366,13 @@ strategies:
     timeframe: "4h"
     confidence_base: 76
     min_volume_24h: 5000000
+    entry_staleness_atr: 2      # max ATR distance from entry zone mid before rejecting (W-2)
+    sl_atr_max: 3               # max ATRs from entry zone edge for stop loss (W-4)
+    swing_lookback_bars: 50     # bars to scan for TP2 swing pivots (W-Q3)
+    min_analyzer_confidence: 60 # reject analyzer results below this threshold (W-Q1)
+    min_range_bars: 20          # range must span at least this many bars (W-S1 duration)
+    min_range_atr_mult: 1.5     # range height must be ≥ this × ATR (W-S1 compression floor)
+    max_range_atr_mult: 12.0    # range height must be ≤ this × ATR (W-S1 trend ceiling)
     accumulation:
       ps_volume_mult: 1.5
       sc_volume_mult: 2.0

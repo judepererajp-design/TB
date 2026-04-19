@@ -58,15 +58,22 @@ class WyckoffPhase(str, Enum):
 @dataclass
 class WyckoffResult:
     phase: WyckoffPhase
-    confidence: float           # 0-100
-    direction: str              # LONG | SHORT
+    confidence: float               # 0-100
+    direction: str                  # LONG | SHORT
     entry_zone: Tuple[float, float]
     stop_loss: float
     key_level: float
     notes: List[str]
     spring_detected: bool = False
-    utad_detected: bool  = False
+    utad_detected: bool   = False
     volume_confirms: bool = False
+    # W-Q2: proper Wyckoff volume narrative flags
+    volume_contraction_in_range: bool = False   # volume contracted during TR vs prior trend
+    dryup_before_event: bool          = False   # quiet volume before Spring/UTAD/SOS
+    # W-S1: structural geometry — exposed so strategies can independently validate the range
+    range_high: float = 0.0         # upper boundary of detected trading range
+    range_low:  float = 0.0         # lower boundary of detected trading range
+    range_bars: int   = 0           # number of bars the range spans
 
 
 class WyckoffAnalyzer:
@@ -105,6 +112,11 @@ class WyckoffAnalyzer:
 
         range_high, range_low, range_start = range_result
         range_size = range_high - range_low
+        range_bars = len(closes) - range_start  # bars since range began
+
+        # W-Q2: volume narrative flags — computed once, shared across detectors
+        vol_contraction  = self._check_range_volume_contraction(volumes, range_start)
+        dryup_before_evt = self._check_dryup(volumes)
 
         # ── Detect Selling Climax (SC) or Buying Climax (BC) ─
         sc_result = self._find_climax(highs, lows, closes, volumes, avg_volume,
@@ -124,6 +136,10 @@ class WyckoffAnalyzer:
             ]
             if spring['volume_spike']:
                 notes.append("✅ Volume climax on Spring — absorption confirmed")
+            if vol_contraction:
+                notes.append("✅ Volume contracted inside range — Wyckoff narrative confirmed")
+            if dryup_before_evt:
+                notes.append("✅ Volume dry-up before Spring — textbook setup")
 
             sl = range_low - (range_size * 0.1)  # Below spring low
             entry_low  = range_low * 1.001
@@ -138,7 +154,12 @@ class WyckoffAnalyzer:
                 key_level=range_low,
                 notes=notes,
                 spring_detected=True,
-                volume_confirms=spring['volume_spike']
+                volume_confirms=spring['volume_spike'],
+                volume_contraction_in_range=vol_contraction,
+                dryup_before_event=dryup_before_evt,
+                range_high=range_high,
+                range_low=range_low,
+                range_bars=range_bars,
             )
 
         # ── Check for UTAD (Upthrust After Distribution) ─────
@@ -151,6 +172,10 @@ class WyckoffAnalyzer:
             ]
             if utad['volume_spike']:
                 notes.append("✅ Volume climax on UTAD — supply confirmed")
+            if vol_contraction:
+                notes.append("✅ Volume contracted inside range — Wyckoff narrative confirmed")
+            if dryup_before_evt:
+                notes.append("✅ Volume dry-up before UTAD — textbook setup")
 
             sl = range_high + (range_size * 0.1)
             entry_high = range_high * 0.999
@@ -165,7 +190,12 @@ class WyckoffAnalyzer:
                 key_level=range_high,
                 notes=notes,
                 utad_detected=True,
-                volume_confirms=utad['volume_spike']
+                volume_confirms=utad['volume_spike'],
+                volume_contraction_in_range=vol_contraction,
+                dryup_before_event=dryup_before_evt,
+                range_high=range_high,
+                range_low=range_low,
+                range_bars=range_bars,
             )
 
         # ── Check for Sign of Strength (SOS) in Phase D ──────
@@ -175,6 +205,10 @@ class WyckoffAnalyzer:
                 "✅ Wyckoff Sign of Strength — demand dominating",
                 "✅ Phase D accumulation — markup approaching",
             ]
+            if vol_contraction:
+                notes.append("✅ Volume contracted during range — institutional accumulation")
+            if dryup_before_evt:
+                notes.append("✅ Volume dry-up → expansion on SOS confirmed")
             return WyckoffResult(
                 phase=WyckoffPhase.ACCUMULATION_D,
                 confidence=70.0,
@@ -183,10 +217,47 @@ class WyckoffAnalyzer:
                 stop_loss=range_low - range_size * 0.05,
                 key_level=range_high,
                 notes=notes,
-                volume_confirms=True
+                volume_confirms=True,
+                volume_contraction_in_range=vol_contraction,
+                dryup_before_event=dryup_before_evt,
+                range_high=range_high,
+                range_low=range_low,
+                range_bars=range_bars,
             )
 
         return None
+
+    def _check_range_volume_contraction(
+        self, volumes, range_start: int
+    ) -> bool:
+        """
+        W-Q2: True when mean volume inside the trading range is meaningfully lower
+        than mean volume in the prior trend segment.  This validates the Wyckoff
+        narrative — accumulation/distribution requires volume to dry up as the smart
+        money absorbs supply/demand quietly.
+        """
+        if range_start < 5:
+            return False
+        _pre_range_lookback = self._min_range_bars  # same as min range to stay consistent
+        pre_range = volumes[:range_start][-_pre_range_lookback:]
+        in_range  = volumes[range_start:]
+        if len(pre_range) < 5 or len(in_range) < 5:
+            return False
+        return float(np.mean(in_range)) < float(np.mean(pre_range)) * 0.85
+
+    def _check_dryup(self, volumes) -> bool:
+        """
+        W-Q2: True when volume dried up in the bars immediately preceding the most
+        recent candles, followed by a volume pickup — the classic dry-up → expansion
+        pattern that precedes legitimate Springs, UTADs, and SOS moves.
+        Quiet window: bars -8 to -3 (relative to end); expansion window: last 3 bars.
+        """
+        if len(volumes) < 10:
+            return False
+        quiet   = float(np.mean(volumes[-8:-3]))
+        expand  = float(np.mean(volumes[-3:]))
+        overall = float(np.mean(volumes))
+        return expand > quiet * 1.25 and quiet < overall * 0.9
 
     def _detect_trading_range(
         self, highs, lows, closes, volumes
@@ -301,8 +372,9 @@ class WyckoffAnalyzer:
         self, closes, volumes, range_high, range_low, avg_volume
     ) -> bool:
         """
-        Sign of Strength: strong move up from range low toward range high on high volume.
-        Indicates Phase D — demand is dominating.
+        Sign of Strength: strong move up from range low toward range high on high volume,
+        preceded by a quiet (dry-up) period.  The dry-up → expansion sequence confirms
+        that demand is genuinely dominating, not just noise.
         """
         range_size = range_high - range_low
         current = closes[-1]
@@ -311,13 +383,24 @@ class WyckoffAnalyzer:
         if current < range_low + range_size * 0.4:
             return False
 
-        # Recent volume increasing
-        if len(volumes) >= 5:
-            recent_avg = np.mean(volumes[-5:])
-            older_avg  = np.mean(volumes[-15:-5]) if len(volumes) >= 15 else np.mean(volumes)
-            return recent_avg > older_avg * 1.2
+        # Recent volume increasing vs older baseline
+        if len(volumes) < 5:
+            return False
+        recent_avg = np.mean(volumes[-5:])
+        older_avg  = np.mean(volumes[-15:-5]) if len(volumes) >= 15 else np.mean(volumes)
+        if not (recent_avg > older_avg * 1.2):
+            return False
 
-        return False
+        # W-Q2: dry-up → expansion required — not just "recent > older"
+        # Look for a quiet window before the expansion (bars -10 to -5)
+        if len(volumes) >= 10:
+            quiet_window = float(np.mean(volumes[-10:-5]))
+            expansion    = float(np.mean(volumes[-5:]))
+            dryup_to_expansion = expansion > quiet_window * 1.25
+        else:
+            dryup_to_expansion = True  # insufficient data; don't gate
+
+        return dryup_to_expansion
 
 
 # ── Module-level convenience function ─────────────────────

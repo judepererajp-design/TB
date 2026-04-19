@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 
 from config.loader import cfg
+from config.constants import STRATEGY_VALID_REGIMES
 from strategies.base import BaseStrategy, SignalResult, SignalDirection, cfg_min_rr
 from utils.formatting import fmt_price
 from utils.risk_params import rp
@@ -30,7 +31,7 @@ class MeanReversion(BaseStrategy):
     name = "MeanReversion"
     description = "Z-score mean reversion in choppy/ranging markets"
 
-    VALID_REGIMES = {"CHOPPY"}
+    VALID_REGIMES = STRATEGY_VALID_REGIMES["MeanReversion"]
 
     def __init__(self):
         super().__init__()
@@ -40,7 +41,7 @@ class MeanReversion(BaseStrategy):
         try:
             return await self._analyze(symbol, ohlcv_dict)
         except Exception as e:
-            logger.debug(f"MeanReversion.analyze {symbol}: {e}")
+            self._record_analyze_error(self.name, e, symbol)
             return None
 
     async def _analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:
@@ -245,7 +246,8 @@ class MeanReversion(BaseStrategy):
         risk = (entry_low - stop_loss) if direction == "LONG" else (stop_loss - entry_high)
         if risk <= 0:
             return None
-        rr_ratio = abs(tp2 - current_price) / risk
+        # X3: use calculate_effective_rr for consistent worst-case fill
+        rr_ratio = self.calculate_effective_rr(direction, entry_low, entry_high, stop_loss, tp2)
 
         confluence: List[str] = [
             f"✅ Z-score: {z_score:.2f} (threshold: ±{z_threshold})",

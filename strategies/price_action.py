@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 
 from config.loader import cfg
-from config.constants import Penalties
+from config.constants import Penalties, STRATEGY_VALID_REGIMES
 from strategies.base import BaseStrategy, SignalResult, SignalDirection, cfg_min_rr
 from utils.formatting import fmt_price
 from utils.risk_params import rp, compute_vol_percentile
@@ -47,6 +47,7 @@ _PATTERN_WEIGHTS = {
 # 0.35 × 1.2 ATR ≈ 0.42 ATR — tight enough to respect pattern invalidation,
 # wide enough to survive market noise (spreads, slippage, minor wicks).
 _SL_BUFFER_FACTOR = 0.35
+_TP_MIN_GAP_ATR = 0.2
 
 
 class PriceAction(BaseStrategy):
@@ -55,7 +56,7 @@ class PriceAction(BaseStrategy):
     description = "Candlestick pattern detection at key structural levels"
 
     # Price action patterns work in any regime — regime bonus/penalty applied
-    VALID_REGIMES = {"BULL_TREND", "BEAR_TREND", "VOLATILE", "CHOPPY", "UNKNOWN"}
+    VALID_REGIMES = STRATEGY_VALID_REGIMES["PriceAction"]
 
     # Direction-aware regime confidence: with-trend gets a boost, counter-trend
     # gets a penalty.  Same fix as SMC — prevents inflating counter-trend signals.
@@ -82,7 +83,7 @@ class PriceAction(BaseStrategy):
         try:
             return await self._analyze(symbol, ohlcv_dict)
         except Exception as e:
-            logger.debug(f"PriceAction.analyze {symbol}: {e}")
+            self._record_analyze_error(self.name, e, symbol)
             return None
 
     async def _analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:
@@ -111,15 +112,12 @@ class PriceAction(BaseStrategy):
                 if _mtf_trigger["triggered"]:
                     _mtf_bonus = int(_mtf_trigger["quality"] * 10)  # Up to +10
 
-        tf = "4h"
+        tf = None
         for candidate_tf in ("4h", "1h"):
             if candidate_tf in ohlcv_dict and len(ohlcv_dict[candidate_tf]) >= 55:
                 tf = candidate_tf
                 break
-        else:
-            return None
-
-        if tf not in ohlcv_dict or len(ohlcv_dict[tf]) < 55:
+        if tf is None:
             return None
 
         ohlcv = ohlcv_dict[tf]
@@ -187,7 +185,8 @@ class PriceAction(BaseStrategy):
         primary_pattern = max(signal_patterns, key=lambda p: _PATTERN_WEIGHTS.get(p["pattern"], 0.5) * p["strength"])
 
         # ── Key level detection ────────────────────────────────────────────
-        lookback_kl = 50
+        lookback_kl = int(getattr(self._cfg, "key_level_lookback", 50))
+        lookback_kl = max(10, lookback_kl)
         swing_highs = []
         swing_lows  = []
         lb = min(lookback_kl, len(highs) - 2)
@@ -207,14 +206,23 @@ class PriceAction(BaseStrategy):
         if not np.isfinite(bb_upper) or not np.isfinite(bb_lower):
             return None
 
-        # Round numbers: multiples of 10, 100, 1000 within 0.5%
-        magnitude = 10 ** max(0, int(math.log10(current_price)) - 1)
+        # Round numbers: dynamic magnitude scaled to instrument price.
+        # Keep coarse levels for high-priced assets and usable decimals for sub-$1.
+        if current_price <= 0:
+            logger.warning(f"PriceAction: invalid current price for {symbol}: {current_price}")
+            return None
+        _log10 = math.floor(math.log10(current_price))
+        if current_price >= 1.0:
+            _exp = max(0, _log10 - 1)
+        else:
+            _exp = _log10 - 1
+        magnitude = 10 ** _exp
         nearest_round = round(current_price / magnitude) * magnitude
         round_proximity = abs(current_price - nearest_round) / current_price
 
         at_key_level = False
         key_level_desc = ""
-        kl_tolerance = atr * 1.5
+        kl_tolerance = atr * float(getattr(self._cfg, "key_level_tolerance_atr", 0.5))
 
         if direction == "LONG":
             # At swing low, BB lower, or round number below
@@ -249,10 +257,29 @@ class PriceAction(BaseStrategy):
         # ── Volume confirmation ────────────────────────────────────────────
         avg_vol    = float(np.mean(volumes[-20:]))
         vol_ratio  = volumes[-1] / avg_vol if avg_vol > 0 else 1.0
-        vol_confirmed = vol_ratio >= 1.5
+        vol_mult = float(getattr(self._cfg, "vol_confirmation_mult", 1.5))
+        vol_confirmed = vol_ratio >= vol_mult
+
+        # Rising volume sequence: 3-bar momentum toward the reversal bar
+        _vol_rising = (
+            len(volumes) >= 4
+            and volumes[-2] > volumes[-3] > volumes[-4]
+        )
+
+        # ── HTF alignment gate/penalty ───────────────────────────────────────
+        _mtf_mismatch = False
+        _mtf_penalty = 0
+        if _htf_bias["bias"] in ("BULLISH", "BEARISH") and _htf_bias["confidence"] > 55:
+            _htf_dir = "LONG" if _htf_bias["bias"] == "BULLISH" else "SHORT"
+            if direction != _htf_dir:
+                _mtf_mismatch = True
+                if bool(getattr(self._cfg, "reject_mtf_mismatch", False)):
+                    return None
+                _mtf_penalty = int(getattr(self._cfg, "mtf_mismatch_penalty", 8))
+                _mtf_bonus = 0
 
         # ── Confidence ────────────────────────────────────────────────────
-        confidence = float(confidence_base) + regime_bonus + _mtf_bonus
+        confidence = float(confidence_base) + regime_bonus + _mtf_bonus - _mtf_penalty
         confidence += primary_pattern["strength"] * 15
         if at_key_level:
             confidence += 12
@@ -260,6 +287,45 @@ class PriceAction(BaseStrategy):
             confidence += 8
         if len(signal_patterns) > 1:
             confidence += 5 * (len(signal_patterns) - 1)
+
+        # ── Prior-bar context for single-bar patterns ─────────────────────
+        # For PinBar and Doji — which are single-bar signals — check that the
+        # preceding bar's direction is consistent with the expected reversal.
+        # Strength is ATR-normalized: a large prior body = stronger context signal.
+        # LONG setup: prior bar should be bearish (downmove to fade)
+        # SHORT setup: prior bar should be bullish (upmove to fade)
+        _single_bar_patterns = {"PinBar", "Doji"}
+        _is_single_bar = primary_pattern["pattern"] in _single_bar_patterns
+        _prior_bar_confirms = False
+        _prior_bar_conflicts = False
+        _context_adj = 0.0
+        _context_bonus = 0.0
+        if _is_single_bar and len(opens) >= 2:
+            _prior_close_vs_open = closes[-2] - opens[-2]
+            _context_strength = abs(_prior_close_vs_open) / atr if atr > 0 else 0.0
+            _context_adj = min(5, _context_strength * 5)
+            if direction == "LONG" and _prior_close_vs_open < 0:
+                _prior_bar_confirms = True   # prior sell-off confirms reversal context
+                _context_bonus = _context_adj
+            elif direction == "SHORT" and _prior_close_vs_open > 0:
+                _prior_bar_confirms = True
+                _context_bonus = _context_adj
+            elif direction == "LONG" and _prior_close_vs_open > 0:
+                _prior_bar_conflicts = True  # prior bar moving with us = chasing
+                confidence -= _context_adj   # penalty applies in full, not capped
+            elif direction == "SHORT" and _prior_close_vs_open < 0:
+                _prior_bar_conflicts = True
+                confidence -= _context_adj   # penalty applies in full, not capped
+
+        # Vol-sequence bonuses: rising sequence (+4) + above-average magnitude (+2).
+        # Context and volume are correlated (a strong prior bar drives volume), so cap
+        # the combined upside at +8 to prevent correlated signals inflating confidence.
+        _vol_seq_bonus = 4.0 if _vol_rising else 0.0
+        _vol_mag_bonus = (
+            2.0 if (_vol_rising and avg_vol > 0 and volumes[-2] > 1.5 * avg_vol) else 0.0
+        )
+        _pa_micro_bonus = min(8, _context_bonus + _vol_seq_bonus + _vol_mag_bonus)
+        confidence += _pa_micro_bonus
 
         # ── Entry / SL / TP levels ────────────────────────────────────────
         # FIX: SL buffer used entry_zone_tight (0.10 ATR) — far too thin.
@@ -285,6 +351,9 @@ class PriceAction(BaseStrategy):
             tp2_candidates = [sh for sh in swing_highs[:3] if sh > entry_high + atr]
             tp2 = min(tp2_candidates) if tp2_candidates else (entry_high + atr * rp.volatility_scaled_tp2(tf, vp))
             tp3 = entry_high + atr * rp.volatility_scaled_tp3(tf, vp)
+            _tp_gap = atr * float(getattr(self._cfg, "tp_min_gap_atr", _TP_MIN_GAP_ATR))
+            tp2 = max(tp2, tp1 + _tp_gap)
+            tp3 = max(tp3, tp2 + _tp_gap)
         else:
             pattern_high = current_high
             entry_high   = current_price + atr * rp.entry_zone_tight
@@ -300,6 +369,9 @@ class PriceAction(BaseStrategy):
             tp2_candidates = [sl for sl in swing_lows[:3] if sl < entry_low - atr]
             tp2 = max(tp2_candidates) if tp2_candidates else (entry_low - atr * rp.volatility_scaled_tp2(tf, vp))
             tp3 = entry_low - atr * rp.volatility_scaled_tp3(tf, vp)
+            _tp_gap = atr * float(getattr(self._cfg, "tp_min_gap_atr", _TP_MIN_GAP_ATR))
+            tp2 = min(tp2, tp1 - _tp_gap)
+            tp3 = min(tp3, tp2 - _tp_gap)
 
         risk = (entry_low - stop_loss) if direction == "LONG" else (stop_loss - entry_high)
         if risk <= 0:
@@ -319,6 +391,19 @@ class PriceAction(BaseStrategy):
             confluence.append(f"✅ Key level: {key_level_desc}")
         if vol_confirmed:
             confluence.append(f"✅ Volume: {vol_ratio:.1f}x average")
+        if _vol_rising:
+            confluence.append(
+                "✅ Volume trend: rising sequence (x3 bars)"
+                + (" + magnitude" if _vol_mag_bonus > 0 else "")
+                + f" — micro-bonus +{_pa_micro_bonus:.0f} (cap 8)"
+            )
+        if _is_single_bar:
+            if _prior_bar_confirms:
+                confluence.append(f"✅ Prior bar: confirms reversal context (+{_context_bonus:.1f})")
+            elif _prior_bar_conflicts:
+                confluence.append(f"⚠️ Prior bar: conflicts with signal direction (-{_context_adj:.1f})")
+        if _mtf_mismatch:
+            confluence.append(f"⚠️ HTF mismatch: 4h {_htf_bias['bias']} vs signal {direction} (-{_mtf_penalty})")
         confluence.append(f"📊 Regime: {regime} | TF: {tf}")
         if _mtf_bonus > 0:
             confluence.append(
