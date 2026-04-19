@@ -140,6 +140,10 @@ class SmartMoneyConcepts(BaseStrategy):
         confidence_base = getattr(self._cfg, "confidence_base", 75)
         lookback_swings = getattr(getattr(self._cfg, "structure", self._cfg), "lookback_swings", 20)
         sweep_lookback  = getattr(getattr(self._cfg, "sweeps", self._cfg), "lookback", 30)
+        # Maximum bars between sweep and BOS for the sequencing bonus to fire at full value.
+        # The bonus is scaled by recency: +4 at 1 bar, tapering to 0 at bos_sweep_max_lag+1.
+        # Default 5: tight cause→effect on 15m/1h; still reasonable on 4h (= 20h window).
+        bos_sweep_max_lag = getattr(getattr(self._cfg, "sweeps", self._cfg), "bos_sweep_max_lag", 5)
         # Define OB config at top-level so it's in scope for Priority 3, Priority 4,
         # and the stacked-confluence scan (which may run before Priority 3 if
         # a higher-priority setup already set direction).
@@ -446,19 +450,21 @@ class SmartMoneyConcepts(BaseStrategy):
                 confluence.append(f"✅ Bullish OB at {fmt_price(ob_low)}-{fmt_price(ob_high)} ({_oi} bars ago)")
                 raw_data["ob_low"] = ob_low
                 raw_data["ob_high"] = ob_high
-                # Feature 1/SMC-Q5 (hybrid): OB mitigation tracking using wicks + closes.
-                # A close inside the OB fully absorbs supply/demand (strong mitigation = 1.0).
-                # A wick that touches but does not close inside is partial mitigation (= 0.5).
-                # Threshold ≥ 2.0 so you need 4 wick-only touches OR 2 close touches.
+                # Feature 1/SMC-Q5 (hybrid + recency): OB mitigation tracking.
+                # Close inside OB = strong absorption (1.0); wick touch = partial (0.5).
+                # Each touch is further weighted by recency: a tap 2 bars ago matters far
+                # more than one 18 bars ago.  weight = max(0, 1 - bars_since / ob_max_age).
+                # Threshold ≥ 2.0 calibrated so 2 recent closes OR ~4 recent wicks trigger.
                 _ob_score = sum(
-                    1.0 if ob_low <= closes[-j] <= ob_high
-                    else (0.5 if lows[-j] <= ob_high and highs[-j] >= ob_low else 0.0)
+                    (1.0 if ob_low <= closes[-j] <= ob_high
+                     else (0.5 if lows[-j] <= ob_high and highs[-j] >= ob_low else 0.0))
+                    * max(0.0, 1.0 - j / ob_max_age)
                     for j in range(1, _oi)
                 )
                 if _ob_score >= 2.0:
                     confidence -= 5
                     confluence.append(f"⚠️ OB mitigated (score {_ob_score:.1f}) — diminished freshness (-5)")
-                raw_data["ob_mitigation_score"] = round(_ob_score, 1)
+                raw_data["ob_mitigation_score"] = round(_ob_score, 2)
                 # Feature 6 (scoped): OB time decay applied only to the OB structural component.
                 # External signals (killzone, MTF, regime) are earned independently — they should
                 # not decay because the OB is old.  We track the pre-OB confidence and apply
@@ -476,16 +482,17 @@ class SmartMoneyConcepts(BaseStrategy):
                 confluence.append(f"✅ Bearish OB at {fmt_price(ob_low)}-{fmt_price(ob_high)} ({_oi} bars ago)")
                 raw_data["ob_low"] = ob_low
                 raw_data["ob_high"] = ob_high
-                # Feature 1/SMC-Q5 (hybrid): OB mitigation tracking (bearish OB).
+                # Feature 1/SMC-Q5 (hybrid + recency): OB mitigation tracking (bearish OB).
                 _ob_score = sum(
-                    1.0 if ob_low <= closes[-j] <= ob_high
-                    else (0.5 if lows[-j] <= ob_high and highs[-j] >= ob_low else 0.0)
+                    (1.0 if ob_low <= closes[-j] <= ob_high
+                     else (0.5 if lows[-j] <= ob_high and highs[-j] >= ob_low else 0.0))
+                    * max(0.0, 1.0 - j / ob_max_age)
                     for j in range(1, _oi)
                 )
                 if _ob_score >= 2.0:
                     confidence -= 5
                     confluence.append(f"⚠️ OB mitigated (score {_ob_score:.1f}) — diminished freshness (-5)")
-                raw_data["ob_mitigation_score"] = round(_ob_score, 1)
+                raw_data["ob_mitigation_score"] = round(_ob_score, 2)
                 # Feature 6 (scoped): OB time decay — structural component only.
                 _age_factor = max(0.0, 1.0 - (_oi / ob_max_age))
                 _ob_decay_mult = 0.8 + 0.2 * _age_factor
@@ -650,34 +657,43 @@ class SmartMoneyConcepts(BaseStrategy):
                 confluence.append(f"⚠️ Weak BOS displacement: {_bos_strength:.2f}× ATR (-3)")
             raw_data["bos_strength"] = round(_bos_strength, 3)
 
-            # Feature (R2-6): Sweep→BOS sequencing bonus.
+            # Feature (R2-6 / R3-2): Sweep→BOS sequencing bonus (recency-scaled).
             # Institutional flow: sweep out stops → accumulate/distribute → break structure.
-            # Detect whether the key swing level was swept (wick below/above + recovery)
-            # within the sweep_lookback window before the current BOS candle.
-            _bos_sweep_seq = False
+            # The bonus scales with how recently the sweep occurred — a sweep 1 bar before
+            # the BOS is a tight cause→effect; one 20 bars ago is much weaker evidence.
+            # Max bonus: +4 at k=1. Scales linearly to 0 at k = bos_sweep_max_lag + 1.
+            _bos_sweep_lag = None
             if direction == "LONG":
-                # Look for a prior bullish sweep (wick below key_swing_low then recovery)
                 for _k in range(1, min(sweep_lookback, len(lows) - 1)):
                     if (lows[-_k] < key_swing_low
                             and (key_swing_low - lows[-_k]) / key_swing_low >= min_wick_pct):
-                        _bos_sweep_seq = True
+                        _bos_sweep_lag = _k
                         break
             else:
-                # Look for a prior bearish sweep (wick above key_swing_high then recovery)
                 for _k in range(1, min(sweep_lookback, len(highs) - 1)):
                     if (highs[-_k] > key_swing_high
                             and (highs[-_k] - key_swing_high) / key_swing_high >= min_wick_pct):
-                        _bos_sweep_seq = True
+                        _bos_sweep_lag = _k
                         break
+            _bos_sweep_seq = _bos_sweep_lag is not None
             if _bos_sweep_seq:
-                confidence += 4
-                confluence.append("🔗 Sweep→BOS sequence confirmed: stop hunt preceded displacement (+4)")
+                _seq_scale = max(0.0, 1.0 - (_bos_sweep_lag - 1) / bos_sweep_max_lag)
+                _seq_bonus = round(4 * _seq_scale)
+                if _seq_bonus > 0:
+                    confidence += _seq_bonus
+                    confluence.append(
+                        f"🔗 Sweep→BOS sequence ({_bos_sweep_lag}b ago): "
+                        f"stop hunt preceded displacement (+{_seq_bonus})"
+                    )
             raw_data["bos_sweep_sequence"] = _bos_sweep_seq
+            raw_data["bos_sweep_lag"] = _bos_sweep_lag
 
-        # ── Feature 5: Stacked confluence bonus ──────────────────────────
-        # Count how many independent SMC factors are simultaneously present
-        # in the signal direction.  Three or more mutually-reinforcing signals
-        # dramatically reduce false-positive probability.
+        # ── Feature 5 (weighted): Stacked confluence bonus ───────────────
+        # Structure-confirming factors (BOS, sweep) score 2 points each;
+        # zone-based factors (FVG, OB) score 1 point each.  Threshold ≥ 4
+        # requires at minimum two structure factors OR both structure + one zone.
+        # This is equivalent to the old ≥3/4 binary count but correctly weights
+        # the difference between institutional displacement and passive zones.
         _cf_bos = (
             (direction == "LONG" and current_close > bos_swing_high)
             or (direction == "SHORT" and current_close < bos_swing_low)
@@ -687,14 +703,22 @@ class SmartMoneyConcepts(BaseStrategy):
             or (direction == "SHORT" and (_single_sweep_bear or _two_bar_sweep_bear))
         )
         _cf_fvg = False
+        _cf_fvg_high: float = 0.0
+        _cf_fvg_low:  float = 0.0
         if len(closes) >= 4:
             if direction == "LONG" and highs[-4] < lows[-2]:
                 _cf_fvg = True
+                _cf_fvg_low  = highs[-4]   # gap bottom
+                _cf_fvg_high = lows[-2]    # gap top
             elif direction == "SHORT" and lows[-4] > highs[-2]:
                 _cf_fvg = True
+                _cf_fvg_high = lows[-4]    # gap top
+                _cf_fvg_low  = highs[-2]   # gap bottom
         # OB confluence: already confirmed if setup_type == OrderBlock, otherwise
         # run a lightweight scan to check whether a valid OB is near current price.
         _cf_ob = raw_data.get("ob_low") is not None
+        _cf_ob_high = raw_data.get("ob_high", 0.0)
+        _cf_ob_low  = raw_data.get("ob_low", 0.0)
         if not _cf_ob:
             _ob_scan_end = min(ob_max_age, len(closes) - 3)
             for _sci in range(2, _ob_scan_end):
@@ -705,6 +729,8 @@ class SmartMoneyConcepts(BaseStrategy):
                             and (closes[-_sci + 1] - opens[-_sci + 1]) / atr >= ob_min_impulse
                             and closes[-_sci] <= current_close <= opens[-_sci] + atr * 0.5):
                         _cf_ob = True
+                        _cf_ob_high = opens[-_sci]
+                        _cf_ob_low  = closes[-_sci]
                         break
                 else:
                     _ob_body = closes[-_sci] - opens[-_sci]
@@ -713,12 +739,31 @@ class SmartMoneyConcepts(BaseStrategy):
                             and (opens[-_sci + 1] - closes[-_sci + 1]) / atr >= ob_min_impulse
                             and opens[-_sci] - atr * 0.5 <= current_close <= closes[-_sci]):
                         _cf_ob = True
+                        _cf_ob_high = closes[-_sci]
+                        _cf_ob_low  = opens[-_sci]
                         break
-        _smc_cf_count = int(_cf_bos) + int(_cf_sweep) + int(_cf_fvg) + int(_cf_ob)
-        if _smc_cf_count >= 3:
+
+        # Feature (R3-3): FVG + OB synergy — when the OB zone overlaps the FVG gap,
+        # the combined POI (Point of Interest) is significantly more reliable than
+        # either zone alone.  Overlap defined as the two ranges sharing any area.
+        _fvg_ob_synergy = False
+        if _cf_fvg and _cf_ob and _cf_ob_high > 0 and _cf_fvg_high > 0:
+            if _cf_ob_low <= _cf_fvg_high and _cf_ob_high >= _cf_fvg_low:
+                _fvg_ob_synergy = True
+                confidence += 4
+                confluence.append("🔗 OB inside FVG — high-probability POI confluence (+4)")
+        raw_data["fvg_ob_synergy"] = _fvg_ob_synergy
+
+        _smc_cf_score = (
+            (2 if _cf_bos else 0)
+            + (2 if _cf_sweep else 0)
+            + (1 if _cf_fvg else 0)
+            + (1 if _cf_ob else 0)
+        )
+        if _smc_cf_score >= 4:
             confidence += 6
-            confluence.append(f"🔗 Stacked SMC confluence: {_smc_cf_count}/4 factors (+6)")
-        raw_data["smc_cf_count"] = _smc_cf_count
+            confluence.append(f"🔗 Stacked SMC confluence: score {_smc_cf_score}/6 (+6)")
+        raw_data["smc_cf_score"] = _smc_cf_score
 
         # ── Direction-aware regime confidence ─────────────────────────────
         # With-trend (LONG in BULL, SHORT in BEAR) gets +8;
