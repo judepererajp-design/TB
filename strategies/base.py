@@ -12,6 +12,7 @@ This module also provides:
 """
 
 import logging
+import hashlib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
@@ -156,6 +157,15 @@ class BaseStrategy(ABC):
         """Clear the class-level indicator cache before processing a new symbol."""
         cls._class_indicator_cache.clear()
 
+    @classmethod
+    def _array_fingerprint(cls, arr: np.ndarray) -> str:
+        """Stable content fingerprint for cache keys."""
+        a = np.ascontiguousarray(np.asarray(arr, dtype=float))
+        h = hashlib.blake2b(digest_size=16)
+        h.update(str(a.shape).encode("utf-8"))
+        h.update(a.tobytes())
+        return h.hexdigest()
+
     # ── Abstract interface ─────────────────────────────────────────────
     @abstractmethod
     async def analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:
@@ -202,17 +212,17 @@ class BaseStrategy(ABC):
         swing_lows = []
         for i in range(2, min(20, len(highs) - 1)):
             idx = -(i + 1)
-            if idx - 1 >= -len(highs) and idx + 1 < 0:
-                if highs[idx] > highs[idx - 1] and highs[idx] > highs[idx + 1]:
-                    swing_highs.append(highs[idx])
-                if lows[idx] < lows[idx - 1] and lows[idx] < lows[idx + 1]:
-                    swing_lows.append(lows[idx])
+            if highs[idx] > highs[idx - 1] and highs[idx] > highs[idx + 1]:
+                swing_highs.append(highs[idx])
+            if lows[idx] < lows[idx - 1] and lows[idx] < lows[idx + 1]:
+                swing_lows.append(lows[idx])
 
-        if len(swing_highs) >= 2 and len(swing_lows) >= 2:
-            hh = swing_highs[0] > swing_highs[1]  # Higher high
-            hl = swing_lows[0] > swing_lows[1]     # Higher low
-            lh = swing_highs[0] < swing_highs[1]   # Lower high
-            ll = swing_lows[0] < swing_lows[1]      # Lower low
+        # Require at least 3 pivots so structure is not inferred from one bounce.
+        if len(swing_highs) >= 3 and len(swing_lows) >= 3:
+            hh = swing_highs[0] > swing_highs[1] > swing_highs[2]  # Higher highs
+            hl = swing_lows[0] > swing_lows[1] > swing_lows[2]     # Higher lows
+            lh = swing_highs[0] < swing_highs[1] < swing_highs[2]  # Lower highs
+            ll = swing_lows[0] < swing_lows[1] < swing_lows[2]     # Lower lows
 
             if hh and hl:
                 result["structure"] = "HH_HL"
@@ -305,7 +315,7 @@ class BaseStrategy(ABC):
                         and (opens[-i + 1] - closes[-i + 1]) > ob_body * 0.5):
                     ob_high = closes[-i]
                     ob_low = opens[-i]
-                    if ob_low > current and ob_low < current + atr * 3:
+                    if ob_high > current and ob_high < current + atr * 3:
                         recency_bonus = max(0, 1 - i / 30)
                         impulse_size = (opens[-i + 1] - closes[-i + 1]) / atr
                         vol_bonus = min(0.3, (volumes[-i + 1] / avg_vol - 1) * 0.15) if avg_vol > 0 else 0
@@ -415,12 +425,16 @@ class BaseStrategy(ABC):
         return result
 
     # ── Indicator helpers ──────────────────────────────────────────────
-    @staticmethod
-    def calculate_rsi(closes: np.ndarray, period: int = 14) -> float:
+    @classmethod
+    def calculate_rsi(cls, closes: np.ndarray, period: int = 14) -> float:
         """Wilder RSI. Returns the most recent RSI value (0-100)."""
         closes = np.asarray(closes, dtype=float)
         if len(closes) < period + 1:
             return 50.0
+        cache_key = ("rsi", period, cls._array_fingerprint(closes))
+        cached = cls._class_indicator_cache.get(cache_key)
+        if cached is not None:
+            return cached
         deltas = np.diff(closes)
         gains = np.where(deltas > 0, deltas, 0.0)
         losses = np.where(deltas < 0, -deltas, 0.0)
@@ -433,17 +447,29 @@ class BaseStrategy(ABC):
         if avg_loss == 0:
             return 100.0
         rs = avg_gain / avg_loss
-        return round(100.0 - (100.0 / (1.0 + rs)), 2)
+        result = float(100.0 - (100.0 / (1.0 + rs)))
+        cls._class_indicator_cache[cache_key] = result
+        return result
 
-    @staticmethod
-    def calculate_atr(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray,
-                       period: int = 14) -> float:
+    @classmethod
+    def calculate_atr(cls, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray,
+                      period: int = 14) -> float:
         """Average True Range using Wilder's smoothing."""
         highs  = np.asarray(highs,  dtype=float)
         lows   = np.asarray(lows,   dtype=float)
         closes = np.asarray(closes, dtype=float)
         if len(highs) < period + 1:
             return 0.0
+        cache_key = (
+            "atr",
+            period,
+            cls._array_fingerprint(highs),
+            cls._array_fingerprint(lows),
+            cls._array_fingerprint(closes),
+        )
+        cached = cls._class_indicator_cache.get(cache_key)
+        if cached is not None:
+            return cached
         trs = []
         for i in range(1, len(highs)):
             tr = max(
@@ -456,17 +482,29 @@ class BaseStrategy(ABC):
         atr = np.mean(trs[:period])
         for i in range(period, len(trs)):
             atr = (atr * (period - 1) + trs[i]) / period
-        return float(atr)
+        result = float(atr)
+        cls._class_indicator_cache[cache_key] = result
+        return result
 
-    @staticmethod
-    def calculate_adx(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray,
-                       period: int = 14) -> float:
+    @classmethod
+    def calculate_adx(cls, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray,
+                      period: int = 14) -> float:
         """Wilder ADX. Returns the most recent ADX value (0-100)."""
         highs  = np.asarray(highs,  dtype=float)
         lows   = np.asarray(lows,   dtype=float)
         closes = np.asarray(closes, dtype=float)
         if len(highs) < period * 2 + 1:
             return 0.0
+        cache_key = (
+            "adx",
+            period,
+            cls._array_fingerprint(highs),
+            cls._array_fingerprint(lows),
+            cls._array_fingerprint(closes),
+        )
+        cached = cls._class_indicator_cache.get(cache_key)
+        if cached is not None:
+            return cached
         dm_plus  = []
         dm_minus = []
         trs      = []
@@ -504,23 +542,30 @@ class BaseStrategy(ABC):
         adx_arr[period - 1] = np.mean(dx[:period])
         for i in range(period, len(dx)):
             adx_arr[i] = (adx_arr[i - 1] * (period - 1) + dx[i]) / period
-        return float(adx_arr[-1])
+        result = float(adx_arr[-1])
+        cls._class_indicator_cache[cache_key] = result
+        return result
 
-    @staticmethod
-    def calculate_bollinger(closes: np.ndarray, period: int = 20,
-                              std_mult: float = 2.0) -> Tuple[float, float, float]:
+    @classmethod
+    def calculate_bollinger(cls, closes: np.ndarray, period: int = 20,
+                            std_mult: float = 2.0) -> Tuple[float, float, float]:
         """
         Bollinger Bands.
         Returns (mid, upper, lower).
         """
         closes = np.asarray(closes, dtype=float)
         if len(closes) < period:
-            mid = float(closes[-1])
-            return mid, mid, mid
+            return float("nan"), float("nan"), float("nan")
+        cache_key = ("bb", period, std_mult, cls._array_fingerprint(closes))
+        cached = cls._class_indicator_cache.get(cache_key)
+        if cached is not None:
+            return cached
         window = closes[-period:]
         mid    = float(np.mean(window))
         std    = float(np.std(window, ddof=1))
-        return mid, mid + std_mult * std, mid - std_mult * std
+        result = (mid, mid + std_mult * std, mid - std_mult * std)
+        cls._class_indicator_cache[cache_key] = result
+        return result
 
     @staticmethod
     def calculate_effective_rr(
