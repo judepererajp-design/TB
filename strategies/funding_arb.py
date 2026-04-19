@@ -102,7 +102,10 @@ class FundingRateArb(BaseStrategy):
         funding_rate_pct = 0.0
         oi_change = 0.0
         funding_delta_trend = "FLAT"
+        funding_delta_pct = 0.0
         funding_age_sec: Optional[float] = None
+        squeeze_risk = "LOW"
+        liquidation_risk = "LOW"
         try:
             from analyzers.derivatives import derivatives_analyzer
             deriv_data = await derivatives_analyzer.analyze(symbol)
@@ -114,6 +117,9 @@ class FundingRateArb(BaseStrategy):
                 funding_delta_trend = str(
                     getattr(deriv_data, "funding_delta_trend", "FLAT") or "FLAT"
                 ).upper()
+                funding_delta_pct = float(getattr(deriv_data, "funding_delta_pct", 0.0) or 0.0)
+                squeeze_risk = str(getattr(deriv_data, "squeeze_risk", "LOW") or "LOW").upper()
+                liquidation_risk = str(getattr(deriv_data, "liquidation_risk", "LOW") or "LOW").upper()
                 funding_ts_ms = getattr(deriv_data, "funding_timestamp_ms", None)
                 if funding_ts_ms:
                     funding_age_sec = max(0.0, time.time() - (float(funding_ts_ms) / 1000.0))
@@ -122,7 +128,6 @@ class FundingRateArb(BaseStrategy):
             # Try raw_data fallback
             funding_rate_pct = 0.0
             oi_change    = 0.0
-
         # Sanity guard against obvious unit/corruption errors.
         if abs(funding_rate_pct) > 5.0:
             logger.warning(
@@ -148,8 +153,13 @@ class FundingRateArb(BaseStrategy):
         else:
             return None  # Funding not extreme enough
 
-        # ── OI change confirmation ────────────────────────────────────────
-        oi_confirms = abs(oi_change) >= min_oi_change
+        # ── OI change confirmation (FA-Q3: scale threshold by ATR% so it is
+        #    self-calibrating — a 8% OI move on BTC is a major event, but
+        #    routine intraday noise on mid-cap alts with high ATR%) ─────────
+        current_price = closes[-1]
+        atr_frac = atr / current_price if current_price > 0 else 0.0
+        effective_min_oi = min_oi_change * (1.0 + atr_frac)
+        oi_confirms = abs(oi_change) >= effective_min_oi
 
         # ── Confidence ────────────────────────────────────────────────────
         confidence = float(confidence_base)
@@ -165,39 +175,80 @@ class FundingRateArb(BaseStrategy):
         if oi_confirms:
             confidence += 8
 
-        # Funding trajectory: fading works better when extreme funding starts
-        # unwinding, not when it is still accelerating in the crowded direction.
-        if direction == "SHORT":
-            if funding_delta_trend == "FALLING":
-                confidence += 4
-            elif funding_delta_trend == "RISING":
-                confidence -= 8
-        else:
-            if funding_delta_trend == "RISING":
-                confidence += 4
-            elif funding_delta_trend == "FALLING":
-                confidence -= 8
+        # FA-Q1: Regime gate — counter-trend fades in a trending regime are
+        # risky (2022 BTC bear had negative funding for months while price fell).
+        # Apply a soft penalty unless funding is very extreme (≥ 2× threshold),
+        # which provides enough evidence to override the trend filter.
+        if regime == "BULL_TREND" and direction == "SHORT":
+            if funding_rate_pct < long_threshold * 2:
+                confidence -= 10
+        elif regime == "BEAR_TREND" and direction == "LONG":
+            if abs(funding_rate_pct) < abs(short_threshold) * 2:
+                confidence -= 10
+
+        # FA-Q2: Funding trajectory — magnitude-scaled adjustment so that a
+        # strong unwind (large delta) gets a proportionally larger bonus and
+        # a strong continuation gets a proportionally larger penalty.
+        # delta_pp is the raw change in percentage points (newest − oldest poll).
+        _delta_threshold = 0.005  # pp — same scale as derivatives._funding_delta_threshold
+        if funding_delta_pct != 0.0:
+            if direction == "SHORT":
+                # Fading extreme positive funding
+                if funding_delta_pct < 0:  # Unwinding → reward the fade
+                    adj = min(8, abs(funding_delta_pct) / _delta_threshold * 1.5)
+                    confidence += adj
+                else:  # Continuation → penalize the fade
+                    adj = min(12, funding_delta_pct / _delta_threshold * 2.0)
+                    confidence -= adj
+            else:
+                # Fading extreme negative funding
+                if funding_delta_pct > 0:  # Unwinding → reward the fade
+                    adj = min(8, funding_delta_pct / _delta_threshold * 1.5)
+                    confidence += adj
+                else:  # Continuation → penalize the fade
+                    adj = min(12, abs(funding_delta_pct) / _delta_threshold * 2.0)
+                    confidence -= adj
 
         # Regime counter-trend bonus (fading trend = slightly less confidence)
         if regime in ("CHOPPY", "VOLATILE"):
             confidence += 5   # Counter-trend setups work better in ranging markets
 
+        # FA-Q5: Graduated staleness penalty — penalize aging data before the
+        # hard cutoff so that borderline signals based on old snapshots carry
+        # less weight.
+        if funding_age_sec is not None:
+            if funding_age_sec > 600:
+                confidence -= 6
+            elif funding_age_sec > 300:
+                confidence -= 3
+
+        # Liquidation context bonus — OI spike into a crowded trade increases
+        # the probability of a squeeze cascade, strengthening the fade thesis.
+        if oi_confirms:
+            if direction == "SHORT" and liquidation_risk in ("MEDIUM", "HIGH"):
+                confidence += 5  # Crowded longs at risk of cascade
+            elif direction == "LONG" and squeeze_risk in ("MEDIUM", "HIGH"):
+                confidence += 5  # Crowded shorts at risk of short-squeeze
+
         # ── Recent swing levels for SL ────────────────────────────────────
         lookback_sl = min(20, len(highs) - 1)
         recent_high = float(np.max(highs[-lookback_sl:]))
         recent_low  = float(np.min(lows[-lookback_sl:]))
-        current_price = closes[-1]
 
         # ── Entry / SL / TP ───────────────────────────────────────────────
         buf = atr * rp.entry_zone_tight
         vp = compute_vol_percentile(highs, lows, closes)
 
+        # FA-Q4: TP philosophy — TP1 is tactical (ATR-based, kept as-is).
+        # TP2/TP3 are ATR-anchored proxies for funding normalization; the
+        # actual exit target is when funding recedes to ≤ threshold * 0.5
+        # (stored in raw_data as funding_exit_threshold for runtime monitoring).
+        funding_exit_threshold = long_threshold * 0.5 if direction == "SHORT" else short_threshold * 0.5
+
         if direction == "LONG":
             entry_low   = current_price - buf
             entry_high  = current_price + buf
             stop_loss   = recent_low - atr * rp.sl_atr_mult
-            # FIX: were hardcoded 1.5/2.5/3.5 ATR — now uses rp.* so settings.yaml tuning applies
-            # Wire timeframe-scaled TPs with volatility adjustment
             tp1         = entry_high + atr * rp.volatility_scaled_tp1(tf, vp)
             tp2         = entry_high + atr * rp.volatility_scaled_tp2(tf, vp)
             tp3         = entry_high + atr * rp.volatility_scaled_tp3(tf, vp)
@@ -220,13 +271,29 @@ class FundingRateArb(BaseStrategy):
             f"   Threshold: {'>' + str(long_threshold) + '%' if direction == 'SHORT' else '<' + str(short_threshold) + '%'}",
         ]
         if oi_confirms:
-            confluence.append(f"✅ OI change: {oi_change:.1f}% — crowding confirmed")
+            confluence.append(
+                f"✅ OI change: {oi_change:.1f}% — crowding confirmed"
+                f" (min {effective_min_oi:.1f}%)"
+            )
         else:
-            confluence.append(f"⚠️ OI change: {oi_change:.1f}% (below {min_oi_change}% threshold)")
+            confluence.append(
+                f"⚠️ OI change: {oi_change:.1f}%"
+                f" (below ATR-scaled min {effective_min_oi:.1f}%)"
+            )
         if funding_age_sec is not None:
             confluence.append(f"🕒 Funding age: {funding_age_sec:.0f}s")
-        confluence.append(f"📈 Funding trajectory: {funding_delta_trend}")
-        confluence.append(f"📊 Counter-trend fade | Regime: {regime} | TF: {tf}")
+        confluence.append(
+            f"📈 Funding trajectory: {funding_delta_trend}"
+            f" (Δ{funding_delta_pct:+.4f}pp)"
+        )
+        if regime in ("BULL_TREND", "BEAR_TREND"):
+            confluence.append(
+                f"⚠️ Counter-trend in {regime} — requires ≥2× threshold"
+            )
+        confluence.append(
+            f"📊 Counter-trend fade | Regime: {regime} | TF: {tf}"
+            f" | Exit signal: funding ≤ {funding_exit_threshold:.4f}%"
+        )
         confluence.append(f"🎯 R:R {rr_ratio:.2f} | ATR: {fmt_price(atr)}")
 
         confidence = min(92, max(40, confidence))
@@ -251,7 +318,12 @@ class FundingRateArb(BaseStrategy):
                 "oi_change": oi_change,
                 "oi_confirms": oi_confirms,
                 "funding_delta_trend": funding_delta_trend,
+                "funding_delta_pct": funding_delta_pct,
                 "funding_age_sec": funding_age_sec,
+                "funding_exit_threshold": funding_exit_threshold,
+                "effective_min_oi": effective_min_oi,
+                "squeeze_risk": squeeze_risk,
+                "liquidation_risk": liquidation_risk,
                 "recent_high": recent_high,
                 "recent_low": recent_low,
                 "atr": atr,
