@@ -388,9 +388,9 @@ class PriceAction(BaseStrategy):
             confluence.append("✅ Volume trend: rising sequence (x3 bars)")
         if _is_single_bar:
             if _prior_bar_confirms:
-                confluence.append("✅ Prior bar: confirms reversal context (+3)")
+                confluence.append(f"✅ Prior bar: confirms reversal context (+{_context_adj:.1f})")
             elif _prior_bar_conflicts:
-                confluence.append("⚠️ Prior bar: conflicts with signal direction (-3)")
+                confluence.append(f"⚠️ Prior bar: conflicts with signal direction (-{_context_adj:.1f})")
         if _mtf_mismatch:
             confluence.append(f"⚠️ HTF mismatch: 4h {_htf_bias['bias']} vs signal {direction} (-{_mtf_penalty})")
         confluence.append(f"📊 Regime: {regime} | TF: {tf}")
