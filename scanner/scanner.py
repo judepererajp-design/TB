@@ -64,6 +64,7 @@ class SymbolState:
     last_signal: float = 0.0
     activity_score: float = 0.0
     promoted_at: float = 0.0        # Timestamp of last promotion
+    low_volume_streak: int = 0
     scan_count: int = 0
     category: str = "UNKNOWN"
 
@@ -150,13 +151,30 @@ class Scanner:
             tier2_cfg = self._scan_cfg.tier2
             tier3_cfg = self._scan_cfg.tier3
 
-            t1_max = getattr(tier1_cfg, 'max_symbols', 80)
-            t2_max = getattr(tier2_cfg, 'max_symbols', 80)
-            t3_max = getattr(tier3_cfg, 'max_symbols', 40)
+            t1_enabled = getattr(tier1_cfg, 'enabled', True)
+            t2_enabled = getattr(tier2_cfg, 'enabled', True)
+            t3_enabled = getattr(tier3_cfg, 'enabled', True)
+
+            t1_max = getattr(tier1_cfg, 'max_symbols', 80) if t1_enabled else 0
+            t2_max = getattr(tier2_cfg, 'max_symbols', 80) if t2_enabled else 0
+            t3_max = getattr(tier3_cfg, 'max_symbols', 40) if t3_enabled else 0
 
             t1_min_vol = getattr(tier1_cfg, 'min_volume_24h', 5_000_000)
             t2_min_vol = getattr(tier2_cfg, 'min_volume_24h', 1_000_000)
             t3_min_vol = getattr(tier3_cfg, 'min_volume_24h', 200_000)
+            active_min_vols = []
+            if t1_enabled:
+                active_min_vols.append(t1_min_vol)
+            if t2_enabled:
+                active_min_vols.append(t2_min_vol)
+            if t3_enabled:
+                active_min_vols.append(t3_min_vol)
+            if not active_min_vols:
+                self._symbols = {}
+                self._last_universe_refresh = now
+                logger.info("Universe build skipped: all scanning tiers are disabled")
+                return
+            min_qual_vol = min(active_min_vols)
 
             excluded = set(cfg.exchange.get('excluded_symbols', [])
                            if isinstance(cfg.exchange.get('excluded_symbols', []), list)
@@ -171,7 +189,7 @@ class Scanner:
                 if base_symbol in excluded:
                     continue
                 vol = float(ticker.get('quoteVolume', 0) or 0)
-                if vol >= t3_min_vol:
+                if vol >= min_qual_vol:
                     qualified.append((base_symbol, vol))
 
             seen = {}
@@ -228,7 +246,14 @@ class Scanner:
                 self._whale_snapshot,
                 self._signal_dedup,
             ):
-                for _k in [k for k in _cd if k not in active_symbols]:
+                if _cd is self._signal_dedup:
+                    _stale_keys = [
+                        k for k in _cd
+                        if not isinstance(k, tuple) or len(k) < 1 or k[0] not in active_symbols
+                    ]
+                else:
+                    _stale_keys = [k for k in _cd if k not in active_symbols]
+                for _k in _stale_keys:
                     _cd.pop(_k, None)
 
             logger.info(
@@ -352,6 +377,18 @@ class Scanner:
         if not getattr(prom_cfg, 'enabled', True):
             return None
 
+        tier_cfgs = {
+            Tier.TIER1: self._scan_cfg.tier1,
+            Tier.TIER2: self._scan_cfg.tier2,
+            Tier.TIER3: self._scan_cfg.tier3,
+        }
+        tier_enabled = {tier: getattr(cfg_t, 'enabled', True) for tier, cfg_t in tier_cfgs.items()}
+        tier_min_vol = {
+            Tier.TIER1: float(getattr(self._scan_cfg.tier1, 'min_volume_24h', 5_000_000)),
+            Tier.TIER2: float(getattr(self._scan_cfg.tier2, 'min_volume_24h', 1_000_000)),
+            Tier.TIER3: float(getattr(self._scan_cfg.tier3, 'min_volume_24h', 200_000)),
+        }
+
         # Always update the volume MA *before* computing the spike ratio so it
         # stays current whether or not a promotion fires this cycle.
         # Use a time-weighted EMA so the effective half-life is ~7 days for all
@@ -373,6 +410,31 @@ class Scanner:
         promotion_threshold = getattr(prom_cfg, 'volume_spike_multiplier', 3.0)
         min_vol = getattr(prom_cfg, 'min_volume_for_promotion', 500_000)
 
+        # Symmetric low-volume demotion: if a symbol remains below its current
+        # tier's minimum volume for N consecutive checks, demote one enabled tier.
+        demotion_cycles = int(getattr(prom_cfg, 'demotion_cycles', 3) or 3)
+        current_tier_min = tier_min_vol.get(state.tier, 0.0)
+        if state.tier != Tier.TIER3 and current_volume < current_tier_min:
+            state.low_volume_streak += 1
+            if state.low_volume_streak >= demotion_cycles:
+                from_tier = state.tier.value
+                next_tier_val = state.tier.value + 1
+                while next_tier_val <= Tier.TIER3.value and not tier_enabled.get(Tier(next_tier_val), True):
+                    next_tier_val += 1
+                if next_tier_val <= Tier.TIER3.value:
+                    new_tier = Tier(next_tier_val)
+                    state.tier = new_tier
+                    state.volume_24h = current_volume
+                    state.low_volume_streak = 0
+                    await db.upsert_symbol_tier(symbol, new_tier.value, current_volume)
+                    logger.info(
+                        f"📉 {symbol} demoted: Tier {from_tier} → Tier {new_tier.value} "
+                        f"(volume ${current_volume:,.0f} < ${current_tier_min:,.0f} for {demotion_cycles} checks)"
+                    )
+                    return (from_tier, new_tier.value)
+        else:
+            state.low_volume_streak = 0
+
         # Cooldown check
         cooldown_hours = getattr(prom_cfg, 'cooldown_hours', 24)
         if time.time() - state.promoted_at < cooldown_hours * 3600:
@@ -383,12 +445,18 @@ class Scanner:
                 state.tier != Tier.TIER1):
 
             from_tier = state.tier.value
-            new_tier = Tier(max(1, state.tier.value - 1))  # Promote one tier
+            next_tier_val = state.tier.value - 1
+            while next_tier_val >= Tier.TIER1.value and not tier_enabled.get(Tier(next_tier_val), True):
+                next_tier_val -= 1
+            if next_tier_val < Tier.TIER1.value:
+                return None
+            new_tier = Tier(next_tier_val)  # Promote one enabled tier
             to_tier = new_tier.value
 
             state.tier = new_tier
             state.promoted_at = time.time()
             state.volume_24h = current_volume
+            state.low_volume_streak = 0
             # Increase scan priority immediately
             state.last_scan = 0  # Force immediate rescan
 
@@ -482,13 +550,18 @@ class Scanner:
                     # still allowing genuine whales that grew since last snapshot.
                     prev = self._whale_snapshot.setdefault(symbol, {}).get(side, 0.0)
                     self._whale_snapshot[symbol][side] = order_usd
-                    if prev == 0.0 or (prev / order_usd) < 0.5:
+                    ratio = (
+                        min(prev, order_usd) / max(prev, order_usd)
+                        if max(prev, order_usd) > 0
+                        else 0.0
+                    )
+                    if prev == 0.0 or ratio < 0.5:
                         # First sighting or too small relative to current — record but don't fire yet
                         logger.debug(
                             f"🐋 Whale candidate (first sighting): "
                             f"{symbol} {side} ${order_usd:,.0f} @ {price}"
                         )
-                        break  # still check iceberg on same side below
+                        continue
 
                     self._whale_cooldown[symbol] = time.time()
                     fp = _fill_prob(price, side, order_usd, min_order_usd)
@@ -514,7 +587,12 @@ class Scanner:
             if cumulative_usd >= min_order_usd:
                 prev = self._whale_snapshot.setdefault(symbol, {}).get(f"iceberg_{side}", 0.0)
                 self._whale_snapshot[symbol][f"iceberg_{side}"] = cumulative_usd
-                if prev == 0.0 or (prev / cumulative_usd) < 0.5:
+                ratio = (
+                    min(prev, cumulative_usd) / max(prev, cumulative_usd)
+                    if max(prev, cumulative_usd) > 0
+                    else 0.0
+                )
+                if prev == 0.0 or ratio < 0.5:
                     logger.debug(
                         f"🐋 Iceberg candidate (first sighting): "
                         f"{symbol} {side} ${cumulative_usd:,.0f} cumulative"
@@ -619,9 +697,10 @@ class Scanner:
             # Lowest bandwidth in 48 bars = squeeze
             if len(closes) >= 48:
                 widths_hist = []
-                for i in range(len(closes) - 48, len(closes)):
-                    w = closes[max(0,i-20):i]
-                    if len(w) >= 10:
+                start = max(bb_period, len(closes) - 48)
+                for end in range(start, len(closes), 5):
+                    w = closes[end - bb_period:end]
+                    if len(w) == bb_period:
                         m = np.mean(w)
                         widths_hist.append((np.std(w) * 4) / m if m > 0 else 0.0)
                 if widths_hist and bb_width < np.percentile(widths_hist, 20):
@@ -636,40 +715,74 @@ class Scanner:
         high_dist = (period_high - current) / current
         low_dist  = (current - period_low) / current
 
+        near_key_level = False
         if high_dist < 0.015:   # Within 1.5% of 20-bar high
             score += 20
+            near_key_level = True
             reasons.append(f"📈 Testing 20-bar high ({fmt_price(period_high)}) — breakout alert")
         elif low_dist < 0.015:
             score += 20
+            near_key_level = True
             reasons.append(f"📉 Testing 20-bar low ({fmt_price(period_low)}) — breakdown alert")
 
         # ── 3. Volume declining (coiling) ─────────────────────
         avg_vol_20 = np.mean(volumes[-20:])
         avg_vol_5  = np.mean(volumes[-5:])
-        if avg_vol_5 < avg_vol_20 * 0.6:
+        range_mid = (np.max(highs[-10:]) + np.min(lows[-10:])) / 2.0
+        range_pct = (np.max(highs[-10:]) - np.min(lows[-10:])) / range_mid if range_mid > 0 else 1.0
+        is_tight_range = range_pct < 0.03
+        # Use a softer volume-drop threshold (0.7) only because we now require
+        # simultaneous tight-range + key-level proximity confirmation.
+        if avg_vol_5 < avg_vol_20 * 0.7 and is_tight_range and near_key_level:
             score += 15
-            reasons.append("📊 Volume declining — coiling for breakout")
+            reasons.append("📊 Volume cooling inside tight key-level range — coiling setup")
 
         # ── 4. RSI divergence ─────────────────────────────────
-        if len(closes) >= 28:
-            rsi_now  = self._quick_rsi(closes, 14)
-            rsi_prev = self._quick_rsi(closes[:-5], 14)
-            price_up = closes[-1] > closes[-6]
+        if len(closes) >= 40:
+            def _swing_idxs(arr: np.ndarray, is_high: bool, look: int = 2) -> List[int]:
+                idxs: List[int] = []
+                for i in range(look, len(arr) - look):
+                    left = arr[i - look:i]
+                    right = arr[i + 1:i + look + 1]
+                    if is_high and arr[i] >= np.max(left) and arr[i] >= np.max(right):
+                        idxs.append(i)
+                    if not is_high and arr[i] <= np.min(left) and arr[i] <= np.min(right):
+                        idxs.append(i)
+                return idxs
 
-            if price_up and rsi_now < rsi_prev - 5:
-                score += 15
-                reasons.append("⚡ RSI bearish divergence — momentum weakening")
-            elif not price_up and rsi_now > rsi_prev + 5:
-                score += 15
-                reasons.append("⚡ RSI bullish divergence — accumulation signal")
+            rsi_series = np.full(len(closes), np.nan, dtype=float)
+            for i in range(15, len(closes) + 1):
+                rsi_series[i - 1] = self._quick_rsi(closes[:i], 14)
+
+            hi_swings = _swing_idxs(closes[-30:], is_high=True)
+            lo_swings = _swing_idxs(closes[-30:], is_high=False)
+
+            if len(hi_swings) >= 2:
+                a, b = hi_swings[-2], hi_swings[-1]
+                pa = closes[-30 + a]
+                pb = closes[-30 + b]
+                ra = rsi_series[-30 + a]
+                rb = rsi_series[-30 + b]
+                if pb > pa and not np.isnan(ra) and not np.isnan(rb) and rb <= ra - 10:
+                    score += 15
+                    reasons.append("⚡ RSI bearish divergence on swing highs")
+            if len(lo_swings) >= 2:
+                a, b = lo_swings[-2], lo_swings[-1]
+                pa = closes[-30 + a]
+                pb = closes[-30 + b]
+                ra = rsi_series[-30 + a]
+                rb = rsi_series[-30 + b]
+                if pb < pa and not np.isnan(ra) and not np.isnan(rb) and rb >= ra + 10:
+                    score += 15
+                    reasons.append("⚡ RSI bullish divergence on swing lows")
 
         # ── 5. ATR compression ────────────────────────────────
-        if len(closes) >= 30:
+        if len(closes) >= 60:
             atr_now = self._quick_atr(highs[-14:], lows[-14:], closes[-14:])
-            atr_old = self._quick_atr(highs[-28:-14], lows[-28:-14], closes[-28:-14])
-            if atr_old > 0 and atr_now < atr_old * 0.5:
+            atr_base = self._quick_atr(highs[-51:], lows[-51:], closes[-51:], period=50)
+            if atr_base > 0 and atr_now < atr_base * 0.6:
                 score += 10
-                reasons.append(f"🔇 ATR compressed {atr_now/atr_old:.0%} of normal")
+                reasons.append(f"🔇 ATR compressed {atr_now/atr_base:.0%} of 50-bar baseline")
 
         if score >= _min_score:
             # Cross-path dedup: if stalker.StalkerEngine already raised this

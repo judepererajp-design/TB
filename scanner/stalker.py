@@ -152,7 +152,7 @@ class StalkerEngine:
         # ── LTF alignment check ───────────────────────────────
         if ohlcv_15m and len(ohlcv_15m) >= 30:
             df15 = pd.DataFrame(ohlcv_15m, columns=['ts','open','high','low','close','volume'])
-            df15 = df15.astype(float)
+            df15 = df15.astype({'open': float, 'high': float, 'low': float, 'close': float, 'volume': float})
             ltf_alert = self._check_ltf_alignment(df15)
             if ltf_alert:
                 score   += 15
@@ -275,7 +275,7 @@ class StalkerEngine:
 
     def _detect_rsi_coiling(self, closes) -> bool:
         """
-        RSI bouncing between 45-55 repeatedly — indecision before breakout.
+        RSI bouncing between 40-60 repeatedly — indecision before breakout.
         """
         if len(closes) < 30:
             return False
@@ -287,11 +287,15 @@ class StalkerEngine:
             gains  = np.where(d > 0, d, 0.0)
             losses = np.where(d < 0, -d, 0.0)
             # Seed with SMA, then apply Wilder's smoothing (matches standard charts)
-            avg_g = float(np.mean(gains[:p])) or 1e-10
-            avg_l = float(np.mean(losses[:p])) or 1e-10
+            avg_g = float(np.mean(gains[:p]))
+            avg_l = float(np.mean(losses[:p]))
             for g, l in zip(gains[p:], losses[p:]):
                 avg_g = (avg_g * (p - 1) + float(g)) / p
                 avg_l = (avg_l * (p - 1) + float(l)) / p
+            if avg_l == 0 and avg_g == 0:
+                return 50.0
+            if avg_l == 0:
+                return 100.0
             return 100 - (100 / (1 + avg_g / avg_l))
 
         rsi_vals = [rsi(closes[:i]) for i in range(len(closes)-15, len(closes))]
@@ -332,8 +336,9 @@ class StalkerEngine:
         vol_spike = cur_vol > avg_vol * 1.8
 
         # Price making a higher high on 15m
-        recent_high = max(df15['high'].values[-5:])
-        prior_high  = max(df15['high'].values[-20:-5])
+        # Exclude the still-forming candle [-1] so highs are based on closed bars only.
+        recent_high = max(df15['high'].values[-6:-1])
+        prior_high  = max(df15['high'].values[-21:-6])
         higher_high = recent_high > prior_high
 
         return vol_spike and higher_high
