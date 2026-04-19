@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 class DerivativesData:
     symbol: str
     funding_rate: float = 0.0          # Current funding rate (%)
+    funding_timestamp_ms: Optional[int] = None  # Funding snapshot time (ms)
     funding_trend: str = "NEUTRAL"     # Level classifier: EXTREMELY_HIGH | HIGH | NEGATIVE | NEUTRAL
     # AUDIT FIX (funding delta): separate rate-of-change classifier.  Squeezes
     # come from acceleration, not absolute level — a flat-but-high funding is
@@ -115,6 +116,7 @@ class DerivativesAnalyzer:
         # Parse funding rate
         if isinstance(funding, dict) and funding:
             data.funding_rate = float(funding.get('fundingRate') or 0) * 100  # Convert to %
+            data.funding_timestamp_ms = self._extract_funding_timestamp_ms(funding)
             data.funding_trend = self._classify_funding_trend(data.funding_rate)
             data.funding_delta_trend = self._classify_funding_delta(symbol, data.funding_rate)
             # FUNDING-Z: compute *after* delta so the latest sample is in history.
@@ -156,6 +158,26 @@ class DerivativesAnalyzer:
         data.score = self._calculate_score(data)
 
         return data
+
+    @staticmethod
+    def _extract_funding_timestamp_ms(funding: Dict) -> Optional[int]:
+        """
+        Best-effort funding snapshot timestamp extraction from CCXT payload.
+        """
+        ts = funding.get('timestamp') or funding.get('fundingTimestamp')
+        if ts is None:
+            info = funding.get('info')
+            if isinstance(info, dict):
+                ts = (
+                    info.get('fundingTime')
+                    or info.get('time')
+                    or info.get('timestamp')
+                )
+        try:
+            ts_int = int(float(ts))
+            return ts_int if ts_int > 0 else None
+        except (TypeError, ValueError):
+            return None
 
     def _update_oi_history(self, symbol: str, oi_level: float) -> float:
         """

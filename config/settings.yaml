@@ -325,10 +325,14 @@ strategies:
     timeframe: "1h"
     confidence_base: 74
     min_volume_24h: 10000000
+    # Units: percentage points per funding cycle (8h on most perps).
+    # Example: 0.05 = 0.05% (5 bps). Backward-compat fractional config
+    # like 0.0005 is auto-normalized to 0.05%.
     extreme_long_threshold: 0.05
     extreme_short_threshold: -0.03
     min_oi_change: 8.0
     lookback_periods: 3
+    max_funding_age_sec: 900
     counter_trend_only: true
 
   range_scalper:
@@ -681,4 +685,3 @@ time_filters:
   dead_zone_start_utc: 3      # Hour to start avoiding signals (UTC)
   dead_zone_end_utc:   7      # Hour to stop avoiding signals (UTC)
   enable_dead_zone:    true   # Set false to disable entirely
-
