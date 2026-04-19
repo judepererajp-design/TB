@@ -140,6 +140,11 @@ class SmartMoneyConcepts(BaseStrategy):
         confidence_base = getattr(self._cfg, "confidence_base", 75)
         lookback_swings = getattr(getattr(self._cfg, "structure", self._cfg), "lookback_swings", 20)
         sweep_lookback  = getattr(getattr(self._cfg, "sweeps", self._cfg), "lookback", 30)
+        # Define OB config at top-level so it's in scope for Priority 3, Priority 4,
+        # and the stacked-confluence scan (which may run before Priority 3 if
+        # a higher-priority setup already set direction).
+        ob_min_impulse  = getattr(getattr(self._cfg, "order_blocks", self._cfg), "min_impulse_pct", 0.5)
+        ob_max_age      = getattr(getattr(self._cfg, "order_blocks", self._cfg), "max_ob_age_bars", 20)
 
         # ── Killzone bonus ────────────────────────────────────────────────
         # FIX AUDIT-5: Use the last candle's timestamp instead of wall-clock
@@ -292,6 +297,13 @@ class SmartMoneyConcepts(BaseStrategy):
             confluence.append(f"✅ Wick below swing low by {fmt_price(key_swing_low - _sweep_bar_low)}")
             raw_data["sweep_low"] = _sweep_bar_low
             raw_data["sweep_level"] = key_swing_low
+            # Feature 4: Sweep strength — deeper institutional sweeps carry more weight.
+            # A sweep that drives > 1 ATR below the liquidity level shows real intent.
+            _sweep_depth = (key_swing_low - _sweep_bar_low) / atr
+            if _sweep_depth > 1.0:
+                confidence += 4
+                confluence.append(f"💪 Deep sweep: {_sweep_depth:.2f}× ATR below level (+4)")
+            raw_data["sweep_depth"] = round(_sweep_depth, 3)
 
         elif _single_sweep_bear or _two_bar_sweep_bear:
             _sweep_bar_high = current_high if _single_sweep_bear else highs[-2]
@@ -305,6 +317,12 @@ class SmartMoneyConcepts(BaseStrategy):
             confluence.append(f"✅ Wick above swing high by {fmt_price(_sweep_bar_high - key_swing_high)}")
             raw_data["sweep_high"] = _sweep_bar_high
             raw_data["sweep_level"] = key_swing_high
+            # Feature 4: Sweep strength — deeper wicks indicate stronger institutional commitment.
+            _sweep_depth = (_sweep_bar_high - key_swing_high) / atr
+            if _sweep_depth > 1.0:
+                confidence += 4
+                confluence.append(f"💪 Deep sweep: {_sweep_depth:.2f}× ATR above level (+4)")
+            raw_data["sweep_depth"] = round(_sweep_depth, 3)
 
         # ─────────────────────────────────────────────────────────────────
         # Priority 2: Fair Value Gap
@@ -336,6 +354,18 @@ class SmartMoneyConcepts(BaseStrategy):
                     confluence.append(f"   FVG midpoint: {fmt_price(fvg_mid)} | Price returned to gap")
                     raw_data["fvg_low"] = c1_high
                     raw_data["fvg_high"] = c3_low
+                    # Feature 2: FVG fill depth — how deeply price has entered the gap.
+                    # A shallow dip just past the gap edge is a weak retest; a deep fill
+                    # (past the midpoint) shows real demand/supply absorption.
+                    _fvg_gap = fvg_mid - c1_high
+                    _fill_ratio = (current_close - c1_high) / _fvg_gap if _fvg_gap > 0 else 0.5
+                    if _fill_ratio < 0.3:
+                        confidence -= 3
+                        confluence.append(f"⚠️ Shallow FVG fill ({_fill_ratio:.0%}) — weak retest (-3)")
+                    elif _fill_ratio > 0.7:
+                        confidence += 3
+                        confluence.append(f"💪 Deep FVG fill ({_fill_ratio:.0%}) — strong retest (+3)")
+                    raw_data["fvg_fill_ratio"] = round(_fill_ratio, 3)
 
             # Bearish FVG: candle-1 low > candle-3 high
             elif c1_low > c3_high and current_close < c1_low:
@@ -352,13 +382,21 @@ class SmartMoneyConcepts(BaseStrategy):
                     confluence.append(f"   FVG midpoint: {fmt_price(fvg_mid)} | Price returned to gap")
                     raw_data["fvg_high"] = c1_low
                     raw_data["fvg_low"] = c3_high
+                    # Feature 2: FVG fill depth for bearish gap.
+                    _fvg_gap = c1_low - fvg_mid
+                    _fill_ratio = (c1_low - current_close) / _fvg_gap if _fvg_gap > 0 else 0.5
+                    if _fill_ratio < 0.3:
+                        confidence -= 3
+                        confluence.append(f"⚠️ Shallow FVG fill ({_fill_ratio:.0%}) — weak retest (-3)")
+                    elif _fill_ratio > 0.7:
+                        confidence += 3
+                        confluence.append(f"💪 Deep FVG fill ({_fill_ratio:.0%}) — strong retest (+3)")
+                    raw_data["fvg_fill_ratio"] = round(_fill_ratio, 3)
 
         # ─────────────────────────────────────────────────────────────────
         # Priority 3: Order Block
         # ─────────────────────────────────────────────────────────────────
         if direction is None:
-            ob_min_impulse = getattr(getattr(self._cfg, "order_blocks", self._cfg), "min_impulse_pct", 0.5)
-            ob_max_age     = getattr(getattr(self._cfg, "order_blocks", self._cfg), "max_ob_age_bars", 20)
             search_bars    = min(ob_max_age, len(closes) - 3)
 
             # SMC-3 FIX: original code divided impulse body by OB body.  A tiny doji OB
@@ -403,6 +441,21 @@ class SmartMoneyConcepts(BaseStrategy):
                 confluence.append(f"✅ Bullish OB at {fmt_price(ob_low)}-{fmt_price(ob_high)} ({_oi} bars ago)")
                 raw_data["ob_low"] = ob_low
                 raw_data["ob_high"] = ob_high
+                # Feature 1/SMC-Q5: OB mitigation tracking.
+                # Count how many times price has entered this zone since the OB formed.
+                # Each visit absorbs institutional orders — by the 2nd test, the OB is
+                # partially mitigated and less reliable.
+                _ob_hits = sum(1 for j in range(1, _oi) if ob_low <= closes[-j] <= ob_high)
+                if _ob_hits >= 2:
+                    confidence -= 5
+                    confluence.append(f"⚠️ OB tested {_ob_hits}× — diminished freshness (-5)")
+                raw_data["ob_hits"] = _ob_hits
+                # Feature 6: OB time decay — institutional memory fades with age.
+                # age_factor goes from 1.0 (just formed) to 0.0 (at max age limit).
+                # Multiplier range: [0.80 (ancient), 1.00 (fresh)].
+                _age_factor = max(0.0, 1.0 - (_oi / ob_max_age))
+                confidence *= 0.8 + 0.2 * _age_factor
+                raw_data["ob_age_factor"] = round(0.8 + 0.2 * _age_factor, 3)
             elif bear_ob_candidates:
                 bear_ob_candidates.sort(reverse=True)
                 _, _oi, ob_high, ob_low = bear_ob_candidates[0]
@@ -413,6 +466,16 @@ class SmartMoneyConcepts(BaseStrategy):
                 confluence.append(f"✅ Bearish OB at {fmt_price(ob_low)}-{fmt_price(ob_high)} ({_oi} bars ago)")
                 raw_data["ob_low"] = ob_low
                 raw_data["ob_high"] = ob_high
+                # Feature 1/SMC-Q5: OB mitigation tracking (bearish OB).
+                _ob_hits = sum(1 for j in range(1, _oi) if ob_low <= closes[-j] <= ob_high)
+                if _ob_hits >= 2:
+                    confidence -= 5
+                    confluence.append(f"⚠️ OB tested {_ob_hits}× — diminished freshness (-5)")
+                raw_data["ob_hits"] = _ob_hits
+                # Feature 6: OB time decay (bearish OB).
+                _age_factor = max(0.0, 1.0 - (_oi / ob_max_age))
+                confidence *= 0.8 + 0.2 * _age_factor
+                raw_data["ob_age_factor"] = round(0.8 + 0.2 * _age_factor, 3)
 
         # ─────────────────────────────────────────────────────────────────
         # Priority 4: Break of Structure (with pullback confirmation)
@@ -544,6 +607,69 @@ class SmartMoneyConcepts(BaseStrategy):
 
         if direction is None:
             return None
+
+        # ── Feature 3: BOS strength scoring ──────────────────────────────
+        # A barely-clearing BOS is noisy; a strong displacement (> 1.5× ATR
+        # beyond the level) signals genuine institutional commitment.
+        if setup_type == "BreakOfStructure":
+            _bos_lv = raw_data.get(
+                "bos_level",
+                bos_swing_high if direction == "LONG" else bos_swing_low,
+            )
+            _bos_strength = abs(current_close - _bos_lv) / atr
+            if _bos_strength > 1.5:
+                confidence += 5
+                confluence.append(f"💪 Strong BOS displacement: {_bos_strength:.2f}× ATR (+5)")
+            elif _bos_strength < 0.5:
+                confidence -= 3
+                confluence.append(f"⚠️ Weak BOS displacement: {_bos_strength:.2f}× ATR (-3)")
+            raw_data["bos_strength"] = round(_bos_strength, 3)
+
+        # ── Feature 5: Stacked confluence bonus ──────────────────────────
+        # Count how many independent SMC factors are simultaneously present
+        # in the signal direction.  Three or more mutually-reinforcing signals
+        # dramatically reduce false-positive probability.
+        _cf_bos = (
+            (direction == "LONG" and current_close > bos_swing_high)
+            or (direction == "SHORT" and current_close < bos_swing_low)
+        )
+        _cf_sweep = (
+            (direction == "LONG" and (_single_sweep_bull or _two_bar_sweep_bull))
+            or (direction == "SHORT" and (_single_sweep_bear or _two_bar_sweep_bear))
+        )
+        _cf_fvg = False
+        if len(closes) >= 4:
+            if direction == "LONG" and highs[-4] < lows[-2]:
+                _cf_fvg = True
+            elif direction == "SHORT" and lows[-4] > highs[-2]:
+                _cf_fvg = True
+        # OB confluence: already confirmed if setup_type == OrderBlock, otherwise
+        # run a lightweight scan to check whether a valid OB is near current price.
+        _cf_ob = raw_data.get("ob_low") is not None
+        if not _cf_ob:
+            _ob_scan_end = min(ob_max_age, len(closes) - 3)
+            for _sci in range(2, _ob_scan_end):
+                if direction == "LONG":
+                    _ob_body = opens[-_sci] - closes[-_sci]
+                    if (_ob_body > 0
+                            and closes[-_sci + 1] > opens[-_sci + 1]
+                            and (closes[-_sci + 1] - opens[-_sci + 1]) / atr >= ob_min_impulse
+                            and closes[-_sci] <= current_close <= opens[-_sci] + atr * 0.5):
+                        _cf_ob = True
+                        break
+                else:
+                    _ob_body = closes[-_sci] - opens[-_sci]
+                    if (_ob_body > 0
+                            and closes[-_sci + 1] < opens[-_sci + 1]
+                            and (opens[-_sci + 1] - closes[-_sci + 1]) / atr >= ob_min_impulse
+                            and opens[-_sci] - atr * 0.5 <= current_close <= closes[-_sci]):
+                        _cf_ob = True
+                        break
+        _smc_cf_count = int(_cf_bos) + int(_cf_sweep) + int(_cf_fvg) + int(_cf_ob)
+        if _smc_cf_count >= 3:
+            confidence += 6
+            confluence.append(f"🔗 Stacked SMC confluence: {_smc_cf_count}/4 factors (+6)")
+        raw_data["smc_cf_count"] = _smc_cf_count
 
         # ── Direction-aware regime confidence ─────────────────────────────
         # With-trend (LONG in BULL, SHORT in BEAR) gets +8;
