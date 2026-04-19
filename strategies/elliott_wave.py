@@ -65,15 +65,21 @@ def _find_swing_pivots(highs: np.ndarray, lows: np.ndarray,
                 and all(lows[i] < lows[i + j] for j in range(1, window + 1)):
             pivots.append((i, float(lows[i]), "L"))
 
-    # Filter: minimum wave size
+    # Filter: minimum wave size.
+    # EW-3: Compare each pivot against its immediate raw predecessor, NOT against
+    # the last *filtered* pivot.  The original sequential anchor means a single
+    # noisy first pivot sets the reference price for every subsequent comparison,
+    # causing legitimate pivots to fail or spurious ones to pass depending on
+    # where the noise spike landed.  Comparing raw[i] vs raw[i-1] ensures each
+    # move is evaluated independently.
     filtered = []
     for i in range(len(pivots)):
         if i == 0:
             filtered.append(pivots[i])
             continue
-        prev_price = filtered[-1][1]
+        ref_price  = pivots[i - 1][1]   # raw immediate predecessor
         curr_price = pivots[i][1]
-        if abs(curr_price - prev_price) / prev_price >= min_wave_pct:
+        if abs(curr_price - ref_price) / ref_price >= min_wave_pct:
             filtered.append(pivots[i])
 
     return filtered
@@ -151,14 +157,14 @@ class ElliottWave(BaseStrategy):
             return None
 
         current_price = closes[-1]
-        direction:   Optional[str] = None
-        target_wave: Optional[int] = None
-        entry_level: float = 0.0
-        sl_level:    float = 0.0
-        tp_proj:     float = 0.0
-        confidence:  float = float(confidence_base)
-        confluence:  List[str] = []
-        raw_data:    Dict = {}
+        direction:   Optional[str]  = None
+        target_wave: Optional[int]  = None
+        entry_level: float          = 0.0
+        sl_level:    float          = 0.0
+        tp_proj:     float          = 0.0
+        confidence:  float          = float(confidence_base)
+        confluence:  List[str]      = []
+        raw_data:    Dict           = {}
 
         # ── Try to identify Wave 3 entry (best setup) ─────────────────────
         # Pattern for LONG: L → H → L (W1 up, W2 retrace, enter Wave 3 up)
@@ -173,6 +179,10 @@ class ElliottWave(BaseStrategy):
                 w1_size    = p1[1] - p0[1]
                 w2_retrace = p1[1] - p2[1]
                 if w1_size <= 0:
+                    continue
+                # EW-Q1: W1 must be a meaningful impulse — require at least 2 ATRs.
+                # Minor pullbacks following random noise don't qualify as Wave 1.
+                if w1_size < atr * 2:
                     continue
                 w2_ratio = w2_retrace / w1_size
                 best_fib, fib_dist = _closest_fib(w2_ratio, _WAVE2_FIBS)
@@ -210,6 +220,9 @@ class ElliottWave(BaseStrategy):
                 w1_size    = p0[1] - p1[1]
                 w2_retrace = p2[1] - p1[1]
                 if w1_size <= 0:
+                    continue
+                # EW-Q1: W1 must be a meaningful impulse — require at least 2 ATRs.
+                if w1_size < atr * 2:
                     continue
                 w2_ratio = w2_retrace / w1_size
                 best_fib, fib_dist = _closest_fib(w2_ratio, _WAVE2_FIBS)
@@ -255,6 +268,10 @@ class ElliottWave(BaseStrategy):
                     w4_retrace = p3[1] - p4[1]
                     if w3_size <= 0:
                         continue
+                    # EW-Q1: W3 must be longer than W1 (classic EW guideline).
+                    # A Wave 5 setup with W3 shorter than W1 is a weaker count.
+                    if w3_size < w1_size:
+                        continue
                     w4_ratio = w4_retrace / w3_size
                     best_fib, fib_dist = _closest_fib(w4_ratio, _WAVE4_FIBS)
 
@@ -288,6 +305,9 @@ class ElliottWave(BaseStrategy):
                     w3_size    = p2[1] - p3[1]
                     w4_retrace = p4[1] - p3[1]
                     if w3_size <= 0:
+                        continue
+                    # EW-Q1: W3 must be longer than W1 (classic EW guideline).
+                    if w3_size < w1_size:
                         continue
                     w4_ratio = w4_retrace / w3_size
                     best_fib, fib_dist = _closest_fib(w4_ratio, _WAVE4_FIBS)
@@ -329,6 +349,17 @@ class ElliottWave(BaseStrategy):
             confidence += self._REGIME_CONF_COUNTER_TREND.get(regime, 0)
 
         # ── Entry zone / SL / TP ──────────────────────────────────────────
+        # EW-Q3: SL at W1 start can be very far from entry on 4h charts (200h+
+        # ago), creating 8-12% realized risk even when R:R looks attractive.
+        # Cap the SL at max_sl_atr ATRs from the Wave 2/4 pivot (entry).
+        # `max(LONG)` / `min(SHORT)` preserves EW semantics: the W1-start
+        # invalidation level still wins when it's CLOSER than the ATR cap.
+        max_sl_atr = getattr(self._cfg, "max_sl_atr", 5.0)
+        if direction == "LONG":
+            sl_level = max(sl_level, entry_level - atr * max_sl_atr)
+        else:
+            sl_level = min(sl_level, entry_level + atr * max_sl_atr)
+
         if direction == "LONG":
             entry_low   = entry_level - atr * rp.entry_zone_tight
             entry_high  = entry_level + atr * rp.entry_zone_atr
