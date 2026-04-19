@@ -26,24 +26,54 @@ from pathlib import Path
 # ── Try requests, fall back to urllib ────────────────────────
 try:
     import requests
-    def _get(url, headers=None, json_body=None, timeout=15):
-        if json_body:
-            r = requests.post(url, json=json_body, headers=headers or {}, timeout=timeout)
-        else:
-            r = requests.get(url, headers=headers or {}, timeout=timeout)
-        r.raise_for_status()
-        return r.json()
+    def _get(url, headers=None, json_body=None, timeout=15, retries=3):
+        for attempt in range(retries):
+            try:
+                if json_body:
+                    r = requests.post(url, json=json_body, headers=headers or {}, timeout=timeout)
+                else:
+                    r = requests.get(url, headers=headers or {}, timeout=timeout)
+                if r.status_code == 429:
+                    wait = min(60, int(r.headers.get("Retry-After", 10)))
+                    print(f"  ⏳ Rate limited (429), retrying in {wait}s...")
+                    time.sleep(wait)
+                    continue
+                r.raise_for_status()
+                return r.json()
+            except requests.exceptions.RequestException as e:
+                if attempt < retries - 1:
+                    time.sleep(2 ** attempt)
+                else:
+                    raise
+        return None
 except ImportError:
     import urllib.request
     import urllib.error
-    def _get(url, headers=None, json_body=None, timeout=15):
+    def _get(url, headers=None, json_body=None, timeout=15, retries=3):
         body = json.dumps(json_body).encode() if json_body else None
-        req = urllib.request.Request(url, data=body, headers=headers or {},
-                                     method="POST" if body else "GET")
-        if body:
-            req.add_header("Content-Type", "application/json")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read())
+        for attempt in range(retries):
+            try:
+                req = urllib.request.Request(url, data=body, headers=headers or {},
+                                             method="POST" if body else "GET")
+                if body:
+                    req.add_header("Content-Type", "application/json")
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return json.loads(resp.read())
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    wait = min(60, int(e.headers.get("Retry-After", 10)))
+                    print(f"  ⏳ Rate limited (429), retrying in {wait}s...")
+                    time.sleep(wait)
+                elif attempt < retries - 1:
+                    time.sleep(2 ** attempt)
+                else:
+                    raise
+            except Exception:
+                if attempt < retries - 1:
+                    time.sleep(2 ** attempt)
+                else:
+                    raise
+        return None
 
 ROOT = Path(__file__).parent.parent
 SETTINGS_PATH = ROOT / "config" / "settings.yaml"

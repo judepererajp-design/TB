@@ -266,7 +266,7 @@ async def fetch_binance_long_ratio(
             long_share = _ratio_to_long_share(item.get("longShortRatio"))
         if long_share is not None and 0.0 < long_share < 1.0:
             samples.append(long_share)
-    return float(statistics.mean(samples)) if samples else None
+    return float(statistics.median(samples)) if samples else None
 
 
 async def fetch_bybit_long_ratio(
@@ -299,7 +299,7 @@ async def fetch_bybit_long_ratio(
         if ratio_share is not None and 0.0 < ratio_share < 1.0:
             samples.append(ratio_share)
 
-    return float(statistics.mean(samples)) if samples else None
+    return float(statistics.median(samples)) if samples else None
 
 
 # ── Binance historical klines for price data ───────────────────────────────────
@@ -336,7 +336,13 @@ async def fetch_binance_price_history(
                     pass
             if len(data) < 1500:
                 break
-            cursor = int(data[-1][6]) + 1  # closeTime + 1
+            next_cursor = int(data[-1][6]) + 1  # closeTime + 1
+            if next_cursor <= cursor:
+                logger.warning(
+                    f"Binance klines cursor stalled for {symbol}: cursor={cursor}"
+                )
+                break
+            cursor = next_cursor
         else:
             break
         await asyncio.sleep(_REQUEST_GAP)
@@ -368,6 +374,46 @@ def enrich_with_prices(
         if price:
             enriched.append((ts, oi, price))
     return enriched
+
+
+# ── Merge near-identical liquidation clusters ─────────────────────────────────
+
+def _merge_clusters(
+    clusters: List[Tuple[float, float, str]],
+    band_pct: float = 0.01,
+) -> List[Tuple[float, float, str]]:
+    """
+    Merge clusters that fall within `band_pct` of each other (default ±1%).
+    Price is the weighted average of merged members; USD size is summed.
+
+    "above" and "below" clusters are merged in separate passes so that a
+    larger cluster of the opposite side can never flip the side label of a
+    running band mid-merge — which would produce a level assigned to the
+    wrong direction.
+    """
+    if not clusters:
+        return []
+
+    def _merge_one_side(group: List[Tuple[float, float, str]]) -> List[Tuple[float, float, str]]:
+        if not group:
+            return []
+        sorted_g = sorted(group, key=lambda x: x[0])
+        out: List[Tuple[float, float, str]] = []
+        band_price, band_usd, band_side = sorted_g[0]
+        for price, usd, side in sorted_g[1:]:
+            if abs(price - band_price) / band_price <= band_pct:
+                total_usd  = band_usd + usd
+                band_price = (band_price * band_usd + price * usd) / total_usd
+                band_usd   = total_usd
+            else:
+                out.append((band_price, band_usd, band_side))
+                band_price, band_usd, band_side = price, usd, side
+        out.append((band_price, band_usd, band_side))
+        return out
+
+    above = [c for c in clusters if c[2] == "above"]
+    below = [c for c in clusters if c[2] == "below"]
+    return _merge_one_side(above) + _merge_one_side(below)
 
 
 # ── Build liquidation clusters from enriched history ──────────────────────────
@@ -484,7 +530,7 @@ def build_clusters(
             side = "above" if p > current_price else "below"
             clusters.append((p, usd, side))
 
-    return clusters
+    return _merge_clusters(clusters)
 
 
 # ── Main bootstrap function ────────────────────────────────────────────────────
@@ -565,7 +611,7 @@ async def bootstrap(
                 bybit_long_ratio = await fetch_bybit_long_ratio(session, coin)
                 await asyncio.sleep(_REQUEST_GAP)
                 ratio_samples = [r for r in (binance_long_ratio, bybit_long_ratio) if r is not None]
-                long_ratio = float(statistics.mean(ratio_samples)) if ratio_samples else 0.65
+                long_ratio = float(statistics.median(ratio_samples)) if ratio_samples else 0.65
 
                 # 3. Enrich with prices
                 bybit_enriched   = enrich_with_prices(bybit_oi, price_map)
