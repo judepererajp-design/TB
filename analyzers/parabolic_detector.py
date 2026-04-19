@@ -26,8 +26,9 @@ logger = logging.getLogger(__name__)
 class ParabolicResult:
     """Result of parabolic/exhaustion analysis."""
     is_parabolic: bool = False
+    parabolic_score: float = 0.0    # gradient [0,1]: abs(avg_accel)/threshold, clamped to 1.0
     is_exhausted: bool = False
-    acceleration: float = 0.0       # ROC-of-ROC
+    acceleration: float = 0.0       # ROC-of-ROC (last single bar)
     roc: float = 0.0                # current ROC
     direction: str = "FLAT"         # UP / DOWN / FLAT
     exhaustion_signals: List[str] = field(default_factory=list)
@@ -105,6 +106,13 @@ class ParabolicDetector:
         all_same_sign = all(a > 0 for a in recent_accel) or all(a < 0 for a in recent_accel)
 
         result.is_parabolic = all_same_sign and abs(avg_accel) > accel_threshold
+
+        # parabolic_score: continuous gradient [0,1] matching is_parabolic.
+        # 0.0 = directions mixed; approaching 1.0 = near threshold; 1.0 = threshold reached/exceeded.
+        if all_same_sign and accel_threshold > 0:
+            result.parabolic_score = round(min(1.0, abs(avg_accel) / accel_threshold), 3)
+        else:
+            result.parabolic_score = 0.0
 
         if result.roc > 0.01:
             result.direction = "UP"

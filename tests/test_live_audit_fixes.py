@@ -1,6 +1,8 @@
 def test_effective_rr_matches_aggregator_long():
     from strategies.base import BaseStrategy
 
+    # Worst-case fill for LONG = entry_high (101).
+    # reward = 108 - 101 = 7, risk = 101 - 96 = 5  →  RR = 1.4
     rr = BaseStrategy.calculate_effective_rr(
         direction="LONG",
         entry_low=99.0,
@@ -9,12 +11,14 @@ def test_effective_rr_matches_aggregator_long():
         tp2=108.0,
     )
 
-    assert rr == 2.0
+    assert rr == 1.4
 
 
 def test_effective_rr_matches_aggregator_short():
     from strategies.base import BaseStrategy
 
+    # Worst-case fill for SHORT = entry_low (99).
+    # reward = 99 - 92 = 7, risk = 104 - 99 = 5  →  RR = 1.4
     rr = BaseStrategy.calculate_effective_rr(
         direction="SHORT",
         entry_low=99.0,
@@ -23,7 +27,7 @@ def test_effective_rr_matches_aggregator_short():
         tp2=92.0,
     )
 
-    assert rr == 2.0
+    assert rr == 1.4
 
 
 def test_smc_blocks_non_reversal_counter_trend_setup():

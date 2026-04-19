@@ -234,7 +234,7 @@ strategies:
     confidence_base: 78
     min_volume_24h: 10000000
     donchian_period: 20
-    min_adx: 28
+    min_adx: 20  # BR-Q2: lowered from 28; alt accumulation breakouts start at ADX 15-22
     volume_confirmation_mult: 1.8
     retest_window_bars: 5
     false_breakout_filter: true

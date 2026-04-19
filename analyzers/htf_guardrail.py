@@ -430,6 +430,15 @@ class HTFWeeklyGuardrail:
         from config.constants import StablecoinHTF as _SH
         return _SH.BASE_ADX_THRESHOLD + self._stablecoin_adx_offset
 
+    def get_weekly_adx(self) -> float:
+        """Return the most recent cached weekly ADX value (0-100).
+
+        Public accessor for strategies that need to gate on weekly trend strength
+        without directly reaching into the private ``_weekly_adx`` attribute.
+        Returns 0.0 before the first successful refresh.
+        """
+        return self._weekly_adx
+
 
 # ── Singleton ──────────────────────────────────────────────────────────────
 htf_guardrail = HTFWeeklyGuardrail()

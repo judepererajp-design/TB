@@ -56,24 +56,30 @@ def _find_swing_pivots(highs: np.ndarray, lows: np.ndarray,
     window = 3  # minimum bars on each side for a pivot
 
     for i in range(start + window, n - window):
-        # Swing high
-        if all(highs[i] >= highs[i - j] for j in range(1, window + 1)) \
-                and all(highs[i] >= highs[i + j] for j in range(1, window + 1)):
+        # Swing high — strict >: flat tops do NOT qualify as pivot highs.
+        if all(highs[i] > highs[i - j] for j in range(1, window + 1)) \
+                and all(highs[i] > highs[i + j] for j in range(1, window + 1)):
             pivots.append((i, float(highs[i]), "H"))
-        # Swing low
-        elif all(lows[i] <= lows[i - j] for j in range(1, window + 1)) \
-                and all(lows[i] <= lows[i + j] for j in range(1, window + 1)):
+        # Swing low — strict <: flat bottoms do NOT qualify as pivot lows.
+        elif all(lows[i] < lows[i - j] for j in range(1, window + 1)) \
+                and all(lows[i] < lows[i + j] for j in range(1, window + 1)):
             pivots.append((i, float(lows[i]), "L"))
 
-    # Filter: minimum wave size
+    # Filter: minimum wave size.
+    # EW-3: Compare each pivot against its immediate raw predecessor, NOT against
+    # the last *filtered* pivot.  The original sequential anchor means a single
+    # noisy first pivot sets the reference price for every subsequent comparison,
+    # causing legitimate pivots to fail or spurious ones to pass depending on
+    # where the noise spike landed.  Comparing raw[i] vs raw[i-1] ensures each
+    # move is evaluated independently.
     filtered = []
     for i in range(len(pivots)):
         if i == 0:
             filtered.append(pivots[i])
             continue
-        prev_price = filtered[-1][1]
+        ref_price  = pivots[i - 1][1]   # raw immediate predecessor
         curr_price = pivots[i][1]
-        if abs(curr_price - prev_price) / prev_price >= min_wave_pct:
+        if abs(curr_price - ref_price) / ref_price >= min_wave_pct:
             filtered.append(pivots[i])
 
     return filtered
@@ -105,7 +111,8 @@ class ElliottWave(BaseStrategy):
         try:
             return await self._analyze(symbol, ohlcv_dict)
         except Exception as e:
-            logger.debug(f"ElliottWave.analyze {symbol}: {e}")
+            # EW-6: warn (not debug) so unexpected exceptions surface in production logs.
+            logger.warning(f"ElliottWave.analyze {symbol}: {e}")
             return None
 
     async def _analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:
@@ -137,6 +144,10 @@ class ElliottWave(BaseStrategy):
 
         min_wave_pct  = getattr(self._cfg, "min_wave_pct", 0.03)
         fib_tolerance = getattr(self._cfg, "fibonacci_tolerance", 0.08)
+        # EW-4: Wave 4 retracements are structurally tighter than Wave 2 — use a
+        # stricter tolerance so the 23.6%/38.2% check is actually selective
+        # (at 0.08 tolerance any retrace 15.6%–46.2% passes, which is too wide).
+        fib_tolerance_w4 = getattr(self._cfg, "fibonacci_tolerance_w4", min(fib_tolerance, 0.04))
         max_wave_bars = getattr(self._cfg, "max_wave_bars", 200)
         confidence_base = getattr(self._cfg, "confidence_base", 72)
 
@@ -146,14 +157,14 @@ class ElliottWave(BaseStrategy):
             return None
 
         current_price = closes[-1]
-        direction:   Optional[str] = None
-        target_wave: Optional[int] = None
-        entry_level: float = 0.0
-        sl_level:    float = 0.0
-        tp_proj:     float = 0.0
-        confidence:  float = float(confidence_base)
-        confluence:  List[str] = []
-        raw_data:    Dict = {}
+        direction:   Optional[str]  = None
+        target_wave: Optional[int]  = None
+        entry_level: float          = 0.0
+        sl_level:    float          = 0.0
+        tp_proj:     float          = 0.0
+        confidence:  float          = float(confidence_base)
+        confluence:  List[str]      = []
+        raw_data:    Dict           = {}
 
         # ── Try to identify Wave 3 entry (best setup) ─────────────────────
         # Pattern for LONG: L → H → L (W1 up, W2 retrace, enter Wave 3 up)
@@ -169,34 +180,39 @@ class ElliottWave(BaseStrategy):
                 w2_retrace = p1[1] - p2[1]
                 if w1_size <= 0:
                     continue
+                # EW-Q1: W1 must be a meaningful impulse — require at least 2 ATRs.
+                # Minor pullbacks following random noise don't qualify as Wave 1.
+                if w1_size < atr * 2:
+                    continue
                 w2_ratio = w2_retrace / w1_size
                 best_fib, fib_dist = _closest_fib(w2_ratio, _WAVE2_FIBS)
 
                 if fib_dist > fib_tolerance:
                     continue
 
-                # Price should be near/just above Wave 2 low
-                if abs(current_price - p2[1]) <= atr * 3:
+                # EW-Q2: tighten proximity — 3 ATRs lets a trade be taken well
+                # into Wave 3 already; 1.5 ATRs keeps entries near the W2 end.
+                if abs(current_price - p2[1]) <= atr * 1.5:
                     direction   = "LONG"
                     target_wave = 3
                     entry_level = p2[1]
                     sl_level    = p0[1]  # Below Wave 1 start
-                    # BUG-FIX: tp_proj was never set for bullish W3 — it stayed 0.0.
-                    # This caused tp2=0.0, which the TP floor enforcement then rescued
-                    # with ATR-based targets, silently discarding the wave projection.
-                    # W3 target: 161.8% extension of W1 from W2 end.
-                    tp_proj     = p2[1] + w1_size * 1.618
+                    # EW-Q5: most W3 waves extend to 200–261.8% of W1; use 200% as
+                    # the primary target (tp2) so we're not capped at 161.8%.
+                    # Store the 161.8% level for reference in raw_data.
+                    tp_proj     = p2[1] + w1_size * 2.000
 
                     confidence_bonus = 15 if fib_dist < 0.03 else 8 if fib_dist < 0.05 else 0
                     confluence.append(f"✅ Bullish Wave 2 at {fmt_price(p2[1])} — retraced {w2_ratio:.1%} of W1")
                     confluence.append(f"   Closest Fib: {best_fib:.1%} | Distance: {fib_dist:.1%}")
-                    confluence.append(f"   W1 size: {fmt_price(w1_size)} | W3 proj (161.8%): {fmt_price(tp_proj)}")
+                    confluence.append(f"   W1 size: {fmt_price(w1_size)} | W3 proj (200%): {fmt_price(tp_proj)}")
                     confidence += confidence_bonus
                     raw_data["wave1_start"] = p0[1]
                     raw_data["wave1_end"] = p1[1]
                     raw_data["wave2_end"] = p2[1]
                     raw_data["w2_fib"] = best_fib
                     raw_data["w3_proj"] = tp_proj
+                    raw_data["w3_proj_162"] = p2[1] + w1_size * 1.618  # reference: confirmed W3 start level
                     break
 
             # Bearish Wave 3 setup: H - L - H pattern (W1 down, W2 retrace up)
@@ -205,29 +221,36 @@ class ElliottWave(BaseStrategy):
                 w2_retrace = p2[1] - p1[1]
                 if w1_size <= 0:
                     continue
+                # EW-Q1: W1 must be a meaningful impulse — require at least 2 ATRs.
+                if w1_size < atr * 2:
+                    continue
                 w2_ratio = w2_retrace / w1_size
                 best_fib, fib_dist = _closest_fib(w2_ratio, _WAVE2_FIBS)
 
                 if fib_dist > fib_tolerance:
                     continue
 
-                if abs(current_price - p2[1]) <= atr * 3:
+                if abs(current_price - p2[1]) <= atr * 1.5:
                     direction   = "SHORT"
                     target_wave = 3
                     entry_level = p2[1]
                     sl_level    = p0[1]
 
-                    tp_proj = p2[1] - w1_size * 1.618
+                    # EW-Q5: 200% extension as primary target; store 161.8% reference.
+                    tp_proj = p2[1] - w1_size * 2.000
 
                     confidence_bonus = 15 if fib_dist < 0.03 else 8 if fib_dist < 0.05 else 0
                     confluence.append(f"✅ Bearish Wave 2 at {fmt_price(p2[1])} — retraced {w2_ratio:.1%} of W1")
                     confluence.append(f"   Closest Fib: {best_fib:.1%} | Distance: {fib_dist:.1%}")
-                    confluence.append(f"   W1 size: {fmt_price(w1_size)} | W3 proj: {fmt_price(tp_proj)}")
+                    confluence.append(f"   W1 size: {fmt_price(w1_size)} | W3 proj (200%): {fmt_price(tp_proj)}")
                     confidence += confidence_bonus
                     raw_data["wave1_start"] = p0[1]
                     raw_data["wave1_end"] = p1[1]
                     raw_data["wave2_end"] = p2[1]
                     raw_data["w2_fib"] = best_fib
+                    # EW-1: SHORT was missing w3_proj — analytics reading it got None.
+                    raw_data["w3_proj"] = tp_proj
+                    raw_data["w3_proj_162"] = p2[1] - w1_size * 1.618
                     break
 
         # ── Try Wave 5 entry if no Wave 3 found ───────────────────────────
@@ -245,13 +268,22 @@ class ElliottWave(BaseStrategy):
                     w4_retrace = p3[1] - p4[1]
                     if w3_size <= 0:
                         continue
+                    # EW-Q1: W3 must be longer than W1 (classic EW guideline).
+                    # A Wave 5 setup with W3 shorter than W1 is a weaker count.
+                    if w3_size < w1_size:
+                        continue
                     w4_ratio = w4_retrace / w3_size
                     best_fib, fib_dist = _closest_fib(w4_ratio, _WAVE4_FIBS)
 
-                    if fib_dist > fib_tolerance:
+                    if fib_dist > fib_tolerance_w4:
                         continue
 
-                    if abs(current_price - p4[1]) <= atr * 3:
+                    # EW-Q4: Wave 4 must not enter Wave 1 territory (classic EW rule).
+                    # For bullish W5: W4 low (p4[1]) must stay above W1 high (p1[1]).
+                    if p4[1] < p1[1]:
+                        continue
+
+                    if abs(current_price - p4[1]) <= atr * 1.5:
                         direction   = "LONG"
                         target_wave = 5
                         entry_level = p4[1]
@@ -274,13 +306,21 @@ class ElliottWave(BaseStrategy):
                     w4_retrace = p4[1] - p3[1]
                     if w3_size <= 0:
                         continue
+                    # EW-Q1: W3 must be longer than W1 (classic EW guideline).
+                    if w3_size < w1_size:
+                        continue
                     w4_ratio = w4_retrace / w3_size
                     best_fib, fib_dist = _closest_fib(w4_ratio, _WAVE4_FIBS)
 
-                    if fib_dist > fib_tolerance:
+                    if fib_dist > fib_tolerance_w4:
                         continue
 
-                    if abs(current_price - p4[1]) <= atr * 3:
+                    # EW-Q4: Wave 4 must not enter Wave 1 territory (classic EW rule).
+                    # For bearish W5: W4 high (p4[1]) must stay below W1 low (p1[1]).
+                    if p4[1] > p1[1]:
+                        continue
+
+                    if abs(current_price - p4[1]) <= atr * 1.5:
                         direction   = "SHORT"
                         target_wave = 5
                         entry_level = p4[1]
@@ -309,6 +349,17 @@ class ElliottWave(BaseStrategy):
             confidence += self._REGIME_CONF_COUNTER_TREND.get(regime, 0)
 
         # ── Entry zone / SL / TP ──────────────────────────────────────────
+        # EW-Q3: SL at W1 start can be very far from entry on 4h charts (200h+
+        # ago), creating 8-12% realized risk even when R:R looks attractive.
+        # Cap the SL at max_sl_atr ATRs from the Wave 2/4 pivot (entry).
+        # `max(LONG)` / `min(SHORT)` preserves EW semantics: the W1-start
+        # invalidation level still wins when it's CLOSER than the ATR cap.
+        max_sl_atr = getattr(self._cfg, "max_sl_atr", 5.0)
+        if direction == "LONG":
+            sl_level = max(sl_level, entry_level - atr * max_sl_atr)
+        else:
+            sl_level = min(sl_level, entry_level + atr * max_sl_atr)
+
         if direction == "LONG":
             entry_low   = entry_level - atr * rp.entry_zone_tight
             entry_high  = entry_level + atr * rp.entry_zone_atr
