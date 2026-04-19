@@ -109,6 +109,8 @@ class Scanner:
         # OHLCV data-quality cooldown — symbols that fail N times are auto-excluded
         self._ohlcv_fail_counts: Dict[str, int] = {}      # symbol → consecutive failures
         self._ohlcv_cooldown_until: Dict[str, float] = {} # symbol → cooldown expiry ts
+        # Temporary exclusion cooldown (edge-case spam control)
+        self._temp_excluded_until: Dict[str, float] = {}  # symbol → temporary exclusion expiry ts
 
         # Stalker watchlist
         self._stalker_scores: Dict[str, float] = {}
@@ -243,6 +245,7 @@ class Scanner:
                 self._watchlist_cooldown,
                 self._ohlcv_fail_counts,
                 self._ohlcv_cooldown_until,
+                self._temp_excluded_until,
                 self._whale_snapshot,
                 self._signal_dedup,
             ):
@@ -282,6 +285,8 @@ class Scanner:
         # in an asyncio task and can mutate _symbols while we iterate, raising
         # RuntimeError: dictionary changed size during iteration.
         for symbol, state in list(self._symbols.items()):
+            if self.is_temporarily_excluded(symbol):
+                continue
             interval = self._tier_intervals.get(state.tier, 300)
             if now - state.last_scan >= interval:
                 due.append(symbol)
@@ -312,7 +317,31 @@ class Scanner:
         """E3: Permanently remove a delisted/bad symbol from the scan universe."""
         # FIX: pop() is atomic at the GIL level — safe without a lock
         self._symbols.pop(symbol, None)
+        self._temp_excluded_until.pop(symbol, None)
         logger.info(f"Scanner: excluded {symbol} from universe (delisted or bad symbol)")
+
+    def temporarily_exclude_symbol(self, symbol: str, duration_secs: int = 3600, reason: str = "edge case"):
+        """Temporarily pause scans for a symbol without removing it from the universe."""
+        if symbol not in self._symbols:
+            return
+        until = time.time() + max(1, int(duration_secs))
+        prev_until = self._temp_excluded_until.get(symbol, 0.0)
+        self._temp_excluded_until[symbol] = max(prev_until, until)
+        remaining = int(max(0.0, self._temp_excluded_until[symbol] - time.time()))
+        logger.info(
+            f"Scanner: temporarily excluded {symbol} for {remaining}s ({reason})"
+        )
+
+    def is_temporarily_excluded(self, symbol: str) -> bool:
+        """Return True if symbol is under temporary exclusion cooldown."""
+        until = self._temp_excluded_until.get(symbol)
+        if until is None:
+            return False
+        if time.time() >= until:
+            self._temp_excluded_until.pop(symbol, None)
+            logger.info(f"Scanner: temporary exclusion expired for {symbol}")
+            return False
+        return True
 
     # ── OHLCV data-quality cooldown ──────────────────────────────
 
