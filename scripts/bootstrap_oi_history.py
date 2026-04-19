@@ -451,11 +451,17 @@ def build_clusters(
             continue
 
         if any(_coin_upper.startswith(m) for m in ("BTC", "ETH")):
+            # BTC/ETH tend to carry lower average leverage than smaller-cap alts.
             leverage_mix = [(5, 0.35), (10, 0.45), (20, 0.20)]
         elif any(_coin_upper.startswith(m) for m in ("SOL", "BNB", "XRP", "ADA", "DOGE", "AVAX", "LINK")):
+            # Large liquid alts: balanced mix with a small high-leverage tail.
             leverage_mix = [(5, 0.20), (10, 0.45), (20, 0.30), (50, 0.05)]
         else:
+            # Smaller caps: leverage skews higher, including 50x/100x activity.
             leverage_mix = [(10, 0.30), (20, 0.45), (50, 0.20), (100, 0.05)]
+        if abs(sum(w for _, w in leverage_mix) - 1.0) > 1e-9:
+            logger.warning(f"Invalid leverage mix weights for {coin}: {leverage_mix}")
+            continue
 
         safe_long_ratio = min(0.8, max(0.2, float(long_ratio)))
         long_oi  = oi_accumulated * safe_long_ratio

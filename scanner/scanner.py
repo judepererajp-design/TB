@@ -731,6 +731,8 @@ class Scanner:
         range_mid = (np.max(highs[-10:]) + np.min(lows[-10:])) / 2.0
         range_pct = (np.max(highs[-10:]) - np.min(lows[-10:])) / range_mid if range_mid > 0 else 1.0
         is_tight_range = range_pct < 0.03
+        # Use a softer volume-drop threshold (0.7) only because we now require
+        # simultaneous tight-range + key-level proximity confirmation.
         if avg_vol_5 < avg_vol_20 * 0.7 and is_tight_range and near_key_level:
             score += 15
             reasons.append("📊 Volume cooling inside tight key-level range — coiling setup")
