@@ -338,6 +338,18 @@ class ElliottWave(BaseStrategy):
         if direction is None:
             return None
 
+        # ── Hard counter-trend veto ────────────────────────────────────────
+        # EW-C: The -10 confidence penalty for counter-trend signals is not
+        # sufficient to stop them from reaching the aggregator (observed 67%
+        # rejection rate at AGG_THRESHOLD / RR_FLOOR, wasting pipeline capacity).
+        # Elliott Wave 3/5 entries are momentum setups — they must follow the
+        # dominant regime.  Counter-trend wave counts in a confirmed trend are
+        # structurally unsound and almost never achieve the projected targets.
+        if direction == "SHORT" and regime == "BULL_TREND":
+            return None
+        if direction == "LONG" and regime == "BEAR_TREND":
+            return None
+
         # ── Direction-aware regime confidence ─────────────────────────────
         _is_with_trend = (
             (direction == "LONG" and regime == "BULL_TREND") or

@@ -35,7 +35,7 @@ class Grading:
     A_GRADE_ESTIMATE_RAW_CONF: int = 78   # Raw conf proxy for A-grade in daily limit
 
     # Adaptive confidence floor
-    ADAPTIVE_FLOOR_MIN_HISTORY: int = 20  # Min scores before adaptive calc
+    ADAPTIVE_FLOOR_MIN_HISTORY: int = 50  # Min scores before adaptive calc (raised from 20: 20 approved signals in the first 4 minutes of a run is too thin a sample and causes the floor to ratchet +8 pts in one minute)
     ADAPTIVE_FLOOR_PERCENTILE: int = 40   # np.percentile target
     ADAPTIVE_FLOOR_MAX_CAP: int = 68      # Never raise floor above this
     FLOOR_ABSOLUTE_MINIMUM: int = 55      # Safety — never below 55

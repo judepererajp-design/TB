@@ -217,13 +217,19 @@ async def fetch_okx_oi_history(
             except (IndexError, ValueError, TypeError):
                 pass
 
-        oldest_ts = int(rows[-1][0])
+        # Use the minimum timestamp in this page as both the oldest-ts check
+        # and the next pagination cursor.  OKX may return rows in ascending or
+        # descending order depending on the API version; taking the min ensures
+        # correct pagination regardless of row order.  Previously rows[-1][0]
+        # was used, which equalled the NEWEST timestamp when data was ascending,
+        # causing the cursor to stall immediately on the second iteration.
+        oldest_ts = min(int(row[0]) for row in rows)
         if oldest_ts <= start_ms:
             break
 
-        next_after = rows[-1][0]
+        next_after = str(oldest_ts)
         if after and next_after == after:
-            logger.warning(f"OKX OI cursor stalled for {coin}: after={after}")
+            logger.debug(f"OKX OI cursor exhausted for {coin}: after={after}")
             break
         after = next_after
         await asyncio.sleep(_REQUEST_GAP)

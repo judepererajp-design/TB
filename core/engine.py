@@ -6031,13 +6031,17 @@ class Engine:
     @staticmethod
     def _compute_pump_dump_metrics(ohlcv_15m: Optional[List]) -> Optional[Dict]:
         """Compute simple 15m pump/dump metrics from recent OHLCV candles."""
-        if not ohlcv_15m or len(ohlcv_15m) < 5:
+        if not ohlcv_15m or len(ohlcv_15m) < 7:
             return None
         try:
-            prev_close = float(ohlcv_15m[-2][4])
-            last_close = float(ohlcv_15m[-1][4])
-            last_volume = float(ohlcv_15m[-1][5])
-            baseline_volumes = [float(c[5]) for c in ohlcv_15m[-5:-1] if float(c[5]) >= 0]
+            # Use the last CLOSED bar (index -2) — the current bar (-1) is still
+            # forming and its partial volume compared against fully-closed baseline
+            # bars produces spurious -70% to -99% volume readings on nearly every
+            # symbol.  Shifting back one bar gives stable, comparable readings.
+            prev_close = float(ohlcv_15m[-3][4])
+            last_close = float(ohlcv_15m[-2][4])
+            last_volume = float(ohlcv_15m[-2][5])
+            baseline_volumes = [float(c[5]) for c in ohlcv_15m[-6:-2] if float(c[5]) >= 0]
             baseline_volume = sum(baseline_volumes) / len(baseline_volumes) if baseline_volumes else 0.0
             price_change_pct = ((last_close - prev_close) / prev_close * 100.0) if prev_close > 0 else 0.0
             volume_change_pct = (

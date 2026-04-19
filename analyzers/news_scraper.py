@@ -223,6 +223,13 @@ class NewsScraper:
         # Titles whose confidence should be downgraded due to evolution
         self._evolved_titles: Dict[str, float] = {}  # original_title -> penalty multiplier
 
+        # News storm log debounce — prevents the same warning from firing once
+        # per evaluation loop (54 times in 4 minutes for a persistent storm).
+        # Log at most once per state change (severity+regime combo) or every
+        # 5 minutes, whichever comes first.
+        self._last_storm_log_ts: float = 0.0
+        self._last_storm_key: str = ""
+
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
@@ -1268,11 +1275,19 @@ class NewsScraper:
             'tighten_profitable': severity == "SEVERE",
         }
 
-        logger.warning(
-            f"📰🔴 NEWS STORM {severity}: {negative_count}/{total_count} negative "
-            f"items in {window_minutes}min — LONG penalty {long_penalty}, "
-            f"SHORT penalty {short_penalty} (regime={current_regime or 'UNKNOWN'})"
-        )
+        # Debounce: only log when the storm state changes (severity or regime)
+        # or after a 5-minute cooldown.  Prevents ~18 identical warnings per
+        # minute when the storm condition persists across evaluation loops.
+        _storm_key = f"{severity}:{current_regime}"
+        _now_ts = time.time()
+        if _storm_key != self._last_storm_key or _now_ts - self._last_storm_log_ts > 300:
+            logger.warning(
+                f"📰🔴 NEWS STORM {severity}: {negative_count}/{total_count} negative "
+                f"items in {window_minutes}min — LONG penalty {long_penalty}, "
+                f"SHORT penalty {short_penalty} (regime={current_regime or 'UNKNOWN'})"
+            )
+            self._last_storm_log_ts = _now_ts
+            self._last_storm_key = _storm_key
 
         return result
 
