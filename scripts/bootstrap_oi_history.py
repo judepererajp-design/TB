@@ -299,8 +299,10 @@ def build_clusters(
       → Shorts were opened at P → will liquidate at P*(1+1/lev)
 
     We use a mix of 5x, 10x, 20x leverage assumptions weighted realistically.
-    OI deltas are age-weighted (exponential decay, τ=30 days) so stale data
-    contributes less than recent accumulation.
+    OI deltas are age-weighted (exponential decay) so stale data contributes
+    less than recent accumulation.  The decay constant τ is asset-aware:
+      • BTC/ETH: τ=30 days (structurally stable; older OI stays relevant)
+      • Alts:    τ=21 days (faster cycling; stale accumulation decays sooner)
 
     Returns list of (price, usd_size, 'above'|'below') relative to current price.
     Clusters with effective OI < $10M are filtered out.
@@ -336,7 +338,8 @@ def build_clusters(
             continue
 
         # Exponential age weight: recent data → weight ≈ 1.0,
-        # data 30 days old → weight ≈ 0.37, data 60 days old → weight ≈ 0.14.
+        # data τ days old → weight ≈ 0.37, data 2τ days old → weight ≈ 0.14.
+        # τ=30d for BTC/ETH, τ=21d for alts (see asset-aware block above).
         age_secs = max(0.0, now_ts - ts)
         weight   = math.exp(-age_secs / tau_secs)
 

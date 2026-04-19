@@ -89,12 +89,24 @@ class StalkerEngine:
             _raw_adj = round(_raw_adj * 0.75)
         min_score = self._min_watch_score + _raw_adj
 
-        # Regime-dependent dedup TTL (mirrors scanner.stalker_scan)
-        _base_dedup_ttl = 1800  # 30 min
+        # Regime-dependent dedup TTL (mirrors scanner.stalker_scan).
+        # Read the base TTL from the scanner singleton so both paths stay in sync.
+        # Hysteresis: within 10 min of a regime flip, damp the TTL reduction by
+        # 25% so we don't instantly halve the dedup window on a noisy transition.
+        try:
+            from scanner.scanner import scanner as _scanner_singleton
+            _base_dedup_ttl = _scanner_singleton._signal_dedup_ttl
+        except Exception:
+            _base_dedup_ttl = 1800  # 30 min fallback
         if _regime in ("BULL_TREND", "BEAR_TREND"):
             _dedup_ttl = _base_dedup_ttl        # 30 min — signals evolve slowly
         else:
-            _dedup_ttl = _base_dedup_ttl // 2   # 15 min — allow re-entries in chop
+            _raw_ttl_reduction = _base_dedup_ttl // 2
+            if _recently_flipped:
+                _damped_ttl = _base_dedup_ttl - round(_raw_ttl_reduction * 0.75)
+                _dedup_ttl = _damped_ttl
+            else:
+                _dedup_ttl = _base_dedup_ttl - _raw_ttl_reduction  # 15 min in chop/volatile
 
         df = pd.DataFrame(ohlcv_1h, columns=['ts','open','high','low','close','volume'])
         df = df.astype({'open': float,'high': float,'low': float,'close': float,'volume': float})
@@ -231,7 +243,7 @@ class StalkerEngine:
             return np.mean(trs[-p:]) if trs else 0
 
         recent_atr = atr(highs[-14:], lows[-14:], closes[-14:], period)
-        long_atr   = atr(highs[-60:], lows[-60:], closes[-60:], 59)   # average all 59 TRs
+        long_atr   = atr(highs[-60:], lows[-60:], closes[-60:], 59)   # 60 bars → 59 TRs, average all
 
         if long_atr == 0:
             return False

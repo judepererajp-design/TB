@@ -430,8 +430,10 @@ class Scanner:
 
         # Use last known price from order book or symbol state
         # order_book bids/asks have prices — use mid of best bid/ask
-        best_bid = float(order_book.get('bids', [[]])[0][0]) if order_book.get('bids') else 0.0
-        best_ask = float(order_book.get('asks', [[]])[0][0]) if order_book.get('asks') else 0.0
+        _bids_raw = order_book.get('bids', [])
+        _asks_raw = order_book.get('asks', [])
+        best_bid = float(_bids_raw[0][0]) if _bids_raw and _bids_raw[0] else 0.0
+        best_ask = float(_asks_raw[0][0]) if _asks_raw and _asks_raw[0] else 0.0
         if best_bid > 0 and best_ask > 0:
             current_price = (best_bid + best_ask) / 2
         elif best_bid > 0:
@@ -582,10 +584,18 @@ class Scanner:
         # Regime-dependent dedup TTL:
         # TREND → signals evolve slowly, 30 min window avoids duplicate noise.
         # CHOPPY → signals flip quickly, 15 min window allows valid re-entries.
+        # Hysteresis: within 10 min of a regime flip, damp the TTL reduction by
+        # 25% so we don't instantly halve the dedup window on a noisy transition.
         if _regime in ("BULL_TREND", "BEAR_TREND"):
             _dedup_ttl = self._signal_dedup_ttl        # 30 min
         else:
-            _dedup_ttl = self._signal_dedup_ttl // 2   # 15 min in chop/volatile
+            _raw_ttl_reduction = self._signal_dedup_ttl // 2
+            if _recently_flipped:
+                # Damp: interpolate 75% of the way from full TTL to half TTL
+                _damped_ttl = self._signal_dedup_ttl - round(_raw_ttl_reduction * 0.75)
+                _dedup_ttl = _damped_ttl
+            else:
+                _dedup_ttl = self._signal_dedup_ttl - _raw_ttl_reduction  # 15 min in chop/volatile
 
         df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
         df = df.astype({'open':float,'high':float,'low':float,'close':float,'volume':float})
@@ -604,7 +614,7 @@ class Scanner:
             window = closes[-bb_period:]
             bb_mean = np.mean(window)
             bb_std  = np.std(window)
-            bb_width = (bb_std * 4) / bb_mean if bb_mean > 0 else 0.0  # Standard Bollinger Bandwidth
+            bb_width = (bb_std * 4) / bb_mean if bb_mean > 0 else 0.0  # Full band width (upper - lower) / mean
 
             # Lowest bandwidth in 48 bars = squeeze
             if len(closes) >= 48:
