@@ -28,11 +28,13 @@ logger = logging.getLogger(__name__)
 class DerivativesData:
     symbol: str
     funding_rate: float = 0.0          # Current funding rate (%)
+    funding_timestamp_ms: Optional[int] = None  # Funding snapshot time (ms)
     funding_trend: str = "NEUTRAL"     # Level classifier: EXTREMELY_HIGH | HIGH | NEGATIVE | NEUTRAL
     # AUDIT FIX (funding delta): separate rate-of-change classifier.  Squeezes
     # come from acceleration, not absolute level — a flat-but-high funding is
     # already priced in, whereas a rapidly RISING funding signals crowd entry.
     funding_delta_trend: str = "FLAT"  # RISING | FALLING | FLAT
+    funding_delta_pct: float = 0.0     # Raw rate-of-change in pp (newest − oldest sample)
     # AUDIT FIX (funding z-score): per-asset normalised funding extreme.
     # Same threshold catches the relative tail on any symbol because the
     # normalisation uses each asset's own mean/std. 0.0 = baseline /
@@ -115,8 +117,9 @@ class DerivativesAnalyzer:
         # Parse funding rate
         if isinstance(funding, dict) and funding:
             data.funding_rate = float(funding.get('fundingRate') or 0) * 100  # Convert to %
+            data.funding_timestamp_ms = self._extract_funding_timestamp_ms(funding)
             data.funding_trend = self._classify_funding_trend(data.funding_rate)
-            data.funding_delta_trend = self._classify_funding_delta(symbol, data.funding_rate)
+            data.funding_delta_trend, data.funding_delta_pct = self._classify_funding_delta(symbol, data.funding_rate)
             # FUNDING-Z: compute *after* delta so the latest sample is in history.
             data.funding_z, data.funding_z_trend = self._compute_funding_z(symbol)
 
@@ -156,6 +159,33 @@ class DerivativesAnalyzer:
         data.score = self._calculate_score(data)
 
         return data
+
+    @staticmethod
+    def _extract_funding_timestamp_ms(funding: Dict) -> Optional[int]:
+        """
+        Best-effort funding snapshot timestamp extraction from CCXT payload.
+        """
+        ts = funding.get('timestamp') or funding.get('fundingTimestamp')
+        if ts is None:
+            info = funding.get('info')
+            if isinstance(info, dict):
+                ts = (
+                    info.get('fundingTime')
+                    or info.get('time')
+                    or info.get('timestamp')
+                )
+        try:
+            if isinstance(ts, str):
+                ts = ts.strip()
+                try:
+                    ts_int = int(ts)
+                except ValueError:
+                    ts_int = int(float(ts))
+            else:
+                ts_int = int(ts)
+            return ts_int if ts_int > 0 else None
+        except (TypeError, ValueError):
+            return None
 
     def _update_oi_history(self, symbol: str, oi_level: float) -> float:
         """
@@ -203,7 +233,7 @@ class DerivativesAnalyzer:
         else:
             return "NEUTRAL"
 
-    def _classify_funding_delta(self, symbol: str, rate: float) -> str:
+    def _classify_funding_delta(self, symbol: str, rate: float) -> Tuple[str, float]:
         """
         Classify funding rate-of-change across the last few polls.
 
@@ -215,19 +245,22 @@ class DerivativesAnalyzer:
 
         Uses a short per-symbol history (deque) and compares newest vs oldest
         sample.  Returns "FLAT" until we have at least 2 samples.
+
+        Returns a tuple of (trend_label, raw_delta_pp) where raw_delta_pp is the
+        actual change in percentage-points so callers can scale by magnitude.
         """
         history = self._funding_history.setdefault(
             symbol, deque(maxlen=self._funding_history_max)
         )
         history.append(rate)
         if len(history) < 2:
-            return "FLAT"
+            return "FLAT", 0.0
         delta = history[-1] - history[0]
         if delta > self._funding_delta_threshold:
-            return "RISING"
+            return "RISING", delta
         elif delta < -self._funding_delta_threshold:
-            return "FALLING"
-        return "FLAT"
+            return "FALLING", delta
+        return "FLAT", delta
 
     def _compute_funding_z(self, symbol: str) -> Tuple[float, str]:
         """

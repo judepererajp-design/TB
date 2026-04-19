@@ -124,19 +124,27 @@ class Momentum(BaseStrategy):
         fast_period  = getattr(self._cfg, "macd_fast", 12)
         slow_period  = getattr(self._cfg, "macd_slow", 26)
         sig_period   = getattr(self._cfg, "macd_signal", 9)
-        min_adx      = getattr(self._cfg, "min_adx", 30)
+        min_adx      = getattr(self._cfg, "min_adx", 25)
         vol_surge    = getattr(self._cfg, "volume_surge_mult", 2.0)
         confidence_base = getattr(self._cfg, "confidence_base", 70)
+
+        # Dynamic vol_surge: in high-volatility instruments (high ATR%), random
+        # volume spikes are more common, so require proportionally more to confirm.
+        # Scale is modest: ±0-50% of the base threshold.
+        _atr_pct = atr / closes[-1] if closes[-1] > 0 else 0.02
+        _effective_vol_surge = vol_surge * (1.0 + min(0.5, _atr_pct * 10))
 
         # ── MACD calculation ──────────────────────────────────────────────
         macd_line, signal_line, histogram = _macd(closes, fast_period, slow_period, sig_period)
 
-        if len(macd_line) < 3:
+        if len(macd_line) < 4:
             return None
 
-        # Detect crossover on the most recent completed bar ([-2] vs [-1])
-        prev_macd_diff  = macd_line[-2] - signal_line[-2]
-        curr_macd_diff  = macd_line[-1] - signal_line[-1]
+        # M-1: Detect crossover on the two most recent *completed* bars ([-3]→[-2]).
+        # [-1] is the currently-forming candle whose MACD value shifts every tick.
+        # Using confirmed bars eliminates false crossovers from the live candle.
+        prev_macd_diff  = macd_line[-3] - signal_line[-3]
+        curr_macd_diff  = macd_line[-2] - signal_line[-2]
 
         bullish_cross = prev_macd_diff <= 0 < curr_macd_diff
         bearish_cross = prev_macd_diff >= 0 > curr_macd_diff
@@ -146,12 +154,40 @@ class Momentum(BaseStrategy):
 
         direction = "LONG" if bullish_cross else "SHORT"
 
-        # ── Regime direction gate ─────────────────────────────────────────
+        # Whipsaw / cooldown — a crossover that reverses within a few bars and
+        # crosses again is almost always a chop trap.  Detect prior sign flips in
+        # the 5 bars immediately before the current crossover window.
+        # 2+ reversals = pure chop → hard block.  1 reversal → soft −10 penalty.
+        _whipsaw_penalty = 0
+        if len(macd_line) >= 8:
+            _prior_diff        = macd_line[-8:-3] - signal_line[-8:-3]
+            _prior_sign_chg    = int(np.sum(np.diff(np.sign(_prior_diff)) != 0))
+            if _prior_sign_chg >= 2:
+                return None  # Pure chop — 2+ flips in 5 bars
+            elif _prior_sign_chg == 1:
+                _whipsaw_penalty = -10  # Prior crossover failed — lower conviction
+
+        # Early histogram buildup bonus — if the histogram was already narrowing
+        # toward zero in the bar *before* the crossover, momentum was building
+        # early.  This partially offsets the late-entry nature of MACD.
+        _early_momentum_bonus = 0
+        if len(histogram) >= 4:
+            if bullish_cross and histogram[-4] < histogram[-3] < 0:
+                _early_momentum_bonus = 4   # Pre-cross bullish momentum already building
+            elif bearish_cross and histogram[-4] > histogram[-3] > 0:
+                _early_momentum_bonus = 4   # Pre-cross bearish momentum already building
+
+        # ── Regime direction gate — soft penalty for counter-trend signals ──
+        # Hard-blocking all counter-trend signals in trending regimes misses
+        # tradeable extended-wick reversals.  Apply a −15 confidence penalty
+        # instead so those setups survive only when all other signals are strong.
+        _counter_trend_penalty = 0
         if regime_dir and direction != regime_dir:
-            return None
+            _counter_trend_penalty = -15
 
         # ── Histogram expansion ───────────────────────────────────────────
-        histogram_expanding = abs(histogram[-1]) > abs(histogram[-2])
+        # M-1: Histogram expansion on confirmed bars ([-2] vs [-3]).
+        histogram_expanding = abs(histogram[-2]) > abs(histogram[-3])
         require_expansion   = getattr(self._cfg, "histogram_expansion", True)
         if require_expansion and not histogram_expanding:
             return None
@@ -162,9 +198,12 @@ class Momentum(BaseStrategy):
             return None
 
         # ── Volume surge ──────────────────────────────────────────────────
+        # M-2: Use last *closed* bar for volume comparison.  The live bar's volume
+        # accumulates throughout the candle period, so comparing volumes[-1] against
+        # a 20-bar average suppresses the ratio for early-in-period checks.
         avg_vol   = float(np.mean(volumes[-20:]))
-        vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 1.0
-        if vol_ratio < vol_surge:
+        vol_ratio = volumes[-2] / avg_vol if avg_vol > 0 else 1.0
+        if vol_ratio < _effective_vol_surge:
             return None
 
         # ── EMA pullback confirmation ─────────────────────────────────────
@@ -177,14 +216,20 @@ class Momentum(BaseStrategy):
         _ema_ref = None
 
         # Check proximity to 9 EMA first (faster, tighter entries)
+        # M-3: Scale thresholds by ATR% so volatile alts aren't unfairly penalised.
+        # At low volatility (ATR ~1% of price) threshold = 0.6; at high volatility
+        # (ATR ~5%) threshold = min(2.0, 0.6 + scaling).
+        _near_9_thresh  = max(0.6, min(2.0, _atr_pct * 40))
+        _near_21_thresh = _near_9_thresh + 0.4
+
         _dist_9  = abs(closes[-1] - ema_9[-1]) / atr if atr > 0 else 99
         _dist_21 = abs(closes[-1] - ema_21[-1]) / atr if atr > 0 else 99
 
-        if _dist_9 < 0.6:
+        if _dist_9 < _near_9_thresh:
             _near_ema = True
             _ema_pullback_bonus = 6
             _ema_ref = ema_9[-1]
-        elif _dist_21 < 0.8:
+        elif _dist_21 < _near_21_thresh:
             _near_ema = True
             _ema_pullback_bonus = 4
             _ema_ref = ema_21[-1]
@@ -194,6 +239,9 @@ class Momentum(BaseStrategy):
         # ── Confidence ────────────────────────────────────────────────────
         confidence = float(confidence_base)
         confidence += _ms_bonus
+        confidence += _counter_trend_penalty
+        confidence += _whipsaw_penalty
+        confidence += _early_momentum_bonus
         confidence += _ema_pullback_bonus
         confidence += 5   # MACD crossover
         if histogram_expanding:
@@ -202,6 +250,9 @@ class Momentum(BaseStrategy):
         confidence  += adx_bonus
         if vol_ratio >= 3.0:
             confidence += 5
+        # Rising volume participation — trending volume is stronger than a single spike.
+        if len(volumes) >= 4 and volumes[-2] > volumes[-3] > volumes[-4]:
+            confidence += 3
 
         # ── Entry / SL / TP ───────────────────────────────────────────────
         current_close = closes[-1]
@@ -211,16 +262,18 @@ class Momentum(BaseStrategy):
         if direction == "LONG":
             entry_low   = current_close
             entry_high  = current_close + buf
-            swing_low_3 = float(np.min(lows[-4:-1]))
-            stop_loss   = swing_low_3 - atr * 0.5
+            # M-4: 5-bar swing lookback — 3 bars is too short for hourly structure.
+            swing_low = float(np.min(lows[-6:-1]))
+            stop_loss   = swing_low - atr * 0.5
             tp1         = entry_high + atr * rp.volatility_scaled_tp1(tf, vp)
             tp2         = entry_high + atr * rp.volatility_scaled_tp2(tf, vp)
             tp3         = entry_high + atr * rp.volatility_scaled_tp3(tf, vp)
         else:
             entry_high  = current_close
             entry_low   = current_close - buf
-            swing_high_3 = float(np.max(highs[-4:-1]))
-            stop_loss   = swing_high_3 + atr * 0.5
+            # M-4: 5-bar swing lookback (same rationale as LONG path above)
+            swing_high = float(np.max(highs[-6:-1]))
+            stop_loss   = swing_high + atr * 0.5
             tp1         = entry_low - atr * rp.volatility_scaled_tp1(tf, vp)
             tp2         = entry_low - atr * rp.volatility_scaled_tp2(tf, vp)
             tp3         = entry_low - atr * rp.volatility_scaled_tp3(tf, vp)
@@ -237,10 +290,10 @@ class Momentum(BaseStrategy):
 
         confluence: List[str] = [
             f"✅ MACD {'bullish' if direction == 'LONG' else 'bearish'} crossover",
-            f"   MACD: {macd_line[-1]:.4f} | Signal: {signal_line[-1]:.4f}",
+            f"   MACD: {macd_line[-2]:.4f} | Signal: {signal_line[-2]:.4f}",
         ]
         if histogram_expanding:
-            confluence.append(f"✅ Histogram expanding: {histogram[-1]:.4f} > {histogram[-2]:.4f}")
+            confluence.append(f"✅ Histogram expanding: {histogram[-2]:.4f} > {histogram[-3]:.4f}")
         confluence.append(f"✅ ADX: {adx:.1f} > {min_adx} — trend established")
         confluence.append(f"✅ Volume surge: {vol_ratio:.1f}x average")
         if _near_ema and _ema_ref is not None:
@@ -252,6 +305,14 @@ class Momentum(BaseStrategy):
 
         if _ms_bonus != 0:
             confluence.append(f"🧠 Market State: {getattr(_ms_state, 'value', 'N/A')} ({'+' if _ms_bonus >= 0 else ''}{_ms_bonus})")
+        if _counter_trend_penalty != 0:
+            confluence.append(f"⚠️ Counter-trend signal in {regime} ({_counter_trend_penalty})")
+        if _whipsaw_penalty != 0:
+            confluence.append(f"⚠️ Prior crossover reversal detected — chop risk ({_whipsaw_penalty})")
+        if _early_momentum_bonus > 0:
+            confluence.append(f"✅ Pre-cross histogram buildup (+{_early_momentum_bonus})")
+        if len(volumes) >= 4 and volumes[-2] > volumes[-3] > volumes[-4]:
+            confluence.append("✅ Rising volume participation (+3)")
 
         confidence = min(93, max(40, confidence))
 
@@ -271,13 +332,16 @@ class Momentum(BaseStrategy):
             analysis_timeframes=[tf],
             confluence=confluence,
             raw_data={
-                "macd": float(macd_line[-1]),
-                "macd_signal": float(signal_line[-1]),
-                "histogram": float(histogram[-1]),
+                "macd": float(macd_line[-2]),
+                "macd_signal": float(signal_line[-2]),
+                "histogram": float(histogram[-2]),
                 "adx": adx,
                 "vol_ratio": vol_ratio,
+                "vol_surge_threshold": round(_effective_vol_surge, 2),
                 "regime": regime,
                 "market_state": getattr(_ms_state, 'value', None),
+                "whipsaw_penalty": _whipsaw_penalty,
+                "early_momentum_bonus": _early_momentum_bonus,
             },
             regime=regime,
         )

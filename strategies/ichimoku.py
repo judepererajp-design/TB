@@ -105,14 +105,23 @@ class Ichimoku(BaseStrategy):
         # Senkou Span A = (Tenkan + Kijun) / 2, shifted forward 26
         senkou_a_raw = (tenkan + kijun) / 2
         # We access the value from `displacement` bars ago as the current cloud value
-        senkou_a_current = senkou_a_raw[-displacement] if len(senkou_a_raw) > displacement else senkou_a_raw[0]
+        # The ≥100-bar guard above means len(senkou_a_raw) > displacement (26) always holds.
+        senkou_a_current = senkou_a_raw[-displacement]
 
         # Senkou Span B = (52-period H+L) / 2, shifted forward 26
         senkou_b_raw = _period_midline(highs, lows, senkou_b_period)
-        senkou_b_current = senkou_b_raw[-displacement] if len(senkou_b_raw) > displacement else senkou_b_raw[0]
+        senkou_b_current = senkou_b_raw[-displacement]
 
         kumo_top    = max(senkou_a_current, senkou_b_current)
         kumo_bottom = min(senkou_a_current, senkou_b_current)
+        kumo_size   = kumo_top - kumo_bottom
+
+        # IC-Q1: Thin cloud → weak S/R zone → high failure rate.
+        # Use the larger of 1×ATR or 0.2% of price so the gate scales correctly across
+        # assets where ATR is very small relative to price (e.g. low-vol alts) or very
+        # large relative to price (e.g. high-vol micro-caps).
+        if kumo_size < max(atr * 1.0, current_price * 0.002):
+            return None
 
         # Chikou span = close shifted back `displacement` bars
         chikou_current_price = closes[-1]
@@ -141,11 +150,34 @@ class Ichimoku(BaseStrategy):
 
         # ── Condition 2: Price vs Kumo ────────────────────────────────────
         require_cloud = getattr(self._cfg, "require_above_cloud", True)
+        _bars_above_cloud = 0
+        _late_strong_entry = False  # set below when bars > 5 but trend is still intact
         if require_cloud:
             if direction == "LONG" and current_price <= kumo_top:
                 return None
             if direction == "SHORT" and current_price >= kumo_bottom:
                 return None
+            # IC-Q2: Breakout recency — price that has been above/below the cloud
+            # for many bars signals trend continuation, not a fresh breakout entry.
+            # Count consecutive bars price has cleared the cloud.
+            _bars_above_cloud = 0
+            for _i in range(1, min(len(closes), 7)):
+                if direction == "LONG" and closes[-_i] > kumo_top:
+                    _bars_above_cloud += 1
+                elif direction == "SHORT" and closes[-_i] < kumo_bottom:
+                    _bars_above_cloud += 1
+                else:
+                    break
+            if _bars_above_cloud > 5:
+                # Distinguish two sub-cases:
+                #   • Cloud-hugging (< 0.5×ATR away): price is pulling back toward the cloud
+                #     edge — momentum is fading, breakout is at risk of reverting.  Hard-reject.
+                #   • Strong-but-late (≥ 0.5×ATR away): trend is clearly intact but entry is
+                #     extended.  Allow through; the confidence path applies a −6 penalty below.
+                _close_distance_cloud = abs(current_price - (kumo_top if direction == "LONG" else kumo_bottom))
+                if _close_distance_cloud < 0.5 * atr:
+                    return None  # Cloud-hugging: breakout losing momentum, likely to fade back
+                _late_strong_entry = True  # Extended — penalised in confidence, not hard-rejected
 
         # ── Condition 3: Chikou clear ──────────────────────────────────────
         require_chikou = getattr(self._cfg, "require_chikou_clear", True)
@@ -157,6 +189,35 @@ class Ichimoku(BaseStrategy):
                 return None
             if direction == "SHORT" and not chikou_short_clear:
                 return None
+
+        # IC-Q4: TK cross recency — signals are strongest when the cross is fresh.
+        # Stale crosses produce "Frankenstein setups" where TK, cloud, and chikou
+        # conditions are temporally disconnected.  Scan back up to 15 bars for the
+        # most recent directional TK cross; reject if it is more than 3 bars old.
+        _bars_since_tk_cross = 20  # default: no recent cross found in scan window
+        for _i in range(min(len(tenkan) - 1, 15)):
+            _idx_after  = -1 - _i
+            _idx_before = -2 - _i
+            if direction == "LONG":
+                if tenkan[_idx_before] <= kijun[_idx_before] and tenkan[_idx_after] > kijun[_idx_after]:
+                    _bars_since_tk_cross = _i
+                    break
+            else:
+                if tenkan[_idx_before] >= kijun[_idx_before] and tenkan[_idx_after] < kijun[_idx_after]:
+                    _bars_since_tk_cross = _i
+                    break
+        if _bars_since_tk_cross > 3:
+            return None
+
+        # TK cross quality: compute Tenkan 3-bar slope for use in confidence scoring.
+        # A slope below 5% of ATR indicates a nearly-flat cross (noise tick, not momentum).
+        _tenkan_slope = tenkan[-1] - tenkan[-3] if len(tenkan) >= 3 else 0.0
+
+        # Direction-aware regime alignment (used for kijun bonus and regime confidence)
+        _is_with_trend = (
+            (direction == "LONG" and regime == "BULL_TREND") or
+            (direction == "SHORT" and regime == "BEAR_TREND")
+        )
 
         # ── Condition 4: Kijun pullback detection ────────────────────────
         # After TK cross, best entry is on a pullback to flat Kijun.
@@ -172,14 +233,13 @@ class Ichimoku(BaseStrategy):
                 _dist_to_kijun = abs(current_price - current_kijun) / atr
                 if _dist_to_kijun < 0.8:
                     _kijun_pullback = True
-                    _kijun_pullback_bonus = 8  # High-probability pullback entry
+                    # IC-Q3: Only give full bonus in trending regime — flat Kijun
+                    # fires most often in sideways/low-vol markets where Ichimoku
+                    # is least reliable.  Halve the reward outside trend context.
+                    _kijun_pullback_bonus = 6 if _is_with_trend else 2
 
         # ── Confidence ────────────────────────────────────────────────────
         # Direction-aware regime bonus
-        _is_with_trend = (
-            (direction == "LONG" and regime == "BULL_TREND") or
-            (direction == "SHORT" and regime == "BEAR_TREND")
-        )
         if _is_with_trend or regime not in ("BULL_TREND", "BEAR_TREND"):
             _regime_bonus = self._REGIME_CONF_WITH_TREND.get(regime, 0)
         else:
@@ -193,15 +253,30 @@ class Ichimoku(BaseStrategy):
         elif direction == "SHORT" and current_price < kumo_bottom:
             confidence += 8
 
-        # Price clearance from cloud
+        # Price clearance from cloud — three-zone model:
+        #   <1×ATR : borderline break (no adjustment — too close to cloud)
+        #   1–2×ATR: optimal clearance (+5 — confirmed break, not overextended)
+        #   >2×ATR : overextended entry (-5 — trend is real but entry is late/stretched)
         cloud_distance = abs(current_price - (kumo_top if direction == "LONG" else kumo_bottom))
-        if cloud_distance > atr * 2:
-            confidence += 5
+        if atr <= cloud_distance < 2 * atr:
+            confidence += 5  # Optimal clearance
+        elif cloud_distance >= 2 * atr:
+            confidence -= 5  # Overextended
 
         # Chikou strength
         chikou_margin = abs(chikou_current_price - chikou_compare_price)
         if chikou_margin > atr:
             confidence += 5
+
+        # TK cross slope quality: a near-flat cross is a noise tick, not a momentum signal.
+        # Threshold: 5% of ATR over 3 bars — anything below is considered structurally flat.
+        if abs(_tenkan_slope) < atr * 0.05:
+            confidence -= 3
+
+        # Late-but-strong-trend penalty: price has been above/below the cloud for 6+ bars
+        # but trend is intact (passed the cloud-hugging hard gate above).  Entry is extended.
+        if _late_strong_entry:
+            confidence -= 6
 
         # ── Entry around TK cross level (or Kijun on pullback) ──────────
         # When flat-Kijun pullback is detected, enter near Kijun level
@@ -217,7 +292,11 @@ class Ichimoku(BaseStrategy):
             entry_high  = tk_cross_level + atr * 0.3
             # SL: Kijun level - ATR buffer
             stop_loss   = current_kijun - atr * rp.sl_atr_mult
-            tp1         = kumo_top + atr * 0.5 * rp.atr_scale(tf) if kumo_top > entry_high else entry_high + atr * rp.volatility_scaled_tp1(tf, vp)
+            # TP1: structural target (cloud top) when cloud is above entry; otherwise ATR-scaled.
+            if kumo_top > entry_high:
+                tp1 = kumo_top + atr * 0.5 * rp.atr_scale(tf)
+            else:
+                tp1 = entry_high + atr * rp.volatility_scaled_tp1(tf, vp)
             # Wire timeframe+volatility-scaled TPs
             tp2         = entry_high + atr * rp.volatility_scaled_tp2(tf, vp)
             tp3         = entry_high + atr * rp.volatility_scaled_tp3(tf, vp)
@@ -225,7 +304,11 @@ class Ichimoku(BaseStrategy):
             entry_high  = tk_cross_level + atr * 0.3
             entry_low   = tk_cross_level - atr * 0.3
             stop_loss   = current_kijun + atr * rp.sl_atr_mult
-            tp1         = kumo_bottom - atr * 0.5 * rp.atr_scale(tf) if kumo_bottom < entry_low else entry_low - atr * rp.volatility_scaled_tp1(tf, vp)
+            # TP1: structural target (cloud bottom) when cloud is below entry; otherwise ATR-scaled.
+            if kumo_bottom < entry_low:
+                tp1 = kumo_bottom - atr * 0.5 * rp.atr_scale(tf)
+            else:
+                tp1 = entry_low - atr * rp.volatility_scaled_tp1(tf, vp)
             tp2         = entry_low - atr * rp.volatility_scaled_tp2(tf, vp)
             tp3         = entry_low - atr * rp.volatility_scaled_tp3(tf, vp)
 
@@ -233,8 +316,6 @@ class Ichimoku(BaseStrategy):
         if risk <= 0:
             return None
         rr_ratio = abs(tp2 - tk_cross_level) / risk
-
-        kumo_size = kumo_top - kumo_bottom
 
         confluence: List[str] = [
             f"✅ {'Bullish' if direction == 'LONG' else 'Bearish'} TK cross",
@@ -273,11 +354,14 @@ class Ichimoku(BaseStrategy):
                 "kijun": float(current_kijun),
                 "kumo_top": float(kumo_top),
                 "kumo_bottom": float(kumo_bottom),
+                "kumo_size": float(kumo_size),
                 "senkou_a": float(senkou_a_current),
                 "senkou_b": float(senkou_b_current),
                 "chikou_compare_price": float(chikou_compare_price),
                 "atr": atr,
                 "regime": regime,
+                "bars_since_tk_cross": _bars_since_tk_cross,
+                "bars_above_cloud": _bars_above_cloud if require_cloud else None,
             },
             regime=regime,
         )

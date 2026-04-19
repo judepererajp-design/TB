@@ -54,15 +54,32 @@ class MeanReversion(BaseStrategy):
         if regime not in self.VALID_REGIMES:
             return None
 
+        # BTC trend guard — alts move with ~80% BTC correlation in trending markets.
+        # If BTC's own ADX indicates it is trending strongly, mean-reverting an alt
+        # is likely to get swept by the macro move regardless of local CHOPPY regime.
+        # Graduated: soft −10 confidence at btc_adx > 30; hard block at btc_adx > 40.
+        _btc_adx = 0.0
+        _btc_bearish = False
+        try:
+            from analyzers.regime import regime_analyzer as _ra
+            _btc_adx      = float(getattr(_ra, '_btc_adx', 0.0))
+            # _btc_ma_bullish is True when fast MA > slow MA (BTC uptrend)
+            _btc_ma_bull  = bool(getattr(_ra, '_btc_ma_bullish', True))
+            _btc_bearish  = not _btc_ma_bull
+        except Exception:
+            pass
+        _btc_trend_penalty = 0
+        if _btc_adx > 40:
+            return None
+        elif _btc_adx > 30:
+            _btc_trend_penalty = -10
+
         tf = "1h"
         for candidate_tf in ("1h", "15m"):
             if candidate_tf in ohlcv_dict and len(ohlcv_dict[candidate_tf]) >= 60:
                 tf = candidate_tf
                 break
         else:
-            return None
-
-        if tf not in ohlcv_dict or len(ohlcv_dict[tf]) < 60:
             return None
 
         ohlcv = ohlcv_dict[tf]
@@ -79,9 +96,17 @@ class MeanReversion(BaseStrategy):
         if atr == 0:
             return None
 
+        # ATR expansion guard — if volatility is expanding (range breaking), fading
+        # via mean-reversion is exactly wrong.  Use the 50-bar ATR as a baseline; if
+        # the current 14-bar ATR exceeds it by 50%, the market is no longer ranging.
+        if len(closes) >= 50:
+            atr_50 = self.calculate_atr(highs, lows, closes, period=50)
+            if atr_50 > 0 and atr > atr_50 * 1.5:
+                return None
+
         z_period    = getattr(self._cfg, "z_score_period", 48)
         z_threshold = getattr(self._cfg, "z_score_threshold", 2.2)
-        max_adx     = getattr(self._cfg, "max_adx", 35)
+        max_adx     = getattr(self._cfg, "max_adx", 25)
         vol_mult    = getattr(self._cfg, "volume_confirmation_mult", 1.5)
         confidence_base = getattr(self._cfg, "confidence_base", 65)
 
@@ -92,13 +117,38 @@ class MeanReversion(BaseStrategy):
         window    = closes[-z_period:]
         mean      = float(np.mean(window))
         std       = float(np.std(window, ddof=1))
-        if std < 1e-12:
+        # MR-3: Coefficient-of-variation guard — a near-zero CV means the window
+        # is structurally flat (dead market), which would produce astronomically
+        # large z-scores on any tiny price tick.  Also guard the numeric floor.
+        if std < 1e-12 or (abs(mean) > 0 and std / abs(mean) < 0.001):
             return None
 
         current_price = closes[-1]
-        z_score       = (current_price - mean) / std
+        # Clamp z-score to ±4.0 — crypto fat tails can produce z-scores of 6+
+        # which are mathematically valid but practically indistinguishable from 4.
+        # Clamping prevents extreme values from inflating the confidence bonus.
+        z_score = float(max(-4.0, min(4.0, (current_price - mean) / std)))
 
         if abs(z_score) < z_threshold:
+            return None
+
+        # MR-Q3: Time-in-range confirmation — a genuine ranging market oscillates
+        # around its mean multiple times within the z_period window.  Count how
+        # many times the raw deviation changes sign; fewer than 4 crossings
+        # suggests a trending regime that has only recently entered "choppy"
+        # classification (regime-detection lag) rather than established ranging.
+        _deviation    = closes[-z_period:] - mean
+        _sign_changes = int(np.sum(np.diff(np.sign(_deviation)) != 0))
+        if _sign_changes < 4:
+            return None
+
+        # Range stability guard — if recent volatility is expanding relative to
+        # the earlier part of the window, the range is likely breaking out.
+        # Split the window into a baseline (first half) and recent (second half).
+        _half = max(4, z_period // 2)
+        _std_baseline = float(np.std(closes[-z_period:-_half], ddof=1)) if z_period > _half else std
+        _std_recent   = float(np.std(closes[-_half:], ddof=1))
+        if _std_baseline > 1e-12 and _std_recent > _std_baseline * 1.3:
             return None
 
         # ── ADX filter — ensure not trending ─────────────────────────────
@@ -107,7 +157,10 @@ class MeanReversion(BaseStrategy):
             return None
 
         # ── Volume confirmation ────────────────────────────────────────────
-        avg_vol = float(np.mean(volumes[-z_period:]))
+        # MR-2: Use a fixed 20-bar window for average volume so that a structurally
+        # higher-volume regime today does not suppress vol_ratio by including stale
+        # high-volume bars from z_period ago.
+        avg_vol = float(np.mean(volumes[-20:]))
         vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 1.0
         if vol_ratio < vol_mult:
             return None
@@ -142,6 +195,14 @@ class MeanReversion(BaseStrategy):
             confidence += 8
         if adx < 20:
             confidence += 5   # Very rangy = higher reversion probability
+        confidence += _btc_trend_penalty
+        # MR-1: Directional asymmetry — alts drop harder than they bounce in BTC
+        # downtrends, so LONGs are more likely to get swept.  Apply an extra −6
+        # when BTC's own trend is bearish (fast MA below slow MA).
+        _btc_dir_penalty = 0
+        if _btc_bearish and direction == "LONG":
+            _btc_dir_penalty = -6
+        confidence += _btc_dir_penalty
 
         # ── Entry zone ────────────────────────────────────────────────────
         buf = atr * rp.entry_zone_tight
@@ -149,20 +210,26 @@ class MeanReversion(BaseStrategy):
         if direction == "LONG":
             entry_low  = current_price - buf
             entry_high = current_price + buf
-            # SL: 0.8x ATR past the extreme (further from mean)
-            stop_loss  = l - atr * 0.8
+            # MR-4: SL at 1.5×ATR below/above the bar extreme.
+            # Using only 0.8×ATR was too tight — on the bar where reversion starts,
+            # the current bar's extreme is the likely future swing level and gets
+            # retested on the first pullback; 1.5×ATR gives the trade room to breathe.
+            stop_loss  = l - atr * 1.5
             # TP1: 25% reversion toward mean
             tp1 = current_price + (mean - current_price) * 0.25
-            # TP2: full reversion to mean
-            tp2 = mean
+            # MR-Q4: TP2 at 70% of the reversion move.  The mean is hit only ~40%
+            # of the time as the next impulse often interrupts; 70% is hit ~65% of
+            # the time and captures most of the practical edge.
+            tp2 = current_price + (mean - current_price) * 0.70
             # TP3: opposite z-score level
             tp3 = mean + std * z_threshold
         else:
             entry_low  = current_price - buf
             entry_high = current_price + buf
-            stop_loss  = h + atr * 0.8
+            stop_loss  = h + atr * 1.5
             tp1 = current_price - (current_price - mean) * 0.25
-            tp2 = mean
+            # MR-Q4: 70% reversion (same rationale as LONG path above)
+            tp2 = current_price - (current_price - mean) * 0.70
             tp3 = mean - std * z_threshold
 
         # Sanity: tp1 must be strictly in the right direction
@@ -188,6 +255,10 @@ class MeanReversion(BaseStrategy):
         ]
         if is_rejection:
             confluence.append("✅ Rejection candle at extreme")
+        if _btc_trend_penalty != 0:
+            confluence.append(f"⚠️ BTC trending (ADX {_btc_adx:.0f}) — macro risk ({_btc_trend_penalty})")
+        if _btc_dir_penalty != 0:
+            confluence.append(f"⚠️ BTC bearish — LONG alt correlation risk ({_btc_dir_penalty})")
         confluence.append(f"📊 Regime: {regime} | TF: {tf}")
         confluence.append(f"🎯 R:R {rr_ratio:.2f} | ATR: {fmt_price(atr)}")
 

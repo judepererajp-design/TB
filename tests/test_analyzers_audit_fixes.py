@@ -77,10 +77,14 @@ def test_funding_delta_boosts_squeeze_risk_when_aligned_with_positioning():
 def test_funding_delta_classifier_flat_with_single_sample():
     """Delta classifier must return FLAT until ≥2 samples are collected."""
     analyzer = DerivativesAnalyzer()
-    # First poll — only one sample in the deque → FLAT.
-    assert analyzer._classify_funding_delta("Y/USDT", 0.01) == "FLAT"
+    # First poll — only one sample in the deque → FLAT (method now returns (trend, delta) tuple).
+    trend, delta = analyzer._classify_funding_delta("Y/USDT", 0.01)
+    assert trend == "FLAT"
+    assert delta == 0.0
     # After a clearly-rising second sample, we should see RISING.
-    assert analyzer._classify_funding_delta("Y/USDT", 0.03) == "RISING"
+    trend2, delta2 = analyzer._classify_funding_delta("Y/USDT", 0.03)
+    assert trend2 == "RISING"
+    assert delta2 > 0
 
 
 # ──────────────────────────────────────────────────────────────────────────
