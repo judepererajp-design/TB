@@ -802,6 +802,7 @@ class BaseStrategy(ABC):
                 # the parabolic move — not the price direction above.
                 _full = _pd.analyze(ohlcv, direction=direction, roc_period=period)
                 result["is_parabolic"] = bool(_full.is_parabolic)
+                result["parabolic_score"] = round(float(_full.parabolic_score), 3)
                 result["is_exhausted"] = bool(_full.is_exhausted)
                 result["exhaustion_signals"] = list(_full.exhaustion_signals)
                 result["confidence_penalty"] = int(_full.confidence_penalty)
