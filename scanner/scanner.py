@@ -328,10 +328,11 @@ class Scanner:
         """
         if symbol not in self._symbols:
             return
-        until = time.time() + max(1, int(duration_secs))
+        now = time.time()
+        until = now + max(1.0, float(duration_secs))
         prev_until = self._temp_excluded_until.get(symbol, 0.0)
         self._temp_excluded_until[symbol] = max(prev_until, until)
-        remaining = int(max(0.0, self._temp_excluded_until[symbol] - time.time()))
+        remaining = int(max(0.0, self._temp_excluded_until[symbol] - now))
         logger.info(
             f"Scanner: temporarily excluded {symbol} for {remaining}s ({reason})"
         )
