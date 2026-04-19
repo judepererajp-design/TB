@@ -362,7 +362,7 @@ class SmartMoneyConcepts(BaseStrategy):
                     if _fill_ratio < 0.3:
                         confidence -= 3
                         confluence.append(f"⚠️ Shallow FVG fill ({_fill_ratio:.0%}) — weak retest (-3)")
-                    elif _fill_ratio > 0.7:
+                    elif _fill_ratio >= 0.6:
                         confidence += 3
                         confluence.append(f"💪 Deep FVG fill ({_fill_ratio:.0%}) — strong retest (+3)")
                     raw_data["fvg_fill_ratio"] = round(_fill_ratio, 3)
@@ -388,7 +388,7 @@ class SmartMoneyConcepts(BaseStrategy):
                     if _fill_ratio < 0.3:
                         confidence -= 3
                         confluence.append(f"⚠️ Shallow FVG fill ({_fill_ratio:.0%}) — weak retest (-3)")
-                    elif _fill_ratio > 0.7:
+                    elif _fill_ratio >= 0.6:
                         confidence += 3
                         confluence.append(f"💪 Deep FVG fill ({_fill_ratio:.0%}) — strong retest (+3)")
                     raw_data["fvg_fill_ratio"] = round(_fill_ratio, 3)
@@ -398,6 +398,11 @@ class SmartMoneyConcepts(BaseStrategy):
         # ─────────────────────────────────────────────────────────────────
         if direction is None:
             search_bars    = min(ob_max_age, len(closes) - 3)
+            # Capture confidence before any OB-structural bonus/penalty so we can
+            # apply time-decay only to the OB portion (killzone, MTF, regime are
+            # earned independently and should not decay with OB age).
+            _pre_ob_confidence = confidence
+            _ob_decay_mult = 1.0  # sentinel: no decay unless a qualifying OB is found
 
             # SMC-3 FIX: original code divided impulse body by OB body.  A tiny doji OB
             # (0.05× ATR body) lets any noise impulse satisfy the ratio.  Divide by ATR
@@ -441,21 +446,26 @@ class SmartMoneyConcepts(BaseStrategy):
                 confluence.append(f"✅ Bullish OB at {fmt_price(ob_low)}-{fmt_price(ob_high)} ({_oi} bars ago)")
                 raw_data["ob_low"] = ob_low
                 raw_data["ob_high"] = ob_high
-                # Feature 1/SMC-Q5: OB mitigation tracking.
-                # Count how many times price has entered this zone since the OB formed.
-                # Each visit absorbs institutional orders — by the 2nd test, the OB is
-                # partially mitigated and less reliable.
-                _ob_hits = sum(1 for j in range(1, _oi) if ob_low <= closes[-j] <= ob_high)
-                if _ob_hits >= 2:
+                # Feature 1/SMC-Q5 (hybrid): OB mitigation tracking using wicks + closes.
+                # A close inside the OB fully absorbs supply/demand (strong mitigation = 1.0).
+                # A wick that touches but does not close inside is partial mitigation (= 0.5).
+                # Threshold ≥ 2.0 so you need 4 wick-only touches OR 2 close touches.
+                _ob_score = sum(
+                    1.0 if ob_low <= closes[-j] <= ob_high
+                    else (0.5 if lows[-j] <= ob_high and highs[-j] >= ob_low else 0.0)
+                    for j in range(1, _oi)
+                )
+                if _ob_score >= 2.0:
                     confidence -= 5
-                    confluence.append(f"⚠️ OB tested {_ob_hits}× — diminished freshness (-5)")
-                raw_data["ob_hits"] = _ob_hits
-                # Feature 6: OB time decay — institutional memory fades with age.
-                # age_factor goes from 1.0 (just formed) to 0.0 (at max age limit).
-                # Multiplier range: [0.80 (ancient), 1.00 (fresh)].
+                    confluence.append(f"⚠️ OB mitigated (score {_ob_score:.1f}) — diminished freshness (-5)")
+                raw_data["ob_mitigation_score"] = round(_ob_score, 1)
+                # Feature 6 (scoped): OB time decay applied only to the OB structural component.
+                # External signals (killzone, MTF, regime) are earned independently — they should
+                # not decay because the OB is old.  We track the pre-OB confidence and apply
+                # decay to just the structural portion (confidence gained after OB priority fires).
                 _age_factor = max(0.0, 1.0 - (_oi / ob_max_age))
-                confidence *= 0.8 + 0.2 * _age_factor
-                raw_data["ob_age_factor"] = round(0.8 + 0.2 * _age_factor, 3)
+                _ob_decay_mult = 0.8 + 0.2 * _age_factor
+                raw_data["ob_age_factor"] = round(_ob_decay_mult, 3)
             elif bear_ob_candidates:
                 bear_ob_candidates.sort(reverse=True)
                 _, _oi, ob_high, ob_low = bear_ob_candidates[0]
@@ -466,16 +476,26 @@ class SmartMoneyConcepts(BaseStrategy):
                 confluence.append(f"✅ Bearish OB at {fmt_price(ob_low)}-{fmt_price(ob_high)} ({_oi} bars ago)")
                 raw_data["ob_low"] = ob_low
                 raw_data["ob_high"] = ob_high
-                # Feature 1/SMC-Q5: OB mitigation tracking (bearish OB).
-                _ob_hits = sum(1 for j in range(1, _oi) if ob_low <= closes[-j] <= ob_high)
-                if _ob_hits >= 2:
+                # Feature 1/SMC-Q5 (hybrid): OB mitigation tracking (bearish OB).
+                _ob_score = sum(
+                    1.0 if ob_low <= closes[-j] <= ob_high
+                    else (0.5 if lows[-j] <= ob_high and highs[-j] >= ob_low else 0.0)
+                    for j in range(1, _oi)
+                )
+                if _ob_score >= 2.0:
                     confidence -= 5
-                    confluence.append(f"⚠️ OB tested {_ob_hits}× — diminished freshness (-5)")
-                raw_data["ob_hits"] = _ob_hits
-                # Feature 6: OB time decay (bearish OB).
+                    confluence.append(f"⚠️ OB mitigated (score {_ob_score:.1f}) — diminished freshness (-5)")
+                raw_data["ob_mitigation_score"] = round(_ob_score, 1)
+                # Feature 6 (scoped): OB time decay — structural component only.
                 _age_factor = max(0.0, 1.0 - (_oi / ob_max_age))
-                confidence *= 0.8 + 0.2 * _age_factor
-                raw_data["ob_age_factor"] = round(0.8 + 0.2 * _age_factor, 3)
+                _ob_decay_mult = 0.8 + 0.2 * _age_factor
+                raw_data["ob_age_factor"] = round(_ob_decay_mult, 3)
+
+            # Apply OB time decay to structural portion only: keep _pre_ob_confidence
+            # intact and scale only the delta (the OB-specific contribution).
+            if direction is not None and _ob_decay_mult < 1.0:
+                _ob_structural_delta = confidence - _pre_ob_confidence
+                confidence = _pre_ob_confidence + _ob_structural_delta * _ob_decay_mult
 
         # ─────────────────────────────────────────────────────────────────
         # Priority 4: Break of Structure (with pullback confirmation)
@@ -611,19 +631,48 @@ class SmartMoneyConcepts(BaseStrategy):
         # ── Feature 3: BOS strength scoring ──────────────────────────────
         # A barely-clearing BOS is noisy; a strong displacement (> 1.5× ATR
         # beyond the level) signals genuine institutional commitment.
+        # Feature (R2-5): Overextension penalty — if price is already > 2.5× ATR
+        # beyond the BOS level, chasing that displacement has poor expectancy.
         if setup_type == "BreakOfStructure":
             _bos_lv = raw_data.get(
                 "bos_level",
                 bos_swing_high if direction == "LONG" else bos_swing_low,
             )
             _bos_strength = abs(current_close - _bos_lv) / atr
-            if _bos_strength > 1.5:
+            if _bos_strength > 2.5:
+                confidence -= 4
+                confluence.append(f"⚠️ BOS overextended: {_bos_strength:.2f}× ATR — chasing risk (-4)")
+            elif _bos_strength > 1.5:
                 confidence += 5
                 confluence.append(f"💪 Strong BOS displacement: {_bos_strength:.2f}× ATR (+5)")
             elif _bos_strength < 0.5:
                 confidence -= 3
                 confluence.append(f"⚠️ Weak BOS displacement: {_bos_strength:.2f}× ATR (-3)")
             raw_data["bos_strength"] = round(_bos_strength, 3)
+
+            # Feature (R2-6): Sweep→BOS sequencing bonus.
+            # Institutional flow: sweep out stops → accumulate/distribute → break structure.
+            # Detect whether the key swing level was swept (wick below/above + recovery)
+            # within the sweep_lookback window before the current BOS candle.
+            _bos_sweep_seq = False
+            if direction == "LONG":
+                # Look for a prior bullish sweep (wick below key_swing_low then recovery)
+                for _k in range(1, min(sweep_lookback, len(lows) - 1)):
+                    if (lows[-_k] < key_swing_low
+                            and (key_swing_low - lows[-_k]) / key_swing_low >= min_wick_pct):
+                        _bos_sweep_seq = True
+                        break
+            else:
+                # Look for a prior bearish sweep (wick above key_swing_high then recovery)
+                for _k in range(1, min(sweep_lookback, len(highs) - 1)):
+                    if (highs[-_k] > key_swing_high
+                            and (highs[-_k] - key_swing_high) / key_swing_high >= min_wick_pct):
+                        _bos_sweep_seq = True
+                        break
+            if _bos_sweep_seq:
+                confidence += 4
+                confluence.append("🔗 Sweep→BOS sequence confirmed: stop hunt preceded displacement (+4)")
+            raw_data["bos_sweep_sequence"] = _bos_sweep_seq
 
         # ── Feature 5: Stacked confluence bonus ──────────────────────────
         # Count how many independent SMC factors are simultaneously present
