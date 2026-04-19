@@ -210,8 +210,11 @@ class BaseStrategy(ABC):
         # Swing structure: HH/HL (bullish) vs LH/LL (bearish)
         swing_highs = []
         swing_lows = []
+        # Scan from most recent to older pivots (i=2 => idx=-3 first), so
+        # list index 0 is the most recent confirmed swing.
         for i in range(2, min(20, len(highs) - 1)):
             idx = -(i + 1)
+            # Guard left-neighbor access at idx-1 for very short series.
             if idx - 1 < -len(highs):
                 continue
             if highs[idx] > highs[idx - 1] and highs[idx] > highs[idx + 1]:
