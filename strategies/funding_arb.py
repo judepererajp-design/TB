@@ -197,10 +197,10 @@ class FundingRateArb(BaseStrategy):
         _adx_factor = min(1.5, adx / 40.0) if adx > 0 else 1.0
         if regime == "BULL_TREND" and direction == "SHORT":
             if funding_rate_pct < long_threshold * 2:
-                confidence -= round(10 * _adx_factor, 1)
+                confidence -= 10 * _adx_factor
         elif regime == "BEAR_TREND" and direction == "LONG":
             if abs(funding_rate_pct) < abs(short_threshold) * 2:
-                confidence -= round(10 * _adx_factor, 1)
+                confidence -= 10 * _adx_factor
 
         # FA-Q2: Funding trajectory — normalize delta by the entry threshold
         # so the same raw Δpp has proportionally more weight on a tightly-
