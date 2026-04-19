@@ -245,12 +245,15 @@ strategies:
     confidence_base: 72
     min_volume_24h: 3000000
     rsi_period: 14
-    rsi_oversold: 28
-    rsi_overbought: 72
+    rsi_oversold: 20
+    rsi_overbought: 80
     bb_period: 20
     bb_std: 2.5
     require_divergence: true
     require_rejection_candle: true
+    vol_confirmation_mult: 2.0
+    sl_bar_lookback: 5
+    allow_volatile: false
 
   mean_reversion:
     enabled: true

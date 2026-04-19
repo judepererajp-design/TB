@@ -26,10 +26,12 @@ class ReversalStrategy(BaseStrategy):
     name = "ExtremeReversal"
     description = "RSI extreme + Bollinger Band reversal with divergence"
 
-    # Reversals work at EXTREMES — which only happen after clear moves.
-    # Valid in CHOPPY (fading range boundaries) and VOLATILE (panic reversals).
-    # NEVER in a clean trend where "overbought" stays overbought.
-    VALID_REGIMES = {"CHOPPY", "VOLATILE"}
+    # Reversals work at EXTREMES — which happen after clear moves in tight conditions.
+    # Valid in CHOPPY (fading range boundaries).
+    # VOLATILE is excluded by default: extreme directional moves can extend 3-5×
+    # before reverting, making early fades high-risk. Set allow_volatile: true in
+    # config to opt back in (e.g., if scanning for panic capitulation setups).
+    VALID_REGIMES = {"CHOPPY"}
 
     def __init__(self):
         super().__init__()
@@ -40,7 +42,11 @@ class ReversalStrategy(BaseStrategy):
         try:
             from analyzers.regime import regime_analyzer
             regime = getattr(regime_analyzer.regime, 'value', 'UNKNOWN')
-            if regime not in self.VALID_REGIMES:
+            allow_volatile = bool(getattr(self._cfg, 'allow_volatile', False))
+            _valid = set(self.VALID_REGIMES)
+            if allow_volatile:
+                _valid = _valid | {"VOLATILE"}
+            if regime not in _valid:
                 return None  # RSI stays extreme in trends — don't fade
             # Volatile regime: increase thresholds (extremes are more extreme)
             _vol_adj = 5 if regime == "VOLATILE" else 0
@@ -118,7 +124,8 @@ class ReversalStrategy(BaseStrategy):
 
         # ── Volume confirmation ───────────────────────────────
         vol_ratio = cur_vol / avg_vol if avg_vol > 0 else 1.0
-        if vol_ratio >= 1.5:
+        vol_conf_mult = float(getattr(self._cfg, 'vol_confirmation_mult', 2.0))
+        if vol_ratio >= vol_conf_mult:
             confluence.append(f"✅ Volume: {vol_ratio:.1f}x average")
             confidence += 5
 
@@ -129,10 +136,12 @@ class ReversalStrategy(BaseStrategy):
         tp2_m = rp.volatility_scaled_tp2(tf, vp)
         tp3_m = rp.volatility_scaled_tp3(tf, vp)
 
+        # ── SL lookback: wider window for volatile extremes ──────
+        sl_lookback = max(3, int(getattr(self._cfg, 'sl_bar_lookback', 5)))
         if direction == "LONG":
             entry_low  = current - atr * rp.entry_zone_tight
             entry_high = current + atr * rp.entry_zone_atr
-            stop_loss  = lows[-3:].min() - atr * rp.sl_atr_mult
+            stop_loss  = lows[-sl_lookback:].min() - atr * rp.sl_atr_mult
             tp1 = current + atr * tp1_m
             tp2 = bb_mid  # Mean reversion target
             tp3 = current + atr * tp3_m
@@ -143,7 +152,7 @@ class ReversalStrategy(BaseStrategy):
         else:
             entry_high = current + atr * rp.entry_zone_tight
             entry_low  = current - atr * rp.entry_zone_atr
-            stop_loss  = highs[-3:].max() + atr * rp.sl_atr_mult
+            stop_loss  = highs[-sl_lookback:].max() + atr * rp.sl_atr_mult
             tp1 = current - atr * tp1_m
             tp2 = bb_mid
             tp3 = current - atr * tp3_m

@@ -651,7 +651,7 @@ _REGIME_ACCEPTANCE = {
     "Momentum":              {"BULL_TREND", "BEAR_TREND", "VOLATILE"},
     "SmartMoneyConcepts":    {"BULL_TREND", "BEAR_TREND", "VOLATILE", "VOLATILE_PANIC", "CHOPPY", "UNKNOWN"},
     "Ichimoku":              {"BULL_TREND", "BEAR_TREND", "VOLATILE"},
-    "ExtremeReversal":       {"CHOPPY", "VOLATILE"},
+    "ExtremeReversal":       {"CHOPPY"},
     "PriceAction":           {"BULL_TREND", "BEAR_TREND", "VOLATILE", "CHOPPY", "UNKNOWN"},
     "WyckoffAccDist":        {"BULL_TREND", "BEAR_TREND", "VOLATILE", "CHOPPY", "UNKNOWN"},
     "FundingRateArb":        {"BULL_TREND", "BEAR_TREND", "VOLATILE", "CHOPPY", "UNKNOWN"},

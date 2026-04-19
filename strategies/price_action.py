@@ -260,6 +260,12 @@ class PriceAction(BaseStrategy):
         vol_mult = float(getattr(self._cfg, "vol_confirmation_mult", 1.5))
         vol_confirmed = vol_ratio >= vol_mult
 
+        # Rising volume sequence: 3-bar momentum toward the reversal bar
+        _vol_rising = (
+            len(volumes) >= 4
+            and volumes[-2] > volumes[-3] > volumes[-4]
+        )
+
         # ── HTF alignment gate/penalty ───────────────────────────────────────
         _mtf_mismatch = False
         _mtf_penalty = 0
@@ -279,8 +285,29 @@ class PriceAction(BaseStrategy):
             confidence += 12
         if vol_confirmed:
             confidence += 8
+        if _vol_rising:
+            confidence += 4  # rising volume sequence builds credibility for the move
         if len(signal_patterns) > 1:
             confidence += 5 * (len(signal_patterns) - 1)
+
+        # ── Prior-bar context for single-bar patterns ─────────────────────
+        # For PinBar and Doji — which are single-bar signals — check that the
+        # preceding bar's direction is consistent with the expected reversal:
+        # LONG setup: prior bar should be bearish (downmove to fade)
+        # SHORT setup: prior bar should be bullish (upmove to fade)
+        _single_bar_patterns = {"PinBar", "Doji"}
+        _is_single_bar = primary_pattern["pattern"] in _single_bar_patterns
+        if _is_single_bar and len(opens) >= 2:
+            _prior_bearish = closes[-2] < opens[-2]
+            _prior_bullish = closes[-2] > opens[-2]
+            if direction == "LONG" and _prior_bearish:
+                confidence += 3  # prior sell-off confirms reversal context
+            elif direction == "SHORT" and _prior_bullish:
+                confidence += 3
+            elif direction == "LONG" and _prior_bullish:
+                confidence -= 3  # prior bar moving with us = chasing, not reversing
+            elif direction == "SHORT" and _prior_bearish:
+                confidence -= 3
 
         # ── Entry / SL / TP levels ────────────────────────────────────────
         # FIX: SL buffer used entry_zone_tight (0.10 ATR) — far too thin.
@@ -346,6 +373,14 @@ class PriceAction(BaseStrategy):
             confluence.append(f"✅ Key level: {key_level_desc}")
         if vol_confirmed:
             confluence.append(f"✅ Volume: {vol_ratio:.1f}x average")
+        if _vol_rising:
+            confluence.append("✅ Volume trend: rising sequence (x3 bars)")
+        if _is_single_bar and len(opens) >= 2:
+            _prior_ctx = "prior bar confirms" if (
+                (direction == "LONG" and closes[-2] < opens[-2]) or
+                (direction == "SHORT" and closes[-2] > opens[-2])
+            ) else "prior bar neutral/conflicting"
+            confluence.append(f"📊 Single-bar pattern context: {_prior_ctx}")
         if _mtf_mismatch:
             confluence.append(f"⚠️ HTF mismatch: 4h {_htf_bias['bias']} vs signal {direction} (-{_mtf_penalty})")
         confluence.append(f"📊 Regime: {regime} | TF: {tf}")

@@ -70,6 +70,7 @@ class RangeScalperStrategy(BaseStrategy):
         # ── Market state gate: compression warning ─────────────
         _ms_state = None
         _ms_compression_penalty = 0
+        _ms_result = None
         try:
             from analyzers.market_state_engine import market_state_engine, MarketState
             _ms_result = await market_state_engine.get_state()
@@ -83,6 +84,16 @@ class RangeScalperStrategy(BaseStrategy):
                 return None  # Market is trending/expanding — no range to scalp
         except Exception:
             pass
+
+        # ── BTC breakout gate (RS-Q4) ─────────────────────────────
+        # If BTC is breaking out / strongly trending, alt ranges are unstable.
+        # Use the already-fetched MarketStateResult for BTC momentum data.
+        if _ms_result is not None:
+            _btc_mom = abs(_ms_result.btc_momentum_fast)
+            _btc_bias = _ms_result.direction_bias
+            _btc_breakout_thresh = 0.025  # 2.5% BTC 6h momentum = trending, not ranging
+            if _btc_mom >= _btc_breakout_thresh and _btc_bias != "NEUTRAL":
+                return None  # BTC strongly trending — alt ranges unreliable
 
         # ── 1. Get candle data ────────────────────────────────────
         tf = '15m'  # Scalper uses 15m for entries
@@ -221,12 +232,11 @@ class RangeScalperStrategy(BaseStrategy):
         bounce_count = self._count_zone_bounces(
             highs, lows, closes, direction, range_high, range_low, edge_band, lookback
         )
-        if bounce_count >= 2:
-            confluence.append(f"✅ Zone tested {bounce_count}x — strong S/D level")
-            confidence += 6
-        elif bounce_count == 1:
-            confluence.append(f"📊 Zone tested once before")
-            confidence += 3
+        if bounce_count >= 1:
+            _bounce_bonus = min(6, bounce_count * 2)
+            _bounce_label = f"✅ Zone tested {bounce_count}x — strong S/D level" if bounce_count >= 2 else "📊 Zone tested once before"
+            confluence.append(_bounce_label)
+            confidence += _bounce_bonus
 
         # f) ADX confirms no trend (must be low for range trading)
         adx = self.calculate_adx(highs, lows, closes, 14)
