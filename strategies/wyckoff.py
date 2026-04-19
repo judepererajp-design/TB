@@ -132,6 +132,37 @@ class WyckoffAccDist(BaseStrategy):
             )
             return None
 
+        # W-S1: Independent structural validation — runs against raw OHLCV data,
+        # independent of analyzer confidence, to ensure the detected range has
+        # adequate duration and a realistic ATR-relative size.  This breaks the
+        # single analyzer-trust chain: a high-confidence but structurally poor
+        # range can still be rejected here.
+        _min_range_bars = getattr(self._cfg, "min_range_bars", 20)
+        _min_range_atr  = getattr(self._cfg, "min_range_atr_mult", 1.5)
+        _max_range_atr  = getattr(self._cfg, "max_range_atr_mult", 12.0)
+
+        if result.range_bars > 0 and result.range_bars < _min_range_bars:
+            logger.debug(
+                f"WyckoffAccDist {symbol}: range too short ({result.range_bars} bars "
+                f"< min {_min_range_bars}) — skipping"
+            )
+            return None
+
+        if result.range_high > 0 and result.range_low > 0 and atr > 0:
+            range_height_atr = (result.range_high - result.range_low) / atr
+            if range_height_atr < _min_range_atr:
+                logger.debug(
+                    f"WyckoffAccDist {symbol}: range height {range_height_atr:.1f}× ATR "
+                    f"< min {_min_range_atr}× — noise band, skipping"
+                )
+                return None
+            if range_height_atr > _max_range_atr:
+                logger.debug(
+                    f"WyckoffAccDist {symbol}: range height {range_height_atr:.1f}× ATR "
+                    f"> max {_max_range_atr}× — too wide to be a range, skipping"
+                )
+                return None
+
         # ── Phase gate — only act on Phase C and D ─────────────────────────
         from patterns.wyckoff import WyckoffPhase as WP
 
@@ -292,6 +323,8 @@ class WyckoffAccDist(BaseStrategy):
             confluence.append("✅ Spring detected — stop hunt below range support")
         if result.utad_detected:
             confluence.append("✅ UTAD detected — trap above range resistance")
+        if result.range_bars > 0:
+            confluence.append(f"📐 Range: {result.range_bars} bars | height {(result.range_high - result.range_low) / atr:.1f}× ATR")
         confluence.append(f"📊 Regime: {regime} ({'+' if regime_bonus >= 0 else ''}{regime_bonus}) | TF: {tf}")
         confluence.append(f"🎯 R:R {rr_ratio:.2f} | ATR: {fmt_price(atr)}")
 
@@ -321,6 +354,9 @@ class WyckoffAccDist(BaseStrategy):
                 "dryup_before_event": result.dryup_before_event,
                 "wyckoff_confidence": result.confidence,
                 "key_level": result.key_level,
+                "range_high": result.range_high,
+                "range_low": result.range_low,
+                "range_bars": result.range_bars,
                 "atr": atr,
                 "regime": regime,
             },

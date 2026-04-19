@@ -370,6 +370,9 @@ strategies:
     sl_atr_max: 3               # max ATRs from entry zone edge for stop loss (W-4)
     swing_lookback_bars: 50     # bars to scan for TP2 swing pivots (W-Q3)
     min_analyzer_confidence: 60 # reject analyzer results below this threshold (W-Q1)
+    min_range_bars: 20          # range must span at least this many bars (W-S1 duration)
+    min_range_atr_mult: 1.5     # range height must be ≥ this × ATR (W-S1 compression floor)
+    max_range_atr_mult: 12.0    # range height must be ≤ this × ATR (W-S1 trend ceiling)
     accumulation:
       ps_volume_mult: 1.5
       sc_volume_mult: 2.0

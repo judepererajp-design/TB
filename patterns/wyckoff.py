@@ -70,6 +70,10 @@ class WyckoffResult:
     # W-Q2: proper Wyckoff volume narrative flags
     volume_contraction_in_range: bool = False   # volume contracted during TR vs prior trend
     dryup_before_event: bool          = False   # quiet volume before Spring/UTAD/SOS
+    # W-S1: structural geometry — exposed so strategies can independently validate the range
+    range_high: float = 0.0         # upper boundary of detected trading range
+    range_low:  float = 0.0         # lower boundary of detected trading range
+    range_bars: int   = 0           # number of bars the range spans
 
 
 class WyckoffAnalyzer:
@@ -108,6 +112,7 @@ class WyckoffAnalyzer:
 
         range_high, range_low, range_start = range_result
         range_size = range_high - range_low
+        range_bars = len(closes) - range_start  # bars since range began
 
         # W-Q2: volume narrative flags — computed once, shared across detectors
         vol_contraction  = self._check_range_volume_contraction(volumes, range_start)
@@ -152,6 +157,9 @@ class WyckoffAnalyzer:
                 volume_confirms=spring['volume_spike'],
                 volume_contraction_in_range=vol_contraction,
                 dryup_before_event=dryup_before_evt,
+                range_high=range_high,
+                range_low=range_low,
+                range_bars=range_bars,
             )
 
         # ── Check for UTAD (Upthrust After Distribution) ─────
@@ -185,6 +193,9 @@ class WyckoffAnalyzer:
                 volume_confirms=utad['volume_spike'],
                 volume_contraction_in_range=vol_contraction,
                 dryup_before_event=dryup_before_evt,
+                range_high=range_high,
+                range_low=range_low,
+                range_bars=range_bars,
             )
 
         # ── Check for Sign of Strength (SOS) in Phase D ──────
@@ -209,6 +220,9 @@ class WyckoffAnalyzer:
                 volume_confirms=True,
                 volume_contraction_in_range=vol_contraction,
                 dryup_before_event=dryup_before_evt,
+                range_high=range_high,
+                range_low=range_low,
+                range_bars=range_bars,
             )
 
         return None
