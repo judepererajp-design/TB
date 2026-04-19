@@ -35,7 +35,9 @@ class Grading:
     A_GRADE_ESTIMATE_RAW_CONF: int = 78   # Raw conf proxy for A-grade in daily limit
 
     # Adaptive confidence floor
-    ADAPTIVE_FLOOR_MIN_HISTORY: int = 20  # Min scores before adaptive calc
+    # Raised from 20 → 50: with only 20 samples, the 40th-percentile floor can jump
+    # +8 pts in the first minute of a run, killing valid signals like DOT/AVAX/M.
+    ADAPTIVE_FLOOR_MIN_HISTORY: int = 50  # Min scores before adaptive calc
     ADAPTIVE_FLOOR_PERCENTILE: int = 40   # np.percentile target
     ADAPTIVE_FLOOR_MAX_CAP: int = 68      # Never raise floor above this
     FLOOR_ABSOLUTE_MINIMUM: int = 55      # Safety — never below 55
@@ -317,9 +319,18 @@ class Portfolio:
     KELLY_MULT_VOLATILE_PANIC: float = 0.25
     KELLY_MULT_VOLATILE: float = 0.50
     KELLY_MULT_CHOPPY: float = 0.65
-    KELLY_MULT_COUNTER_TREND: float = 0.50
-    KELLY_MULT_BULL_TREND: float = 0.85
-    BULL_TREND_HIGH_CONF_THRESHOLD: float = 0.65  # p_win for full Kelly
+    KELLY_MULT_COUNTER_TREND: float = 0.50          # BEAR_TREND+LONG and BULL_TREND+SHORT
+    KELLY_MULT_BULL_TREND: float = 0.85             # BULL_TREND+LONG below high-conf threshold
+    BULL_TREND_HIGH_CONF_THRESHOLD: float = 0.65    # p_win for full Kelly (BULL_TREND+LONG only)
+
+    # Kelly setup-class multipliers
+    # Scalps have shorter hold times, tighter stops, and higher rate-of-loss than swings.
+    # Sizing identically to swings over-allocates risk to scalp setups which fail more often
+    # due to micro-structure noise. Positional setups have the widest structural backing.
+    KELLY_MULT_SETUP_SCALP: float = 0.80       # Reduced: scalps are noisy / short-duration
+    KELLY_MULT_SETUP_INTRADAY: float = 1.00    # Baseline — no change
+    KELLY_MULT_SETUP_SWING: float = 1.05       # Slight reward: wider stop = cleaner signal
+    KELLY_MULT_SETUP_POSITIONAL: float = 1.10  # Highest conviction, longest-validated setup
 
 
 # ════════════════════════════════════════════════════════════════

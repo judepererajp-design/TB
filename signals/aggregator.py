@@ -664,6 +664,29 @@ class SignalAggregator:
             )
             signal.rr_ratio = round(_user_max_rr, 2)
 
+        # ── Resync TP2 after any RR cap ──────────────────────────────────
+        # Capping rr_ratio without adjusting TP2 means the exchange receives
+        # the original (uncapped) TP2 price even though the signal reports 6R.
+        # Example: DEXE entry=15.79, SL=14.45, TP2=35.04 (14.4R raw) → after
+        # cap rr_ratio=6.0 but TP2 was still 35.04 (+122%).  Fix: recalculate
+        # TP2 from (entry_mid + risk × capped_rr_ratio) so the level sent to
+        # the exchange is consistent with what the risk model approved.
+        if signal.rr_ratio < verified_rr:  # some cap was applied
+            if signal.direction == SignalDirection.LONG:
+                signal.tp2 = round(entry_mid + risk * signal.rr_ratio, 8)
+                # Maintain TP ordering: TP1 must stay below new TP2
+                if signal.tp1 >= signal.tp2:
+                    signal.tp1 = round(signal.tp2 * 0.998, 8)
+                # TP3 may already be above new TP2 (fine); if not, push outward
+                if signal.tp3 is not None and signal.tp3 <= signal.tp2:
+                    signal.tp3 = round(signal.tp2 * 1.002, 8)
+            else:
+                signal.tp2 = round(entry_mid - risk * signal.rr_ratio, 8)
+                if signal.tp1 <= signal.tp2:
+                    signal.tp1 = round(signal.tp2 * 1.002, 8)
+                if signal.tp3 is not None and signal.tp3 >= signal.tp2:
+                    signal.tp3 = round(signal.tp2 * 0.998, 8)
+
         # ── RR floor gate (single authoritative check) ───────
         # Strategies may do their own check but this is the canonical gate.
         # Uses setup_class-aware floor — EV gate in alpha_model owns profitability.

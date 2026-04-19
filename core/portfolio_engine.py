@@ -145,6 +145,7 @@ class PortfolioEngine:
         sector: str = "",
         correlation_to_btc: float = -1.0,  # -1 = use cache lookup
         symbol_volatility: float = Portfolio.DEFAULT_SYMBOL_VOLATILITY,
+        setup_class: str = "intraday",
     ) -> SizingDecision:
         """
         Determine optimal position size accounting for portfolio constraints.
@@ -165,6 +166,7 @@ class PortfolioEngine:
             sector: Asset sector (e.g., "L1", "DeFi", "Meme")
             correlation_to_btc: BTC correlation (0-1)
             symbol_volatility: Daily volatility of this symbol
+            setup_class: Signal setup class (scalp/intraday/swing/positional)
 
         Returns:
             SizingDecision with position size and adjustments
@@ -175,7 +177,7 @@ class PortfolioEngine:
                 entry_price=entry_price, stop_loss=stop_loss,
                 kelly_fraction=kelly_fraction, p_win=p_win, rr_ratio=rr_ratio,
                 sector=sector, correlation_to_btc=correlation_to_btc,
-                symbol_volatility=symbol_volatility,
+                symbol_volatility=symbol_volatility, setup_class=setup_class,
             )
 
     def _size_position_locked(
@@ -191,6 +193,7 @@ class PortfolioEngine:
         sector: str = "",
         correlation_to_btc: float = -1.0,
         symbol_volatility: float = Portfolio.DEFAULT_SYMBOL_VOLATILITY,
+        setup_class: str = "intraday",
     ) -> SizingDecision:
         """Internal (unlocked) implementation — always called under self._lock."""
         # FIX 11: resolve the -1.0 sentinel immediately. The value was passed raw to
@@ -227,6 +230,19 @@ class PortfolioEngine:
         _dynamic_kelly = self.get_dynamic_kelly(strategy, _cur_regime, direction)
         # Blend: 60% dynamic, 40% caller-provided (smooth transition for new strategies)
         blended_kelly = 0.6 * _dynamic_kelly + 0.4 * kelly_fraction
+
+        # Setup-class Kelly multiplier — scalps are noisier and have higher rate-of-loss
+        # than swing setups; this applies a consistent adjustment independent of regime.
+        # Intraday (1.0×) is the baseline; scalp is reduced (0.80×), swing/positional
+        # are slightly elevated to reward the wider structural confirmation they require.
+        _setup_mult = {
+            "scalp":       Portfolio.KELLY_MULT_SETUP_SCALP,
+            "intraday":    Portfolio.KELLY_MULT_SETUP_INTRADAY,
+            "swing":       Portfolio.KELLY_MULT_SETUP_SWING,
+            "positional":  Portfolio.KELLY_MULT_SETUP_POSITIONAL,
+        }.get(setup_class, Portfolio.KELLY_MULT_SETUP_INTRADAY)
+        blended_kelly *= _setup_mult
+
         base_risk_pct = max(0.002, min(self._max_position_risk_pct, blended_kelly))
 
         # ── 2. Volatility adjustment ──────────────────────────
@@ -883,6 +899,12 @@ class PortfolioEngine:
             elif regime == "CHOPPY":
                 regime_mult = Portfolio.KELLY_MULT_CHOPPY
             elif regime == "BEAR_TREND" and direction == "LONG":
+                # Counter-trend: halve Kelly — bear-market longs face strong headwind
+                regime_mult = Portfolio.KELLY_MULT_COUNTER_TREND
+            elif regime == "BULL_TREND" and direction == "SHORT":
+                # Counter-trend: same 0.50× treatment as BEAR_TREND+LONG (symmetric).
+                # Previously fell through to BULL_TREND → 0.85, meaning counter-trend
+                # SHORTs were sized the same as trend-aligned LONGs. Fixed.
                 regime_mult = Portfolio.KELLY_MULT_COUNTER_TREND
             elif regime == "BULL_TREND" and direction == "LONG" and p_win >= Portfolio.BULL_TREND_HIGH_CONF_THRESHOLD:
                 regime_mult = 1.0   # Full half-Kelly for high-confidence trend trades

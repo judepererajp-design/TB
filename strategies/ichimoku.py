@@ -116,6 +116,7 @@ class Ichimoku(BaseStrategy):
         kumo_top    = max(senkou_a_current, senkou_b_current)
         kumo_bottom = min(senkou_a_current, senkou_b_current)
         kumo_size   = kumo_top - kumo_bottom
+        current_price = closes[-1]
 
         # IC-Q1: Thin cloud → weak S/R zone → high failure rate.
         # Use the larger of 1×ATR or 0.2% of price so the gate scales correctly across
@@ -128,7 +129,6 @@ class Ichimoku(BaseStrategy):
         chikou_current_price = closes[-1]
         chikou_compare_price = closes[-displacement - 1] if len(closes) > displacement + 1 else closes[0]
 
-        current_price  = closes[-1]
         current_tenkan = tenkan[-1]
         current_kijun  = kijun[-1]
         prev_tenkan    = tenkan[-2]
