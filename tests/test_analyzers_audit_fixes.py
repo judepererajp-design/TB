@@ -311,12 +311,14 @@ def test_detect_parabolic_backward_compatible_without_ohlcv():
     closes = np.array([100.0 + i * 0.5 for i in range(40)])
     result = BaseStrategy.detect_parabolic(closes)
     # Base keys still present
-    for key in ("is_parabolic", "acceleration", "roc", "direction"):
+    for key in ("is_parabolic", "parabolic_score", "acceleration", "roc", "direction"):
         assert key in result
     # New keys default-populated — no error, no enrichment call
     assert result.get("is_exhausted") is False
     assert result.get("exhaustion_signals") == []
     assert result.get("confidence_penalty") == 0
+    # parabolic_score is a float in [0, 1]
+    assert 0.0 <= result["parabolic_score"] <= 1.0
 
 
 def test_volume_profile_ignores_all_zero_volume_input():

@@ -704,6 +704,7 @@ class BaseStrategy(ABC):
         closes = np.asarray(closes, dtype=float)
         result = {
             "is_parabolic": False,
+            "parabolic_score": 0.0,   # gradient [0,1]: 0=no acceleration, 1=threshold met exactly, >1 clamped to 1
             "acceleration": 0.0,
             "roc": 0.0,
             "direction": "FLAT",
@@ -764,6 +765,18 @@ class BaseStrategy(ABC):
 
         is_parabolic = _all_same_sign and abs(_avg_accel) > _dynamic_threshold
 
+        # parabolic_score: a continuous [0,1] measure of how strongly the
+        # acceleration exceeds (or approaches) the threshold.  Callers that
+        # want a gradient (e.g. partial confidence penalty) should use this
+        # instead of the binary is_parabolic flag.
+        #   0.0  — acceleration absent or in mixed directions
+        #   0.0–1.0 — acceleration present, below/at threshold
+        #   1.0  — threshold met or exceeded (clamped)
+        if _all_same_sign and _dynamic_threshold > 0:
+            _parabolic_score = min(1.0, abs(_avg_accel) / _dynamic_threshold)
+        else:
+            _parabolic_score = 0.0
+
         if current_roc > 0.01:
             price_direction = "UP"
         elif current_roc < -0.01:
@@ -772,6 +785,7 @@ class BaseStrategy(ABC):
             price_direction = "FLAT"
 
         result["is_parabolic"] = is_parabolic
+        result["parabolic_score"] = round(_parabolic_score, 3)
         result["acceleration"] = round(acceleration, 6)
         result["roc"] = round(current_roc, 6)
         result["direction"] = price_direction
@@ -912,14 +926,19 @@ class BaseStrategy(ABC):
                 signals.append("waning_momentum")
                 score += _W_WANING_MOMENTUM
 
-        # Gate: when histogram data is provided but NOT decelerating, that is a
-        # counter-signal to exhaustion — a still-expanding histogram means price
-        # momentum is intact regardless of what structure signals say.  When no
-        # histogram is passed (caller doesn't have MACD data), we cannot use it
-        # to veto, so the gate passes by default.
-        histogram_gate_ok = (not histogram_provided) or histogram_decelerating
+        # Histogram counter-signal: when histogram data is present but NOT
+        # decelerating, momentum is likely still intact.  Rather than a hard
+        # veto (which would block otherwise strong exhaustion readings), apply
+        # a multiplicative penalty to the score.  A non-decelerating histogram
+        # with a pile of price/volume signals could still reach the threshold
+        # if the evidence is overwhelming, but the bar is raised substantially.
+        #   _HISTOGRAM_COUNTER_MULT = 0.65 → caller needs raw score ≥ 0.77 to
+        #   still declare exhaustion when the histogram is still expanding.
+        _HISTOGRAM_COUNTER_MULT = 0.65
+        if histogram_provided and not histogram_decelerating:
+            score *= _HISTOGRAM_COUNTER_MULT
 
-        is_exhausted = score >= 0.50 and histogram_gate_ok
+        is_exhausted = score >= 0.50
 
         return {
             "is_exhausted": is_exhausted,
