@@ -35,8 +35,8 @@ def test_ichimoku_cloud_thickness_uses_initialized_current_price():
     from strategies.ichimoku import Ichimoku
 
     src = inspect.getsource(Ichimoku)
-    assert "current_price  = closes[-1]" in src
-    assert src.index("current_price  = closes[-1]") < src.index("if kumo_size < max(atr * 1.0, current_price * 0.002):")
+    assert "current_price = closes[-1]" in src
+    assert src.index("current_price = closes[-1]") < src.index("if kumo_size < max(atr * 1.0, current_price * 0.002):")
 
 
 def test_price_action_has_vol_rising_and_prior_bar_context():

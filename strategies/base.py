@@ -685,8 +685,10 @@ class BaseStrategy(ABC):
 
         stride = max(1, int(sample_stride))
         widths = widths_all[::stride]
+        # Stride sampling can skip the newest window when n is not aligned to stride.
+        # Ensure percentile context always includes the current (latest) bandwidth.
         if widths[-1] != widths_all[-1]:
-            widths.append(widths_all[-1])  # Always include current regime context
+            widths.append(widths_all[-1])
 
         if len(widths) < 10:
             return result
