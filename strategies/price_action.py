@@ -285,11 +285,6 @@ class PriceAction(BaseStrategy):
             confidence += 12
         if vol_confirmed:
             confidence += 8
-        if _vol_rising:
-            confidence += 4  # rising volume sequence builds credibility for the move
-            # Magnitude bonus: was the leading volume also above-average?
-            if avg_vol > 0 and volumes[-2] > 1.5 * avg_vol:
-                confidence += 2  # above-average leading volume = stronger build-up
         if len(signal_patterns) > 1:
             confidence += 5 * (len(signal_patterns) - 1)
 
@@ -303,22 +298,34 @@ class PriceAction(BaseStrategy):
         _is_single_bar = primary_pattern["pattern"] in _single_bar_patterns
         _prior_bar_confirms = False
         _prior_bar_conflicts = False
+        _context_adj = 0.0
+        _context_bonus = 0.0
         if _is_single_bar and len(opens) >= 2:
             _prior_close_vs_open = closes[-2] - opens[-2]
             _context_strength = abs(_prior_close_vs_open) / atr if atr > 0 else 0.0
             _context_adj = min(5, _context_strength * 5)
             if direction == "LONG" and _prior_close_vs_open < 0:
                 _prior_bar_confirms = True   # prior sell-off confirms reversal context
-                confidence += _context_adj
+                _context_bonus = _context_adj
             elif direction == "SHORT" and _prior_close_vs_open > 0:
                 _prior_bar_confirms = True
-                confidence += _context_adj
+                _context_bonus = _context_adj
             elif direction == "LONG" and _prior_close_vs_open > 0:
                 _prior_bar_conflicts = True  # prior bar moving with us = chasing
-                confidence -= _context_adj
+                confidence -= _context_adj   # penalty applies in full, not capped
             elif direction == "SHORT" and _prior_close_vs_open < 0:
                 _prior_bar_conflicts = True
-                confidence -= _context_adj
+                confidence -= _context_adj   # penalty applies in full, not capped
+
+        # Vol-sequence bonuses: rising sequence (+4) + above-average magnitude (+2).
+        # Context and volume are correlated (a strong prior bar drives volume), so cap
+        # the combined upside at +8 to prevent correlated signals inflating confidence.
+        _vol_seq_bonus = 4.0 if _vol_rising else 0.0
+        _vol_mag_bonus = (
+            2.0 if (_vol_rising and avg_vol > 0 and volumes[-2] > 1.5 * avg_vol) else 0.0
+        )
+        _pa_micro_bonus = min(8, _context_bonus + _vol_seq_bonus + _vol_mag_bonus)
+        confidence += _pa_micro_bonus
 
         # ── Entry / SL / TP levels ────────────────────────────────────────
         # FIX: SL buffer used entry_zone_tight (0.10 ATR) — far too thin.
@@ -385,10 +392,14 @@ class PriceAction(BaseStrategy):
         if vol_confirmed:
             confluence.append(f"✅ Volume: {vol_ratio:.1f}x average")
         if _vol_rising:
-            confluence.append("✅ Volume trend: rising sequence (x3 bars)")
+            confluence.append(
+                "✅ Volume trend: rising sequence (x3 bars)"
+                + (" + magnitude" if _vol_mag_bonus > 0 else "")
+                + f" — micro-bonus +{_pa_micro_bonus:.0f} (cap 8)"
+            )
         if _is_single_bar:
             if _prior_bar_confirms:
-                confluence.append(f"✅ Prior bar: confirms reversal context (+{_context_adj:.1f})")
+                confluence.append(f"✅ Prior bar: confirms reversal context (+{_context_bonus:.1f})")
             elif _prior_bar_conflicts:
                 confluence.append(f"⚠️ Prior bar: conflicts with signal direction (-{_context_adj:.1f})")
         if _mtf_mismatch:

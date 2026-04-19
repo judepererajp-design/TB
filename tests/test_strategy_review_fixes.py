@@ -35,6 +35,9 @@ def test_price_action_has_vol_rising_and_prior_bar_context():
     assert '_context_adj' in src
     # Volume magnitude bonus inside rising-sequence block
     assert '1.5 * avg_vol' in src
+    # Correlated bonuses capped at +8
+    assert '_pa_micro_bonus' in src
+    assert 'min(8, _context_bonus + _vol_seq_bonus + _vol_mag_bonus)' in src
 
 
 def test_range_scalper_uses_bos_hold_and_absolute_stop_boundaries():
@@ -64,6 +67,18 @@ def test_range_scalper_btc_breakout_gate():
     # Soft graded penalty before hard block
     assert '_btc_soft_penalty' in src
     assert '_btc_soft_thresh' in src
+    # Convex scaling formula
+    assert '_btc_scale' in src
+    assert '6 + 4 * min(1.0, _btc_scale)' in src
+
+
+def test_range_scalper_edge_proximity_sanity():
+    from strategies.range_scalper import RangeScalperStrategy
+
+    src = inspect.getsource(RangeScalperStrategy)
+    assert '_distance_to_edge' in src
+    assert '1.2 * atr' in src
+    assert 'Edge proximity' in src
 
 
 def test_range_scalper_range_decay_detection():
@@ -103,6 +118,24 @@ def test_reversal_climactic_volume_bonus():
     src = inspect.getsource(ReversalStrategy)
     assert 'vol_ratio > 3.0' in src
     assert 'Climactic volume' in src
+
+
+def test_reversal_late_divergence_guard():
+    from strategies.reversal import ReversalStrategy
+
+    src = inspect.getsource(ReversalStrategy)
+    assert '_signal_extreme' in src
+    assert '1.5 * atr' in src
+    assert 'Late entry' in src
+
+
+def test_reversal_divergence_volume_coupling():
+    from strategies.reversal import ReversalStrategy
+
+    src = inspect.getsource(ReversalStrategy)
+    assert 'div_strength > 1.0' in src
+    assert 'vol_ratio < vol_conf_mult_for_div' in src
+    assert 'Strong divergence but low volume' in src
 
 
 def test_reversal_valid_regimes_excludes_volatile():

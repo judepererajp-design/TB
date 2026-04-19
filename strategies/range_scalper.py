@@ -98,7 +98,12 @@ class RangeScalperStrategy(BaseStrategy):
             if _btc_momentum_abs >= _btc_breakout_thresh and _btc_bias != "NEUTRAL":
                 return None  # BTC strongly trending — alt ranges unreliable
             elif _btc_momentum_abs >= _btc_soft_thresh and _btc_bias != "NEUTRAL":
-                _btc_soft_penalty = 6   # Moderate BTC move — reduce confidence, don't block
+                # Convex penalty: rises from 6→10 as momentum approaches the hard block.
+                # Risk increases nonlinearly as BTC trends toward breakout velocity.
+                _btc_scale = (_btc_momentum_abs - _btc_soft_thresh) / (
+                    _btc_breakout_thresh - _btc_soft_thresh
+                )
+                _btc_soft_penalty = int(6 + 4 * min(1.0, _btc_scale))
 
         # ── 1. Get candle data ────────────────────────────────────
         tf = '15m'  # Scalper uses 15m for entries
@@ -212,6 +217,19 @@ class RangeScalperStrategy(BaseStrategy):
             f"✅ Price at range {zone_name} zone (depth: {depth:.0%})"
         )
         confidence += depth * 8  # Up to +8 for being deep in zone
+
+        # Edge proximity sanity: even within the zone, the trade is only worthwhile
+        # if price is close to the actual range wall.  If it's more than 1.2 ATR
+        # away from the extreme, price is mid-band and timing is poor.
+        if direction == "LONG":
+            _distance_to_edge = current - range_low
+        else:
+            _distance_to_edge = range_high - current
+        if _distance_to_edge > 1.2 * atr:
+            confidence -= 4
+            confluence.append(
+                f"⚠️ Edge proximity: {_distance_to_edge / atr:.1f}× ATR from range wall (-4)"
+            )
 
         # b) RSI confirmation
         rsi = self.calculate_rsi(closes, 14)

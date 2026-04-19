@@ -107,6 +107,7 @@ class ReversalStrategy(BaseStrategy):
             return None
 
         # ── RSI divergence check ──────────────────────────────
+        div_strength = 0.0
         if req_div:
             div_strength = self._check_divergence(closes, highs, lows, direction, lookback=20)
             if div_strength > 0:
@@ -134,6 +135,24 @@ class ReversalStrategy(BaseStrategy):
         if vol_ratio > 3.0:
             confluence.append(f"🔥 Climactic volume: {vol_ratio:.1f}x — capitulation signal (+4)")
             confidence += 4
+
+        # ── Late-divergence guard ─────────────────────────────
+        # If price has already bounced more than 1.5 ATR from the BB extreme,
+        # the reversal is underway and entering now is chasing.
+        _signal_extreme = bb_lo if direction == "LONG" else bb_up
+        if abs(current - _signal_extreme) > 1.5 * atr:
+            confluence.append(
+                f"⚠️ Late entry: {abs(current - _signal_extreme) / atr:.1f}× ATR from BB extreme (-4)"
+            )
+            confidence -= 4
+
+        # ── Divergence + volume coupling ─────────────────────
+        # Strong divergence without participation is a weaker signal: smart-money
+        # divergence must be accompanied by at least baseline volume to be credible.
+        vol_conf_mult_for_div = float(getattr(self._cfg, 'vol_confirmation_mult', 2.0))
+        if div_strength > 1.0 and vol_ratio < vol_conf_mult_for_div:
+            confluence.append("⚠️ Strong divergence but low volume — signal weaker (-3)")
+            confidence -= 3
 
         # ── Targets ───────────────────────────────────────────
         # Wire timeframe+volatility-scaled TPs for realistic targets per setup class
