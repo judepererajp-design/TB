@@ -118,15 +118,46 @@ class HTFWeeklyGuardrail:
             return False, "HTF guardrail: not warmed — allowing"
 
         if self._weekly_bias == "NEUTRAL":
-            # FIX (P0-B): When weekly is NEUTRAL, the HTF guardrail used to allow
-            # everything — including unlimited counter-trend signals in a strong
-            # intraday regime. Now we consult the intraday regime as a fallback.
-            # We do NOT hard-block (GPT agrees: shorts in bull are fine IF controlled).
-            # Instead, we let the signal through but flag it via the reason string
-            # so downstream code (apply_regime_filter) can apply appropriate penalties.
-            # The actual control happens via:
-            #   1. Enhanced short_bias/long_bias in regime_thresholds (P1-B)
-            #   2. counter_short_max portfolio cap in engine (P2-B)
+            # When weekly is NEUTRAL the original guardrail allowed everything.
+            # P0-B FIX: when the intraday regime is strongly directional we apply
+            # a lightweight confidence threshold so counter-trend signals face at
+            # least some structural gate instead of only strategy-level penalties.
+            #
+            # Logic: if intraday = BULL_TREND and signal = SHORT (counter-trend),
+            #        or intraday = BEAR_TREND and signal = LONG, require a minimum
+            #        confidence of 78 (the lowest bar used in any weekly-biased path).
+            #        Signals at or above that pass freely; below that are blocked.
+            # This closes the "P0-B weakest gate" without turning NEUTRAL into a
+            # fully-biased weekly state — the threshold is lower than the BULLISH/
+            # BEARISH paths (78 vs 81-88) to reflect genuine weekly ambiguity.
+            try:
+                from analyzers.regime import regime_analyzer as _htf_ra
+                _intraday = getattr(_htf_ra.regime, 'value', 'UNKNOWN')
+            except (ImportError, AttributeError):
+                _intraday = 'UNKNOWN'
+
+            _is_counter_intraday = (
+                (signal_direction == "SHORT" and _intraday == "BULL_TREND") or
+                (signal_direction == "LONG"  and _intraday == "BEAR_TREND")
+            )
+            if _is_counter_intraday:
+                _neutral_threshold = 78.0  # Lowest bar — weekly is ambiguous
+                if raw_confidence < _neutral_threshold:
+                    reason = (
+                        f"🚫 HTF weekly NEUTRAL + intraday {_intraday}: "
+                        f"{signal_direction} blocked — "
+                        f"need {_neutral_threshold:.0f}+ conf (got {raw_confidence:.0f}). "
+                        f"Use strategy-level overrides or wait for weekly bias to firm up."
+                    )
+                    if signal_direction == "LONG":
+                        self._blocks_long_session += 1
+                    else:
+                        self._blocks_short_session += 1
+                    return True, reason
+                return False, (
+                    f"HTF NEUTRAL+{_intraday} counter-trend override: "
+                    f"conf={raw_confidence:.0f} >= {_neutral_threshold:.0f}"
+                )
             return False, "HTF guardrail: NEUTRAL — regime-level controls apply"
 
         is_counter = (

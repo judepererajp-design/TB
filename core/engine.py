@@ -4262,6 +4262,7 @@ class Engine:
                                 else (0.025 if getattr(signal, 'tier', 2) == 1
                                       else 0.05 if getattr(signal, 'tier', 2) == 2
                                       else 0.08)),  # T1/T2/T3 fallback
+                        setup_class=getattr(signal, 'setup_class', 'intraday'),
                         )  # end size_position
 
                     if alpha_score.grade != "C" and not sizing.approved:
