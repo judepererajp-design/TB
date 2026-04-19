@@ -275,7 +275,7 @@ class StalkerEngine:
 
     def _detect_rsi_coiling(self, closes) -> bool:
         """
-        RSI bouncing between 45-55 repeatedly — indecision before breakout.
+        RSI bouncing between 40-60 repeatedly — indecision before breakout.
         """
         if len(closes) < 30:
             return False
@@ -336,6 +336,7 @@ class StalkerEngine:
         vol_spike = cur_vol > avg_vol * 1.8
 
         # Price making a higher high on 15m
+        # Exclude the still-forming candle [-1] so highs are based on closed bars only.
         recent_high = max(df15['high'].values[-6:-1])
         prior_high  = max(df15['high'].values[-21:-6])
         higher_high = recent_high > prior_high

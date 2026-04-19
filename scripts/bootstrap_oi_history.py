@@ -21,6 +21,7 @@ import json
 import logging
 import math
 import os
+import statistics
 import sys
 import time
 from collections import defaultdict
@@ -41,6 +42,7 @@ _CACHE_FILE  = os.path.join(os.path.dirname(os.path.dirname(__file__)),
                              "data", "oi_history.json")
 _CACHE_TTL   = 24 * 3600  # re-bootstrap if file > 24 hours old
 _REQUEST_GAP = 0.3        # seconds between API calls
+_ONE_HOUR_MS = 3600 * 1000
 
 # Top coins to bootstrap (covers 95%+ of trading volume)
 # We also do ALL coins the bot scans, but these get priority
@@ -156,7 +158,7 @@ async def fetch_binance_oi_history(
                 break
             last_ts = int(data[-1].get("timestamp", 0))
             next_cursor = last_ts + 1
-            if next_cursor <= cursor or next_cursor - cursor < 3600 * 1000:
+            if next_cursor <= cursor or next_cursor - cursor < _ONE_HOUR_MS:
                 logger.warning(
                     f"Binance OI cursor stalled for {symbol}: cursor={cursor}, last_ts={last_ts}"
                 )
@@ -227,6 +229,77 @@ async def fetch_okx_oi_history(
         await asyncio.sleep(_REQUEST_GAP)
 
     return results
+
+
+# ── Long/short ratio helpers ────────────────────────────────────────────────────
+
+def _ratio_to_long_share(value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if v <= 0:
+        return None
+    if v <= 1:
+        return v
+    return v / (1.0 + v)
+
+
+async def fetch_binance_long_ratio(
+    session: aiohttp.ClientSession, coin: str
+) -> Optional[float]:
+    symbol = f"{coin}USDT"
+    data = await _get(session, f"{_BINANCE}/futures/data/globalLongShortAccountRatio", {
+        "symbol": symbol,
+        "period": "1h",
+        "limit": 30,
+    })
+    if not data or not isinstance(data, list):
+        return None
+
+    samples: List[float] = []
+    for item in data[-12:]:
+        long_share = _ratio_to_long_share(item.get("longAccount"))
+        if long_share is None:
+            long_share = _ratio_to_long_share(item.get("longShortRatio"))
+        if long_share is not None and 0.0 < long_share < 1.0:
+            samples.append(long_share)
+    return float(statistics.mean(samples)) if samples else None
+
+
+async def fetch_bybit_long_ratio(
+    session: aiohttp.ClientSession, coin: str
+) -> Optional[float]:
+    symbol = f"{coin}USDT"
+    data = await _get(session, f"{_BYBIT}/v5/market/account-ratio", {
+        "category": "linear",
+        "symbol": symbol,
+        "period": "1h",
+        "limit": 30,
+    })
+    if not data or str(data.get("retCode")) != "0":
+        return None
+
+    rows = data.get("result", {}).get("list", []) or []
+    samples: List[float] = []
+    for row in rows[-12:]:
+        buy_ratio = row.get("buyRatio") or row.get("longAccountRatio") or row.get("longAccount")
+        sell_ratio = row.get("sellRatio") or row.get("shortAccountRatio") or row.get("shortAccount")
+        long_share = _ratio_to_long_share(buy_ratio)
+        short_share = _ratio_to_long_share(sell_ratio)
+        if long_share is not None and short_share is not None and (long_share + short_share) > 0:
+            samples.append(long_share / (long_share + short_share))
+            continue
+        if long_share is not None and 0.0 < long_share < 1.0:
+            samples.append(long_share)
+            continue
+        ratio_share = _ratio_to_long_share(row.get("buySellRatio"))
+        if ratio_share is not None and 0.0 < ratio_share < 1.0:
+            samples.append(ratio_share)
+
+    return float(statistics.mean(samples)) if samples else None
 
 
 # ── Binance historical klines for price data ───────────────────────────────────
@@ -303,6 +376,7 @@ def build_clusters(
     coin: str,
     history: List[Tuple[float, float, float]],
     current_price: float,
+    long_ratio: float = 0.65,
 ) -> List[Tuple[float, float, str]]:
     """
     Compute deep liquidation clusters from OI + price history.
@@ -311,7 +385,7 @@ def build_clusters(
       → Longs were opened at P → will liquidate at P*(1-1/lev)
       → Shorts were opened at P → will liquidate at P*(1+1/lev)
 
-    We use a mix of 5x, 10x, 20x leverage assumptions weighted realistically.
+    We use asset-aware leverage mixes (BTC/ETH lower leverage, smaller alts higher leverage).
     OI deltas are age-weighted (exponential decay) so stale data contributes
     less than recent accumulation.  The decay constant τ is asset-aware:
       • BTC/ETH: τ=30 days (structurally stable; older OI stays relevant)
@@ -325,6 +399,13 @@ def build_clusters(
 
     # Sort by timestamp
     history = sorted(history, key=lambda x: x[0])
+    oi_values = [float(p[1]) for p in history if len(p) >= 2 and float(p[1]) > 0]
+    if not oi_values:
+        return []
+    median_oi = float(statistics.median(oi_values))
+    # Scale sensitivity by each coin's baseline OI:
+    # 0.5% of median OI, capped at $2M and floored at $100k.
+    min_oi_delta = max(100_000.0, min(2_000_000.0, median_oi * 0.005))
 
     # Age-decay parameters — asset-aware:
     # BTC/ETH are more structurally stable; OI from 30 days ago is still relevant.
@@ -347,7 +428,7 @@ def build_clusters(
         oi_delta = oi - prev_oi
         prev_oi  = oi
 
-        if oi_delta < 2_000_000:  # ignore small OI changes < $2M
+        if oi_delta < min_oi_delta:
             continue
 
         # Exponential age weight: recent data → weight ≈ 1.0,
@@ -369,30 +450,24 @@ def build_clusters(
         if oi_accumulated < 10_000_000:  # need $10M+ (age-weighted) to be significant
             continue
 
-        # Leverage distribution: 20% at 5x, 50% at 10x, 30% at 20x
-        # Long liquidation prices (below entry)
-        long_liq_5x  = price_level * (1 - 1/5)   # -20%
-        long_liq_10x = price_level * (1 - 1/10)  # -10%
-        long_liq_20x = price_level * (1 - 1/20)  # -5%
+        if any(_coin_upper.startswith(m) for m in ("BTC", "ETH")):
+            leverage_mix = [(5, 0.35), (10, 0.45), (20, 0.20)]
+        elif any(_coin_upper.startswith(m) for m in ("SOL", "BNB", "XRP", "ADA", "DOGE", "AVAX", "LINK")):
+            leverage_mix = [(5, 0.20), (10, 0.45), (20, 0.30), (50, 0.05)]
+        else:
+            leverage_mix = [(10, 0.30), (20, 0.45), (50, 0.20), (100, 0.05)]
 
-        # Short liquidation prices (above entry)
-        short_liq_5x  = price_level * (1 + 1/5)   # +20%
-        short_liq_10x = price_level * (1 + 1/10)  # +10%
-        short_liq_20x = price_level * (1 + 1/20)  # +5%
-
-        # Assume 65% long / 35% short (typical bull market)
-        long_oi  = oi_accumulated * 0.65
-        short_oi = oi_accumulated * 0.35
+        safe_long_ratio = min(0.8, max(0.2, float(long_ratio)))
+        long_oi  = oi_accumulated * safe_long_ratio
+        short_oi = oi_accumulated * (1.0 - safe_long_ratio)
 
         long_clusters = [
-            (long_liq_5x,  long_oi * 0.20),
-            (long_liq_10x, long_oi * 0.50),
-            (long_liq_20x, long_oi * 0.30),
+            (price_level * (1 - 1 / lev), long_oi * w)
+            for lev, w in leverage_mix
         ]
         short_clusters = [
-            (short_liq_5x,  short_oi * 0.20),
-            (short_liq_10x, short_oi * 0.50),
-            (short_liq_20x, short_oi * 0.30),
+            (price_level * (1 + 1 / lev), short_oi * w)
+            for lev, w in leverage_mix
         ]
 
         for p, usd in long_clusters:
@@ -478,6 +553,14 @@ async def bootstrap(
                 okx_oi = await fetch_okx_oi_history(session, coin)
                 await asyncio.sleep(_REQUEST_GAP)
 
+                # 2b. Pull live long/short account ratios to avoid hardcoded bias.
+                binance_long_ratio = await fetch_binance_long_ratio(session, coin)
+                await asyncio.sleep(_REQUEST_GAP)
+                bybit_long_ratio = await fetch_bybit_long_ratio(session, coin)
+                await asyncio.sleep(_REQUEST_GAP)
+                ratio_samples = [r for r in (binance_long_ratio, bybit_long_ratio) if r is not None]
+                long_ratio = float(statistics.mean(ratio_samples)) if ratio_samples else 0.65
+
                 # 3. Enrich with prices
                 bybit_enriched   = enrich_with_prices(bybit_oi, price_map)
                 binance_enriched = enrich_with_prices(binance_oi, price_map)
@@ -507,7 +590,7 @@ async def bootstrap(
                 history[coin] = merged
 
                 # 4. Build liquidation clusters
-                coin_clusters = build_clusters(coin, merged, current_price)
+                coin_clusters = build_clusters(coin, merged, current_price, long_ratio=long_ratio)
                 if coin_clusters:
                     clusters[coin] = coin_clusters
 
