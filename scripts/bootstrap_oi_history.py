@@ -24,7 +24,7 @@ import os
 import sys
 import time
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 
@@ -56,7 +56,7 @@ _PRIORITY_COINS = [
 
 
 async def _get(session: aiohttp.ClientSession, url: str,
-               params: dict = None, retries: int = 2) -> Optional[any]:
+               params: dict = None, retries: int = 2) -> Optional[Any]:
     for attempt in range(retries):
         try:
             async with session.get(url, params=params,
@@ -65,6 +65,8 @@ async def _get(session: aiohttp.ClientSession, url: str,
                     return await r.json()
                 elif r.status == 429:
                     await asyncio.sleep(5)
+                else:
+                    logger.warning(f"HTTP {r.status} from {url} params={params}")
         except Exception as e:
             if attempt < retries - 1:
                 await asyncio.sleep(2)
@@ -100,7 +102,7 @@ async def fetch_bybit_oi_history(
             "endTime":     str(cursor_end),
             "limit":       200,
         })
-        if data and data.get("retCode") == 0:
+        if data and str(data.get("retCode")) == "0":
             items = data.get("result", {}).get("list", [])
             for item in items:
                 try:
@@ -152,7 +154,14 @@ async def fetch_binance_oi_history(
                     pass
             if len(data) < 500:
                 break
-            cursor = int(data[-1]["timestamp"]) + 1
+            last_ts = int(data[-1].get("timestamp", 0))
+            next_cursor = last_ts + 1
+            if next_cursor <= cursor or next_cursor - cursor < 3600 * 1000:
+                logger.warning(
+                    f"Binance OI cursor stalled for {symbol}: cursor={cursor}, last_ts={last_ts}"
+                )
+                break
+            cursor = next_cursor
         else:
             break
         await asyncio.sleep(_REQUEST_GAP)
@@ -210,7 +219,11 @@ async def fetch_okx_oi_history(
         if oldest_ts <= start_ms:
             break
 
-        after = rows[-1][0]
+        next_after = rows[-1][0]
+        if after and next_after == after:
+            logger.warning(f"OKX OI cursor stalled for {coin}: after={after}")
+            break
+        after = next_after
         await asyncio.sleep(_REQUEST_GAP)
 
     return results

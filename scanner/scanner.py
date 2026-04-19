@@ -150,13 +150,30 @@ class Scanner:
             tier2_cfg = self._scan_cfg.tier2
             tier3_cfg = self._scan_cfg.tier3
 
-            t1_max = getattr(tier1_cfg, 'max_symbols', 80)
-            t2_max = getattr(tier2_cfg, 'max_symbols', 80)
-            t3_max = getattr(tier3_cfg, 'max_symbols', 40)
+            t1_enabled = getattr(tier1_cfg, 'enabled', True)
+            t2_enabled = getattr(tier2_cfg, 'enabled', True)
+            t3_enabled = getattr(tier3_cfg, 'enabled', True)
+
+            t1_max = getattr(tier1_cfg, 'max_symbols', 80) if t1_enabled else 0
+            t2_max = getattr(tier2_cfg, 'max_symbols', 80) if t2_enabled else 0
+            t3_max = getattr(tier3_cfg, 'max_symbols', 40) if t3_enabled else 0
 
             t1_min_vol = getattr(tier1_cfg, 'min_volume_24h', 5_000_000)
             t2_min_vol = getattr(tier2_cfg, 'min_volume_24h', 1_000_000)
             t3_min_vol = getattr(tier3_cfg, 'min_volume_24h', 200_000)
+            active_min_vols = []
+            if t1_enabled:
+                active_min_vols.append(t1_min_vol)
+            if t2_enabled:
+                active_min_vols.append(t2_min_vol)
+            if t3_enabled:
+                active_min_vols.append(t3_min_vol)
+            if not active_min_vols:
+                self._symbols = {}
+                self._last_universe_refresh = now
+                logger.info("Universe build skipped: all scanning tiers are disabled")
+                return
+            min_qual_vol = min(active_min_vols)
 
             excluded = set(cfg.exchange.get('excluded_symbols', [])
                            if isinstance(cfg.exchange.get('excluded_symbols', []), list)
@@ -171,7 +188,7 @@ class Scanner:
                 if base_symbol in excluded:
                     continue
                 vol = float(ticker.get('quoteVolume', 0) or 0)
-                if vol >= t3_min_vol:
+                if vol >= min_qual_vol:
                     qualified.append((base_symbol, vol))
 
             seen = {}
@@ -228,7 +245,14 @@ class Scanner:
                 self._whale_snapshot,
                 self._signal_dedup,
             ):
-                for _k in [k for k in _cd if k not in active_symbols]:
+                if _cd is self._signal_dedup:
+                    _stale_keys = [
+                        k for k in _cd
+                        if not isinstance(k, tuple) or len(k) < 1 or k[0] not in active_symbols
+                    ]
+                else:
+                    _stale_keys = [k for k in _cd if k not in active_symbols]
+                for _k in _stale_keys:
                     _cd.pop(_k, None)
 
             logger.info(
@@ -482,13 +506,18 @@ class Scanner:
                     # still allowing genuine whales that grew since last snapshot.
                     prev = self._whale_snapshot.setdefault(symbol, {}).get(side, 0.0)
                     self._whale_snapshot[symbol][side] = order_usd
-                    if prev == 0.0 or (prev / order_usd) < 0.5:
+                    ratio = (
+                        min(prev, order_usd) / max(prev, order_usd)
+                        if max(prev, order_usd) > 0
+                        else 0.0
+                    )
+                    if prev == 0.0 or ratio < 0.5:
                         # First sighting or too small relative to current — record but don't fire yet
                         logger.debug(
                             f"🐋 Whale candidate (first sighting): "
                             f"{symbol} {side} ${order_usd:,.0f} @ {price}"
                         )
-                        break  # still check iceberg on same side below
+                        continue
 
                     self._whale_cooldown[symbol] = time.time()
                     fp = _fill_prob(price, side, order_usd, min_order_usd)
@@ -514,7 +543,12 @@ class Scanner:
             if cumulative_usd >= min_order_usd:
                 prev = self._whale_snapshot.setdefault(symbol, {}).get(f"iceberg_{side}", 0.0)
                 self._whale_snapshot[symbol][f"iceberg_{side}"] = cumulative_usd
-                if prev == 0.0 or (prev / cumulative_usd) < 0.5:
+                ratio = (
+                    min(prev, cumulative_usd) / max(prev, cumulative_usd)
+                    if max(prev, cumulative_usd) > 0
+                    else 0.0
+                )
+                if prev == 0.0 or ratio < 0.5:
                     logger.debug(
                         f"🐋 Iceberg candidate (first sighting): "
                         f"{symbol} {side} ${cumulative_usd:,.0f} cumulative"

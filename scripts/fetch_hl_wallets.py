@@ -120,7 +120,9 @@ def fetch_hl_leaderboard(top_n=50):
         # Sort by PnL descending
         wallets.sort(key=lambda x: x["pnl"], reverse=True)
         print(f"  ✅ Got {len(wallets)} addresses from HL leaderboard")
-        return wallets[:top_n]
+        if wallets:
+            return wallets[:top_n]
+        print("  ⚠️  HL leaderboard returned no usable wallet rows; trying fallback")
 
     except Exception as e:
         print(f"  ⚠️  HL leaderboard fetch failed: {e}")
@@ -283,9 +285,6 @@ def main():
     print("=" * 60)
 
     api_key = load_api_key()
-    if not api_key:
-        print("⚠️  No HyperTracker API key found in settings.yaml")
-        print("   Add your key to config/settings.yaml → hypertracker_api_key")
 
     # Collect from all sources
     all_wallets = []
@@ -300,6 +299,8 @@ def main():
         all_wallets.extend(ht_wallets)
         ht_lb = fetch_ht_leaderboard(api_key, top_n=25)
         all_wallets.extend(ht_lb)
+    else:
+        print("ℹ️  HyperTracker API key not set; skipping HyperTracker-only wallet sources")
 
     # Deduplicate, keeping first occurrence (HL leaderboard ranked by PnL)
     seen = set()
