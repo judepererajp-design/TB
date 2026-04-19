@@ -34,7 +34,7 @@ def test_base_bb_squeeze_uses_strided_history_sampling():
 def test_ichimoku_cloud_thickness_uses_initialized_current_price():
     from strategies.ichimoku import Ichimoku
 
-    src = inspect.getsource(Ichimoku)
+    src = inspect.getsource(Ichimoku._analyze)
     assert "current_price = closes[-1]" in src
     assert src.index("current_price = closes[-1]") < src.index("if kumo_size < max(atr * 1.0, current_price * 0.002):")
 
