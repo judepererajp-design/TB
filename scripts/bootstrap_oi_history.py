@@ -384,26 +384,36 @@ def _merge_clusters(
 ) -> List[Tuple[float, float, str]]:
     """
     Merge clusters that fall within `band_pct` of each other (default ±1%).
-    Price is the weighted average of merged members; USD size is summed;
-    side is taken from the member with the largest USD contribution.
+    Price is the weighted average of merged members; USD size is summed.
+
+    "above" and "below" clusters are merged in separate passes so that a
+    larger cluster of the opposite side can never flip the side label of a
+    running band mid-merge — which would produce a level assigned to the
+    wrong direction.
     """
     if not clusters:
         return []
-    sorted_c = sorted(clusters, key=lambda x: x[0])
-    merged: List[Tuple[float, float, str]] = []
-    band_price, band_usd, band_side = sorted_c[0]
-    for price, usd, side in sorted_c[1:]:
-        if abs(price - band_price) / band_price <= band_pct:
-            total_usd  = band_usd + usd
-            band_price = (band_price * band_usd + price * usd) / total_usd
-            if usd > band_usd:
-                band_side = side
-            band_usd = total_usd
-        else:
-            merged.append((band_price, band_usd, band_side))
-            band_price, band_usd, band_side = price, usd, side
-    merged.append((band_price, band_usd, band_side))
-    return merged
+
+    def _merge_one_side(group: List[Tuple[float, float, str]]) -> List[Tuple[float, float, str]]:
+        if not group:
+            return []
+        sorted_g = sorted(group, key=lambda x: x[0])
+        out: List[Tuple[float, float, str]] = []
+        band_price, band_usd, band_side = sorted_g[0]
+        for price, usd, side in sorted_g[1:]:
+            if abs(price - band_price) / band_price <= band_pct:
+                total_usd  = band_usd + usd
+                band_price = (band_price * band_usd + price * usd) / total_usd
+                band_usd   = total_usd
+            else:
+                out.append((band_price, band_usd, band_side))
+                band_price, band_usd, band_side = price, usd, side
+        out.append((band_price, band_usd, band_side))
+        return out
+
+    above = [c for c in clusters if c[2] == "above"]
+    below = [c for c in clusters if c[2] == "below"]
+    return _merge_one_side(above) + _merge_one_side(below)
 
 
 # ── Build liquidation clusters from enriched history ──────────────────────────

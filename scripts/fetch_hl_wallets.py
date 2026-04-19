@@ -34,7 +34,7 @@ try:
                 else:
                     r = requests.get(url, headers=headers or {}, timeout=timeout)
                 if r.status_code == 429:
-                    wait = int(r.headers.get("Retry-After", 10))
+                    wait = min(60, int(r.headers.get("Retry-After", 10)))
                     print(f"  ⏳ Rate limited (429), retrying in {wait}s...")
                     time.sleep(wait)
                     continue
@@ -61,7 +61,7 @@ except ImportError:
                     return json.loads(resp.read())
             except urllib.error.HTTPError as e:
                 if e.code == 429:
-                    wait = int(e.headers.get("Retry-After", 10))
+                    wait = min(60, int(e.headers.get("Retry-After", 10)))
                     print(f"  ⏳ Rate limited (429), retrying in {wait}s...")
                     time.sleep(wait)
                 elif attempt < retries - 1:
