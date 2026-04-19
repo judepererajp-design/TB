@@ -15,6 +15,7 @@ Uses patterns/wyckoff.py WyckoffAnalyzer for phase detection.
 """
 
 import logging
+import time
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -26,6 +27,12 @@ from utils.formatting import fmt_price
 from utils.risk_params import rp, compute_vol_percentile
 
 logger = logging.getLogger(__name__)
+
+# ── W-3+: Module-level failure rate counter ───────────────────────────────────
+# Tracks analyzer call outcomes so we can detect systemic failure spikes without
+# needing a full external metrics backend.
+_wyckoff_stats: Dict[str, float] = {"failures": 0.0, "total": 0.0}
+_STATS_LOG_INTERVAL = 50  # log failure rate every N total calls
 
 
 class WyckoffAccDist(BaseStrategy):
@@ -91,18 +98,40 @@ class WyckoffAccDist(BaseStrategy):
         confidence_base = getattr(self._cfg, "confidence_base", 76)
 
         # ── Run Wyckoff analysis ───────────────────────────────────────────
+        _wyckoff_stats["total"] += 1
         try:
             from patterns.wyckoff import WyckoffAnalyzer, WyckoffPhase
             analyzer = WyckoffAnalyzer()
             result   = analyzer.analyze(ohlcv, timeframe=tf)
         except Exception as e:
-            logger.warning(f"WyckoffAccDist: WyckoffAnalyzer error for {symbol}: {e}")
+            _wyckoff_stats["failures"] += 1
+            # W-3+: log failure rate periodically so ops can detect systemic issues
+            _t = _wyckoff_stats["total"]
+            if _t > 0 and int(_t) % _STATS_LOG_INTERVAL == 0:
+                rate = _wyckoff_stats["failures"] / _t
+                logger.warning(
+                    f"WyckoffAnalyzer failure rate: {rate:.1%} "
+                    f"({int(_wyckoff_stats['failures'])}/{int(_t)} calls) — "
+                    f"last error: {e}"
+                )
+            else:
+                logger.warning(f"WyckoffAccDist: WyckoffAnalyzer error for {symbol}: {e}")
             return None
 
         if result is None:
             return None
 
         phase = result.phase
+
+        # W-Q1: Meta-confidence gate — reject low-conviction analyzer outputs.
+        # If the pattern detector itself is uncertain, don't trade it.
+        _min_analyzer_confidence = getattr(self._cfg, "min_analyzer_confidence", 60)
+        if result.confidence < _min_analyzer_confidence:
+            logger.debug(
+                f"WyckoffAccDist {symbol}: analyzer confidence {result.confidence:.0f} "
+                f"< min {_min_analyzer_confidence} — skipping"
+            )
+            return None
 
         # ── Phase gate — only act on Phase C and D ─────────────────────────
         from patterns.wyckoff import WyckoffPhase as WP
@@ -136,6 +165,11 @@ class WyckoffAccDist(BaseStrategy):
             confidence += 8
         if result.utad_detected:
             confidence += 8
+        # W-Q2: real Wyckoff volume narrative bonuses
+        if result.volume_contraction_in_range:
+            confidence += 8    # volume contracted during range — institutional narrative ✔
+        if result.dryup_before_event:
+            confidence += 5    # dry-up → expansion sequence confirmed
 
         # ── W-1: Direction-aware regime bonus/penalty ─────────────────────
         _is_with_trend = (
@@ -146,6 +180,11 @@ class WyckoffAccDist(BaseStrategy):
             regime_bonus = self._REGIME_CONF_WITH_TREND.get(regime, 0)
         else:
             regime_bonus = self._REGIME_CONF_COUNTER_TREND.get(regime, 0)
+            # Regime scaling: high-conviction phase signals (analyzer ≥ 80) earn a partial
+            # reprieve — a genuine Spring at macro support is not the same as a random
+            # counter-trend guess.  Still penalised, just less harshly.
+            if result.confidence >= 80:
+                regime_bonus += 4
         confidence += regime_bonus
 
         # ── Entry zone from WyckoffResult ──────────────────────────────────
@@ -156,9 +195,12 @@ class WyckoffAccDist(BaseStrategy):
         wy_stop_loss = result.stop_loss
         current_price = closes[-1]
 
-        # W-2: Tighten staleness check — entry zone must be reachable
+        # W-2+: Dynamic staleness — tighten in high-vol regimes to avoid chasing
+        # Compute vol_percentile early so we can use it for both staleness and TPs
+        vp = compute_vol_percentile(highs, lows, closes)
         _staleness_atr = getattr(self._cfg, "entry_staleness_atr", 2)
-        if abs(current_price - (wy_entry_low + wy_entry_high) / 2) > atr * _staleness_atr:
+        _staleness_mult = 0.75 if vp >= 0.70 else 1.0   # tighter in high-vol environments
+        if abs(current_price - (wy_entry_low + wy_entry_high) / 2) > atr * _staleness_atr * _staleness_mult:
             return None
 
         # W-Q4: Phase D requires Phase E onset — price must break the range boundary
@@ -174,7 +216,7 @@ class WyckoffAccDist(BaseStrategy):
 
         _sl_atr_max = getattr(self._cfg, "sl_atr_max", 3)
         _swing_lookback = getattr(self._cfg, "swing_lookback_bars", 50)
-        vp = compute_vol_percentile(highs, lows, closes)
+        # vp already computed above for staleness check
         if direction == "LONG":
             entry_low   = wy_entry_low
             entry_high  = wy_entry_high
@@ -243,6 +285,10 @@ class WyckoffAccDist(BaseStrategy):
                 confluence.append(f"   {note}")
         if result.volume_confirms:
             confluence.append("✅ Volume confirms the Wyckoff phase")
+        if result.volume_contraction_in_range:
+            confluence.append("✅ Volume contracted in range — institutional accumulation/distribution")
+        if result.dryup_before_event:
+            confluence.append("✅ Volume dry-up → expansion — textbook Wyckoff sequence")
         if result.spring_detected:
             confluence.append("✅ Spring detected — stop hunt below range support")
         if result.utad_detected:
@@ -272,6 +318,8 @@ class WyckoffAccDist(BaseStrategy):
                 "spring_detected": result.spring_detected,
                 "utad_detected": result.utad_detected,
                 "volume_confirms": result.volume_confirms,
+                "volume_contraction_in_range": result.volume_contraction_in_range,
+                "dryup_before_event": result.dryup_before_event,
                 "wyckoff_confidence": result.confidence,
                 "key_level": result.key_level,
                 "atr": atr,
