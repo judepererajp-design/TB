@@ -210,8 +210,8 @@ strategies:
       lookback_swings: 20
       min_break_pct: 0.002
     order_blocks:
-      min_impulse_pct: 0.008
-      max_ob_age_bars: 50
+      min_impulse_pct: 0.5          # fraction of ATR the impulse body must exceed (was 0.008 × OB body — too loose)
+      max_ob_age_bars: 20           # max bars since OB formation (was 50 — 8+ days on 4h is too stale)
       require_volume_spike: true
       volume_spike_mult: 1.5
     fvg:
@@ -222,11 +222,11 @@ strategies:
       lookback: 30
       min_wick_pct: 0.003
     killzones:
-      london_open: [7, 10]
-      ny_open: [12, 15]
-      london_close: [15, 17]
-      asia_open: [0, 3]
-      killzone_bonus: 10
+      asia_open: [2, 4]             # Asia session: 02:00-04:00 UTC (2h)
+      london_open: [7, 9]           # London open: 07:00-09:00 UTC (2h)
+      ny_open: [13, 15]             # NY open: 13:00-15:00 UTC (2h)
+      london_close: [15, 17]        # London close: 15:00-17:00 UTC (2h, overlaps NY)
+      killzone_bonus: 10            # total active ~8h vs prior 14h (was >50% of day)
 
   breakout:
     enabled: true
