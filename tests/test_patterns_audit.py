@@ -226,7 +226,7 @@ def test_phase3_wyckoff_spring_recovery_volume_counts_as_confirmation():
     closes[24] = 99.0          # no same-bar recovery
     closes[25] = 100.4         # next-bar recovery
     volumes[24] = 110.0        # no event-bar spike
-    volumes[25] = 120.0        # recovery-bar spike at 0.8 × sensitivity
+    volumes[25] = 120.0        # recovery-bar spike; clears the 100 * 1.1 * 0.8 threshold
 
     spring = a._detect_spring(
         highs, lows, closes, volumes,

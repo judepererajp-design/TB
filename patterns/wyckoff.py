@@ -558,6 +558,8 @@ class WyckoffAnalyzer:
                     # Default to False when the recovery is same-bar (no next
                     # bar to evaluate) so the caller can still rely on the
                     # spring-bar spike alone.
+                    # Same-bar recovery has no distinct "recovery bar"; only use
+                    # the next bar when the bounce first confirms there.
                     recovery_bar = (i + 1) if (not recovered_same and recovered_next) else None
                     recovery_vol_spike = False
                     if recovery_bar is not None and 0 <= recovery_bar < len(volumes):
@@ -597,6 +599,8 @@ class WyckoffAnalyzer:
                                  closes[i + 1] < range_high - rej_threshold)
                 if rejected_same or rejected_next:
                     volume_spike = volumes[i] > avg_volume * self._vol_sensitivity
+                    # Same-bar rejection has no distinct "rejection bar"; only use
+                    # the next bar when the failure first confirms there.
                     rejection_bar = (i + 1) if (not rejected_same and rejected_next) else None
                     rejection_vol_spike = False
                     if rejection_bar is not None and 0 <= rejection_bar < len(volumes):
