@@ -175,13 +175,19 @@ class WhaleAggregator:
 
         threshold = self._min_usd_for_telegram
         try:
-            # Read 24h quote volume from the scanner/price cache when available.
-            # Be defensive — this helper must never raise during flush.
-            from core.price_cache import price_cache as _pc
+            # Read 24h quote volume from the scanner — Scanner tracks
+            # volume_24h per-symbol in SymbolState (populated from exchange
+            # tickers).  PriceCache does not expose 24h volume, only spot
+            # price, so use the scanner as the source of truth.  Defensive
+            # — this helper must never raise during flush.
             vol_24h = 0.0
-            getter = getattr(_pc, 'get_24h_volume', None)
-            if callable(getter):
-                vol_24h = float(getter(symbol) or 0.0)
+            try:
+                from scanner.scanner import scanner as _sc
+                _st = getattr(_sc, '_symbols', {}).get(symbol)
+                if _st is not None:
+                    vol_24h = float(getattr(_st, 'volume_24h', 0.0) or 0.0)
+            except Exception:
+                vol_24h = 0.0
             if vol_24h > 0:
                 # 0.5% of 24h volume (small enough that alts qualify, large
                 # enough that BTC/ETH need genuine six-figure prints).
