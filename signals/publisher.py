@@ -26,6 +26,7 @@ from config.loader import cfg
 from data.database import db
 from signals.aggregator import ScoredSignal
 from signals.upgrade_tracker import upgrade_tracker
+from strategies.base import direction_str
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,7 @@ class SignalPublisher:
             return False
 
         sig = scored.base_signal
-        direction = getattr(sig.direction, 'value', str(sig.direction)) if hasattr(sig.direction, 'value') else str(sig.direction)
+        direction = direction_str(sig) if hasattr(sig.direction, 'value') else str(sig.direction)
 
         # ── 1. Save to database first (always) ───────────────────────
         signal_record = {

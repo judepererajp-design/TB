@@ -15,7 +15,7 @@ import logging
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 
-from strategies.base import SignalResult, SignalDirection
+from strategies.base import SignalResult, SignalDirection, direction_str
 from config.loader import cfg
 
 logger = logging.getLogger(__name__)
@@ -124,7 +124,7 @@ class ConfluenceScorer:
         _active_weak_voters = set(self.WEAK_VOTERS)
         if whale_dominant_side:
             for sig in signals:
-                if sig.strategy == 'FundingRateArb' and getattr(sig.direction, 'value', str(sig.direction)) == whale_dominant_side:
+                if sig.strategy == 'FundingRateArb' and direction_str(sig) == whale_dominant_side:
                     _active_weak_voters.discard('FundingRateArb')
                     sig.confidence = min(99, sig.confidence + 8)  # reward alignment
                     result.confluence_notes.append(

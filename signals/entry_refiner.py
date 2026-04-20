@@ -21,6 +21,7 @@ import logging
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 from utils.formatting import fmt_price
+from strategies.base import direction_str, is_long
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +138,7 @@ class EntryRefiner:
         not the breakout candle close. This gives better R:R and reduces
         false breakout losses.
         """
-        direction = getattr(signal.direction, 'value', str(signal.direction))
+        direction = direction_str(signal)
 
         if direction == "LONG":
             # Breakout level = the resistance that was broken
@@ -187,7 +188,7 @@ class EntryRefiner:
         For reversals: entry zone should be the wick rejection zone,
         not a fixed ATR offset around current price.
         """
-        direction = getattr(signal.direction, 'value', str(signal.direction))
+        direction = direction_str(signal)
 
         if direction == "LONG":
             # Rejection zone = the area where wicks were rejected (recent lows)
@@ -230,7 +231,7 @@ class EntryRefiner:
         Snap entry zone edges to nearest structural level when close.
         Also add confluence notes for VWAP/POC alignment.
         """
-        direction = getattr(signal.direction, 'value', str(signal.direction))
+        direction = direction_str(signal)
         entry_mid = (signal.entry_low + signal.entry_high) / 2
         if entry_mid <= 0:
             return signal  # Cannot align with zero/negative entry price
@@ -305,7 +306,7 @@ class EntryRefiner:
         if len(closes) < 3:
             return True  # Can't check, assume confirmed
 
-        direction = getattr(signal.direction, 'value', str(signal.direction))
+        direction = direction_str(signal)
 
         if direction == "LONG":
             # Higher low check
@@ -436,7 +437,7 @@ class EntryRefiner:
             signal.rr_ratio = 0.0
             return signal
         # Validate tp2 is on the correct side of entry_mid before computing reward
-        is_long = getattr(signal.direction, 'value', str(signal.direction)) == "LONG"
+        is_long = is_long(signal)
         tp2_valid = (
             signal.tp2 is not None and
             signal.tp2 > 0 and
@@ -461,7 +462,7 @@ class EntryRefiner:
         """
         try:
             import numpy as _np
-            direction = getattr(signal.direction, 'value', str(signal.direction))
+            direction = direction_str(signal)
 
             # Quick ATR estimate from recent bars (last 14 candles)
             _h = _np.array([float(x) for x in highs[-15:]])

@@ -45,6 +45,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from analyzers.regime import regime_analyzer
+from strategies.base import direction_str
 
 logger = logging.getLogger(__name__)
 
@@ -288,7 +289,7 @@ class UpgradeTracker:
             (send_to_user: bool, up_score: float)
         """
         sig = scored.base_signal
-        direction = (getattr(sig.direction, 'value', str(sig.direction))
+        direction = (direction_str(sig)
                      if hasattr(sig.direction, 'value')
                      else str(sig.direction))
         regime = scored.regime or getattr(regime_analyzer.regime, 'value', 'UNKNOWN')
@@ -474,7 +475,7 @@ class UpgradeTracker:
           20% — Volume presence
         """
         sig = scored.base_signal
-        direction = (getattr(sig.direction, 'value', str(sig.direction))
+        direction = (direction_str(sig)
                      if hasattr(sig.direction, 'value')
                      else str(sig.direction))
         regime = scored.regime or getattr(regime_analyzer.regime, 'value', 'UNKNOWN')
@@ -516,7 +517,7 @@ class UpgradeTracker:
         we also score whether confluence, confidence, and orderflow are growing.
         """
         sig = scored.base_signal
-        direction = (getattr(sig.direction, 'value', str(sig.direction))
+        direction = (direction_str(sig)
                      if hasattr(sig.direction, 'value')
                      else str(sig.direction))
         scan_key = f"{sig.symbol}|{sig.strategy}|{direction}"
@@ -716,7 +717,7 @@ class UpgradeTracker:
         if not self._db:
             return
         sig = scored.base_signal
-        direction = (getattr(sig.direction, 'value', str(sig.direction))
+        direction = (direction_str(sig)
                      if hasattr(sig.direction, 'value')
                      else str(sig.direction))
         regime = scored.regime or getattr(regime_analyzer.regime, 'value', 'UNKNOWN')
