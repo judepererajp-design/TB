@@ -51,17 +51,28 @@ class SignalClarityScorer:
     Low score = wide entry, floating stop, mixed indicators.
     """
 
-    def score(self, signal, atr: float) -> ClarityResult:
+    def score(self, signal, atr: float, *, prob_win: float = None) -> ClarityResult:
         """
         Score signal clarity. 'signal' should have:
             entry_low, entry_high, stop_loss, take_profit_1, take_profit_2,
             rr_ratio, confluence (list of str)
+
+        FIX Q10: `prob_win` may be supplied in [0.0, 1.0].  When provided, the
+        RR-based bonus is blended with expectancy so a +8R/15%WR trade doesn't
+        score the same as a +2R/55%WR trade.  When omitted (current callers),
+        behaviour is unchanged.
         """
         total_score = 100
         reasons: List[str] = []
 
         entry_mid = (signal.entry_low + signal.entry_high) / 2.0
-        entry_width = signal.entry_high - signal.entry_low
+        # FIX B11: guard against inverted entry zones (entry_high < entry_low).
+        # Previously this produced a negative `width_pct` that fell through
+        # every branch of the ATR-width check silently, leading to a deceptive
+        # "clean" score on a broken signal.  Take max(0, ...) so an inverted
+        # zone is treated as width 0 (will be flagged by aggregator geometry
+        # checks anyway) and remains numerically safe for downstream math.
+        entry_width = max(0.0, signal.entry_high - signal.entry_low)
 
         # ── 1. Entry zone width (relative to ATR) ──────────────────────
         if atr > 0 and entry_width > 0:
@@ -82,7 +93,25 @@ class SignalClarityScorer:
 
         # ── 2. RR ratio clarity ─────────────────────────────────────────
         rr = getattr(signal, 'rr_ratio', 0)
-        if rr >= 2.5:
+        # FIX Q10: blend with prob_win when available to score expectancy-R
+        # rather than raw RR.  A +8R/15% setup (EV = 1.2R) shouldn't outrank
+        # a +2.5R/55% setup (EV = 1.375R).
+        if prob_win is not None and 0.0 < prob_win < 1.0 and rr > 0:
+            ev_r = rr * prob_win - (1.0 - prob_win)  # assumes −1R on loss
+            if ev_r >= 1.5:
+                reasons.append(f"✅ Strong expectancy ({ev_r:+.2f}EV-R, RR={rr:.1f})")
+                total_score += 5
+            elif ev_r >= 0.6:
+                reasons.append(f"✅ Good expectancy ({ev_r:+.2f}EV-R, RR={rr:.1f})")
+            elif ev_r >= 0.2:
+                deduct = 8
+                total_score -= deduct
+                reasons.append(f"⚠️ Weak expectancy ({ev_r:+.2f}EV-R) −{deduct}pts")
+            else:
+                deduct = 20
+                total_score -= deduct
+                reasons.append(f"🚫 Poor expectancy ({ev_r:+.2f}EV-R) −{deduct}pts")
+        elif rr >= 2.5:
             reasons.append(f"✅ Strong RR ({rr:.1f}R)")
             total_score += 5
         elif rr >= 1.8:
@@ -124,21 +153,55 @@ class SignalClarityScorer:
 
         # ── 4. Conflicting indicators ────────────────────────────────────
         confluence = getattr(signal, 'confluence', [])
-        # Conflict detection uses direction-specific keywords.
-        # 'sweep' is intentionally excluded — a sweep note is always directionally aligned
-        # (swept_low = bullish, swept_high = bearish) so it never indicates conflict.
-        conflict_keywords_long  = ['bearish', 'short', 'resistance', 'rejection', 'bear']
-        conflict_keywords_short = ['bullish', 'long', 'support', 'bounce', 'bull']
+        # FIX B10: conflict detection must use word-boundary matches.  The
+        # previous substring match on 'bear'/'bull' flagged legitimately
+        # supportive notes like "bearish divergence failed" or "bear trap
+        # confirmed" as conflicts, causing spurious −8 penalties per note.
+        # Switch to a regex with \b word boundaries and skip notes that are
+        # explicitly-affirming ('✅') or contain anti-pattern markers.
+        import re as _re
+        conflict_kw_long  = ('bearish', 'resistance', 'rejection', 'bear trap', 'bear_div')
+        conflict_kw_short = ('bullish', 'support', 'bounce',       'bull trap', 'bull_div')
+        # Treat ambiguous single-word directional tokens conservatively:
+        # require either an explicit directional marker or a qualifier word
+        # so 'short-term' doesn't flag a LONG signal.
+        _SHORT_TOKEN_PAT = _re.compile(r'(?i)\b(short[-\s]signal|going\s+short)\b')
+        _LONG_TOKEN_PAT  = _re.compile(r'(?i)\b(long[-\s]signal|going\s+long)\b')
+
+        # Anti-pattern markers: these phrases contain a conflict keyword but
+        # mean the opposite — e.g. "bearish divergence invalidated" is NOT a
+        # bearish signal, it's a bullish one.  Exclude notes that contain any.
+        _ANTI_PATTERNS = (
+            'invalidated', 'failed', 'rejected', 'false', 'trap',
+            'broken', 'disproven', 'cancelled', 'canceled',
+        )
+
         direction = getattr(signal, 'direction', None)
         direction_val = direction.value if hasattr(direction, 'value') else str(direction)
 
-        conflict_kw = conflict_keywords_long if direction_val == "LONG" else conflict_keywords_short
-        conflicts = [
-            note for note in confluence
-            if isinstance(note, str)
-               and any(kw in note.lower() for kw in conflict_kw)
-               and not note.startswith('✅')  # Don't flag positive confluence
-        ]
+        if direction_val == "LONG":
+            kw_list = conflict_kw_long
+            opposite_token = _SHORT_TOKEN_PAT
+        else:
+            kw_list = conflict_kw_short
+            opposite_token = _LONG_TOKEN_PAT
+        kw_pat = _re.compile(
+            r'(?i)\b(' + '|'.join(_re.escape(k) for k in kw_list) + r')\b'
+        )
+
+        conflicts = []
+        for note in confluence:
+            if not isinstance(note, str):
+                continue
+            low = note.lower()
+            if note.startswith('✅') or low.startswith('✅'):
+                continue
+            # Skip notes where the conflict keyword is negated by an anti-pattern
+            if any(anti in low for anti in _ANTI_PATTERNS):
+                continue
+            if kw_pat.search(note) or opposite_token.search(note):
+                conflicts.append(note)
+
         if conflicts:
             deduct = min(25, len(conflicts) * 8)
             total_score -= deduct

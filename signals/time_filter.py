@@ -54,6 +54,17 @@ class TimeFilter:
         hour = now.hour
         weekday = now.weekday()  # 0=Monday, 6=Sunday
 
+        # ── FIX Q1: Macro-event dead-zones ────────────────────
+        # Around US CPI / FOMC / NFP releases and major monthly options
+        # expiries, crypto correlates tightly with macro flows and most
+        # technical setups wash out in the volatility spike.  A soft
+        # penalty is applied via `_macro_event_adjustment` if we're inside
+        # one of those windows AND the heuristic considers it imminent.
+        _macro_penalty, _macro_reason = self._macro_event_adjustment(now, grade)
+        if _macro_penalty <= -25 and grade in ("B", "C"):
+            # Heavy-penalty near-block for weak grades in macro windows.
+            return False, _macro_penalty, _macro_reason
+
         # ── Sunday dead period ────────────────────────────────
         # R7-B4: Changed from hard-block to heavy penalties for B/C grades.
         # Saturday uses penalties; Sunday should be consistent.
@@ -71,13 +82,18 @@ class TimeFilter:
         # ── Saturday (T11: weekend low-volume filter) ─────────────────────────
         # Crypto trades 24/7 but weekend volumes are 20-30% lower with wider spreads.
         # Grade-aware penalties: strong multi-strategy signals survive, thin ones don't.
+        # FIX Q13: weekend penalties are regime-aware.  A clean BULL_TREND on
+        # a Saturday is much less dangerous than CHOPPY/VOLATILE — trend trades
+        # respect the macro structure, while mean-reversion trades need the
+        # fuller weekday tape.  Amplify penalties in risk-off regimes.
         if weekday == 5:
+            _regime_mult = self._weekend_regime_multiplier()
             if grade == "C":
-                return False, -20, "⚠️ Saturday C-grade — heavy confidence penalty"
+                return False, int(-20 * _regime_mult), "⚠️ Saturday C-grade — heavy confidence penalty"
             elif grade in ("B", "B+"):
-                return False, -14, "⚠️ Saturday B-grade — moderate confidence penalty"
+                return False, int(-14 * _regime_mult), "⚠️ Saturday B-grade — moderate confidence penalty"
             else:  # A or A+
-                return False, -8, "⚠️ Saturday A-grade — light confidence penalty"
+                return False, int(-8 * _regime_mult), "⚠️ Saturday A-grade — light confidence penalty"
 
         # ── Weekday dead zone (03:00-07:00 UTC) ──────────────
         # R7-B4: Changed from hard-block to heavy penalties for consistency.
@@ -111,9 +127,13 @@ class TimeFilter:
                 break
 
         if in_killzone:
+            if _macro_penalty:
+                return False, 5 + _macro_penalty, f"⏰ Killzone active — prime time ({_macro_reason})"
             return False, 5, "⏰ Killzone active — prime time"
 
         # ── Outside killzone (not dead zone) ──────────────────
+        if _macro_penalty:
+            return False, -8 + _macro_penalty, f"📊 Outside killzone — moderate reduction ({_macro_reason})"
         return False, -8, "📊 Outside killzone — moderate reduction"
 
     def is_killzone(self) -> bool:
@@ -141,6 +161,78 @@ class TimeFilter:
         return "Off-Session"
 
     # ── Session-aware liquidity model (PR4 items 9 + 10) ──────
+
+    def _weekend_regime_multiplier(self) -> float:
+        """
+        FIX Q13: multiplier applied to weekend penalty magnitudes based on
+        current regime.  CHOPPY / VOLATILE weekends deserve harsher penalties
+        than a clean trend weekend — trend-following trades in BULL/BEAR
+        still have macro structure to respect, while mean-reversion in a
+        low-volume weekend range is a coin flip.
+
+        Returns 1.0 if the regime is unavailable.  Capped at 1.5 so a
+        regime multiplier can never make an A-grade weekend A penalty
+        (−8) exceed a C-grade one (−20).
+        """
+        try:
+            from analyzers.regime import regime_analyzer
+            regime = getattr(regime_analyzer.regime, "value", "UNKNOWN")
+            if regime in ("CHOPPY", "VOLATILE"):
+                return 1.5
+            if regime in ("BULL_TREND", "BEAR_TREND"):
+                return 0.85  # trend weekends are slightly less punitive
+            return 1.0
+        except Exception:
+            return 1.0
+
+    def _macro_event_adjustment(
+        self, now: datetime, grade: str
+    ) -> Tuple[int, str]:
+        """
+        FIX Q1: return a macro-event confidence adjustment when the UTC clock
+        falls inside a historically-volatile macro window.
+
+        Heuristics (schedule-free, conservative):
+          • US CPI: 12:30 UTC, 2nd/3rd Wednesday of the month (±30min)
+          • FOMC decision: 18:00 UTC, Wednesday of 3rd full week (±60min)
+          • NFP: 12:30 UTC, first Friday of the month (±30min)
+          • Options monthly expiry: 08:00 UTC, last Friday of the month (±90min)
+
+        Without a live economic-calendar feed we can't be surgical.  This
+        module intentionally uses only calendar heuristics — better to
+        soft-penalise across the whole window than miss the event entirely.
+        Returns (penalty_pts, reason_str); (0, "") when no window matches.
+        """
+        minute = now.minute
+        hour = now.hour
+        weekday = now.weekday()          # 0=Mon … 6=Sun
+        day_of_month = now.day
+
+        # Helper: absolute minute-offset vs target (H, M) on same day.
+        def _mins_to(h: int, m: int) -> int:
+            return abs((hour - h) * 60 + (minute - m))
+
+        # NFP: first Friday 12:30 UTC ±30min
+        if weekday == 4 and 1 <= day_of_month <= 7 and _mins_to(12, 30) <= 30:
+            return (-30, "⚠️ NFP window — macro event imminent, signals heavily reduced")
+
+        # CPI: 2nd Wed of month, 12:30 UTC ±30min.  Roughly days 8-14.
+        if weekday == 2 and 8 <= day_of_month <= 14 and _mins_to(12, 30) <= 30:
+            return (-30, "⚠️ CPI window — macro event imminent, signals heavily reduced")
+
+        # FOMC: 3rd Wed of month, 18:00 UTC ±60min (use days 15-21 as proxy).
+        if weekday == 2 and 15 <= day_of_month <= 21 and _mins_to(18, 0) <= 60:
+            return (-35, "⚠️ FOMC window — rate decision imminent, signals heavily reduced")
+
+        # Monthly options expiry: last Friday of month, 08:00 UTC ±90min.
+        # Last Friday is day >= 22 and weekday 4.
+        if weekday == 4 and day_of_month >= 22 and _mins_to(8, 0) <= 90:
+            # A-grade gets a light tap; lower grades take a heavier hit.
+            if grade in ("A", "A+"):
+                return (-6, "📉 Monthly options expiry — pin risk, slight confidence cut")
+            return (-15, "⚠️ Monthly options expiry — pin risk, signal penalised")
+
+        return (0, "")
 
     def expected_spread_multiplier(self) -> float:
         """

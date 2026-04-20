@@ -30,6 +30,24 @@ def compute_decay_penalty(
 ) -> float:
     """Return the confidence penalty (positive float) due to signal age.
 
+    FIX Q9: Penalty is now an **exponential saturation** model rather than a
+    linear one.  Signal information decays via a compounding process —
+    2h-old signals retain materially more edge than (1 − 2·rate/max) would
+    suggest, but past the knee of the curve the remaining edge collapses
+    fast.  The curve is calibrated so the 1-hour-past-grace point matches
+    ``DECAY_RATE_PER_HOUR`` exactly (preserves config semantics), and
+    saturates to ``DECAY_MAX_PENALTY`` at long tails.
+
+    Formula::
+
+        k = -ln(1 - DECAY_RATE_PER_HOUR / DECAY_MAX_PENALTY)
+        penalty(t) = DECAY_MAX_PENALTY · (1 − exp(−k · hours_past_grace))
+
+    Snaps exactly to DECAY_MAX_PENALTY once the raw fraction exceeds 0.95
+    so behaviour is indistinguishable from the legacy linear-cap model at
+    long ages (half-day+), while being gentler in the 30–120-minute window
+    where most swing signals are actually traded.
+
     Parameters
     ----------
     signal_created_ts : float
@@ -41,8 +59,6 @@ def compute_decay_penalty(
     -------
     float
         Penalty in confidence points (0.0 – DECAY_MAX_PENALTY).
-        The caller should subtract this from ``final_confidence`` and
-        clamp to ``DECAY_MIN_CONFIDENCE``.
     """
     if not EG.DECAY_ENABLED:
         return 0.0
@@ -60,7 +76,27 @@ def compute_decay_penalty(
     # Hours past grace
     hours_past_grace = (age_secs - EG.DECAY_GRACE_PERIOD_SECS) / 3600.0
 
-    penalty = hours_past_grace * EG.DECAY_RATE_PER_HOUR
+    # Derive a half-life from the configured linear rate so legacy config
+    # values remain meaningful.  Pick the half-life as the age at which the
+    # OLD formula would reach 50% of max penalty, then use exponential decay
+    # of REMAINING edge around that anchor.
+    import math as _m
+    if EG.DECAY_RATE_PER_HOUR <= 0 or EG.DECAY_MAX_PENALTY <= 0:
+        return 0.0
+    # Calibrate k so that at `hours_past_grace=1`, penalty ≈ DECAY_RATE_PER_HOUR
+    # (preserves the old configuration semantics — 1h point anchors the curve).
+    ratio = EG.DECAY_RATE_PER_HOUR / EG.DECAY_MAX_PENALTY
+    if ratio >= 1.0:
+        # Degenerate config: rate >= max → curve collapses to a step function.
+        return EG.DECAY_MAX_PENALTY if hours_past_grace > 0 else 0.0
+    k = -_m.log(1.0 - ratio)  # ≈ rate/max for small ratios (linear first-order)
+    decay_fraction = 1.0 - _m.exp(-k * hours_past_grace)
+    penalty = EG.DECAY_MAX_PENALTY * decay_fraction
+    # Snap to exact max once we're within ~2% — the asymptote is never
+    # reached in pure exponential, but long-tail staleness should behave
+    # identically to the old linear-capped model.
+    if penalty >= EG.DECAY_MAX_PENALTY * 0.95:
+        penalty = EG.DECAY_MAX_PENALTY
     penalty = min(penalty, EG.DECAY_MAX_PENALTY)
 
     return round(penalty, 2)

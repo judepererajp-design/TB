@@ -54,9 +54,17 @@ def has_reversal_confirmation(
     if direction not in {"LONG", "SHORT"}:
         return False
 
-    structure = dict((setup_context or {}).get("structure") or {})
-    pattern = dict((setup_context or {}).get("pattern") or {})
-    trade = dict((execution_context or {}).get("trade") or {})
+    # FIX B9: the previous `dict((setup_context or {}).get("structure") or {})`
+    # idiom raised TypeError when callers passed a non-dict (e.g. a list or
+    # custom object) into `structure`/`pattern`/`trade`.  Defensively coerce
+    # to a dict only when the value is actually mapping-like, else fall back
+    # to {} so the rest of the function can treat every branch uniformly.
+    def _as_dict(raw) -> dict:
+        return raw if isinstance(raw, dict) else {}
+
+    structure = _as_dict((setup_context or {}).get("structure"))
+    pattern = _as_dict((setup_context or {}).get("pattern"))
+    trade = _as_dict((execution_context or {}).get("trade"))
 
     choch_direction = direction_str(structure.get("choch_direction")).upper()
     if structure.get("choch"):

@@ -436,16 +436,29 @@ class EntryRefiner:
         if risk <= 1e-10:
             signal.rr_ratio = 0.0
             return signal
-        # Validate tp2 is on the correct side of entry_mid before computing reward
-        is_long = is_long(signal)
-        tp2_valid = (
-            signal.tp2 is not None and
-            signal.tp2 > 0 and
-            ((is_long and signal.tp2 > entry_mid) or
-             (not is_long and signal.tp2 < entry_mid))
-        )
-        if tp2_valid:
-            reward = abs(signal.tp2 - entry_mid)
+        # Validate TP is on the correct side of entry_mid before computing reward.
+        # FIX B1: previously `is_long = is_long(signal)` shadowed the imported
+        # helper as a local and raised UnboundLocalError — silently swallowed
+        # by the caller's broad try/except, leaving R:R stale.
+        # FIX Q16: fall back to tp1 / tp3 when tp2 is missing or geometrically
+        # invalid so tp1-only strategies (scalpers) aren't killed by a 0 R:R.
+        _is_long = is_long(signal)
+
+        def _tp_valid(tp) -> bool:
+            if tp is None or tp <= 0:
+                return False
+            return (tp > entry_mid) if _is_long else (tp < entry_mid)
+
+        chosen_tp = None
+        for tp in (getattr(signal, 'tp2', None),
+                   getattr(signal, 'tp1', None),
+                   getattr(signal, 'tp3', None)):
+            if _tp_valid(tp):
+                chosen_tp = tp
+                break
+
+        if chosen_tp is not None:
+            reward = abs(chosen_tp - entry_mid)
             signal.rr_ratio = round(reward / risk, 2)
         else:
             signal.rr_ratio = 0.0

@@ -374,9 +374,26 @@ class AdaptiveWeightManager:
         ]
         avg_return = sum(r_values) / len(r_values) if r_values else 0.0
 
-        # Max drawdown = worst single-trade R
-        min_r = min(r_values) if r_values else 0.0
-        max_drawdown = abs(min_r) if min_r < 0 else 0.0
+        # Max drawdown — previously computed as `abs(min_r)`, which only
+        # captures the *worst single trade*.  FIX Q4: use the peak-to-trough
+        # cumulative-R drawdown of the ordered trade sequence, which is the
+        # metric a trader actually cares about.  A source that grinds out
+        # +0.5R wins but occasionally lets a −1R through is very different
+        # from one that strings together five −1R in a row — the cumulative
+        # curve highlights the latter, the old metric treated both equally.
+        if r_values:
+            # Preserve the source_signals ordering (chronological per the
+            # input signals list) so "cumulative" has meaning.
+            running = 0.0
+            peak = 0.0
+            worst_drawdown = 0.0
+            for r in r_values:
+                running += r
+                peak = max(peak, running)
+                worst_drawdown = max(worst_drawdown, peak - running)
+            max_drawdown = worst_drawdown
+        else:
+            max_drawdown = 0.0
 
         # Score formula: (win_rate × avg_return) / max(drawdown, floor)
         denominator = max(max_drawdown, AWC.DRAWDOWN_FLOOR)

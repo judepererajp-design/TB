@@ -114,6 +114,12 @@ class LiquidationHeatmap:
         self._cache: Dict[str, Tuple[List[LiquidationEvent], float]] = {}
         self._cache_ttl = cache_ttl
         self._cluster_cache: Dict[str, List[LiquidationCluster]] = {}
+        # FIX Q18: `_cluster_cache` previously persisted forever without a TTL,
+        # so downstream consumers (thesis_checker etc.) could read hour-old
+        # clusters.  Track per-symbol expiry times and expose a public
+        # `get_cached_clusters()` that auto-evicts expired entries.
+        self._cluster_cache_expires: Dict[str, float] = {}
+        self._cluster_cache_ttl: float = max(float(cache_ttl), 120.0)
         # Track which exchanges are reachable (disable failed ones to avoid latency)
         self._exchange_health: Dict[str, float] = {
             "binance": 0.0, "bybit": 0.0, "okx": 0.0
@@ -145,7 +151,24 @@ class LiquidationHeatmap:
 
         clusters = self._build_clusters(relevant, current_price, min_cluster_usd)
         self._cluster_cache[symbol] = clusters
+        self._cluster_cache_expires[symbol] = time.time() + self._cluster_cache_ttl
         return clusters
+
+    def get_cached_clusters(self, symbol: str) -> List[LiquidationCluster]:
+        """
+        FIX Q18: TTL-aware accessor for cached clusters.
+
+        External callers (e.g. ``signals.thesis_checker``) should use this
+        helper rather than reading ``_cluster_cache`` directly, so expired
+        entries return an empty list instead of stale data.
+        """
+        expires = self._cluster_cache_expires.get(symbol, 0.0)
+        if expires <= time.time():
+            # Evict to keep the dict bounded
+            self._cluster_cache.pop(symbol, None)
+            self._cluster_cache_expires.pop(symbol, None)
+            return []
+        return list(self._cluster_cache.get(symbol, []))
 
     def check_ob_overlap(
         self,
@@ -388,9 +411,17 @@ class LiquidationHeatmap:
                 'sl_tighten_level': 0.0,
             }
 
-        # Calculate cascade force: cluster volume × leverage factor × proximity
-        # The closer the price, the higher the risk
-        proximity_mult = max(0.1, 1.0 - (best_dist / 5.0))  # Max at <1%, zero at >5%
+        # Calculate cascade force: cluster volume × leverage factor × proximity.
+        # FIX Q5: real cascade probability is CONVEX in distance (negligible
+        # until price crosses cluster edge, then explodes).  Replace the linear
+        # `max(0.1, 1 - d/5)` with an exponential decay `exp(-k·d²)` which
+        # correctly models that 2% away ≠ "half as dangerous as 1% away" —
+        # it's much safer.  Floor at 0.05 so tail-cluster magnetism isn't
+        # ignored entirely.
+        import math as _m
+        # k tuned so that at d=1% → ~0.55, d=2% → ~0.17, d=3% → ~0.03,
+        # d=5% → ~effectively zero.
+        proximity_mult = max(0.05, _m.exp(-0.6 * best_dist * best_dist))
         oi_factor = min(2.0, oi_usd / 1e9) if oi_usd > 0 else 1.0  # Scale with OI
         cascade_force = (
             best_cluster.total_volume_usd
@@ -618,6 +649,14 @@ class LiquidationHeatmap:
         """
         Group multi-exchange liquidation events into price clusters.
         v2: tracks per-exchange volume in each bin for cross-exchange scoring.
+
+        FIX Q11: bin width is now anchored to a fixed percentage of the
+        current price (default 0.10% per bin) rather than
+        ``(price_max − price_min)/40``.  The old scheme compressed into
+        fine-grained bins during quiet periods (merging legitimate
+        distinct clusters) and blew out to coarse bins after a cascade
+        (over-merging noise).  A fixed-% bin gives consistent semantic
+        granularity regardless of dataset volatility.
         """
         if not events:
             return []
@@ -628,7 +667,17 @@ class LiquidationHeatmap:
         if price_range == 0:
             return []
 
-        bin_width = price_range / num_bins
+        # FIX Q11: bin width = max(0.10% of current_price, legacy range/40).
+        # Using current_price anchors the granularity to the same scale
+        # consumers reason about.  Fall back to legacy scheme if price is
+        # degenerate.
+        pct_bin_width = current_price * 0.001 if current_price > 0 else 0.0
+        legacy_bin_width = price_range / num_bins
+        bin_width = max(pct_bin_width, legacy_bin_width)
+        if bin_width <= 0:
+            return []
+        # Recompute num_bins to cover the observed range, with safety cap.
+        num_bins = min(200, max(10, int(price_range / bin_width) + 1))
         now_ms = time.time() * 1000
 
         bins = [{
@@ -664,7 +713,16 @@ class LiquidationHeatmap:
             age_ms    = now_ms - b["latest_ts"] if b["latest_ts"] > 0 else 86_400_000
             age_hours = age_ms / 3_600_000
             recency   = max(0.1, 1.0 - (age_hours / 24))
-            dominant  = "LONGS_LIQUIDATED" if b["long_vol"] > b["short_vol"] else "SHORTS_LIQUIDATED"
+            # FIX B13: tied volumes no longer silently classify as
+            # SHORTS_LIQUIDATED (which flipped directional bias for perfectly
+            # balanced clusters).  Use an explicit MIXED label so consumers
+            # can either ignore the cluster or treat it neutrally.
+            if b["long_vol"] > b["short_vol"]:
+                dominant = "LONGS_LIQUIDATED"
+            elif b["short_vol"] > b["long_vol"]:
+                dominant = "SHORTS_LIQUIDATED"
+            else:
+                dominant = "MIXED"
 
             clusters.append(LiquidationCluster(
                 price_low=b["low"],

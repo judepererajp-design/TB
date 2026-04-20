@@ -94,16 +94,24 @@ async def _gather_context(symbol: str, direction: str,
         ctx["regime_changed"] = False
 
     # Current funding rate (for FundingRateArb signals)
+    # FIX B2: DerivativesData.funding_rate is stored in percentage points (pp),
+    # NOT fractional (see analyzers/derivatives.py:117, raw *100 conversion).
+    # raw_data['funding_rate'] is also pp (strategies/funding_arb.py stores
+    # funding_rate_pct).  Previous flip thresholds of ±0.0001 were compared
+    # against pp values — 0.0001 pp ≈ 0%, so virtually any sign change tripped
+    # "funding_flipped".  Use a meaningful threshold in pp (0.01 pp = 0.01%/8h
+    # ≈ typical noise floor) and DO NOT multiply by 100 again in the prompt.
     try:
         from analyzers.derivatives import derivatives_analyzer
         coin = symbol.replace("/USDT", "").replace("/BUSD", "")
         deriv = derivatives_analyzer.get_coin_intel(coin)
         if deriv:
-            ctx["funding_now"]      = deriv.funding_rate
-            ctx["funding_original"] = raw_data.get("funding_rate", 0)
+            ctx["funding_now"]      = float(deriv.funding_rate)  # pp
+            ctx["funding_original"] = float(raw_data.get("funding_rate", 0) or 0)  # pp
+            _flip_eps_pp = 0.01  # 0.01%/8h — above typical zero-crossing noise
             ctx["funding_flipped"]  = (
-                (ctx["funding_original"] < 0 and ctx["funding_now"] > 0.0001)
-                or (ctx["funding_original"] > 0 and ctx["funding_now"] < -0.0001)
+                (ctx["funding_original"] < 0 and ctx["funding_now"] >  _flip_eps_pp)
+                or (ctx["funding_original"] > 0 and ctx["funding_now"] < -_flip_eps_pp)
             )
     except Exception:
         pass
@@ -121,15 +129,27 @@ async def _gather_context(symbol: str, direction: str,
         pass
 
     # Liquidation cluster around SL — already in cache
+    # FIX B5: the wick-hunt check in candles_summary used raw_data.get("stop_loss")
+    # which may be missing on legacy rows.  Use the explicit stop_loss parameter
+    # which is guaranteed-valid by the caller contract, and cache it in ctx so
+    # the prompt builder doesn't re-read from raw_data either.
+    ctx["stop_loss"] = float(stop_loss or 0.0)
     try:
         from signals.liquidation_heatmap import liquidation_heatmap as _lh
-        clusters = _lh._cluster_cache.get(symbol, [])
+        # FIX Q18: use TTL-aware accessor — a raw `_cluster_cache.get(symbol, [])`
+        # returned arbitrarily-old clusters (no expiry), so thesis verdicts
+        # drifted from reality during quiet periods.  `get_cached_clusters`
+        # evicts anything older than `_cluster_cache_ttl`.
+        if hasattr(_lh, "get_cached_clusters"):
+            clusters = _lh.get_cached_clusters(symbol)
+        else:  # older instances
+            clusters = _lh._cluster_cache.get(symbol, [])
         ctx["liq_clusters"] = len(clusters)
         # FIX: previous divisor `max(stop_loss, 1)` broke for low-priced symbols
         # (e.g. SHIB at $0.000025 → divisor floors to 1.0 → abs-price-diff/1 is
         # always <0.005, so cluster_near_sl was always True). Use the stop_loss
         # value itself with a tiny epsilon, so the threshold is a true percentage.
-        _sl = float(raw_data.get("stop_loss") or 0.0)
+        _sl = ctx["stop_loss"] or float(raw_data.get("stop_loss") or 0.0)
         if _sl > 0:
             ctx["liq_cluster_near_sl"] = any(
                 abs(c.price_low - _sl) / _sl < 0.005
@@ -151,13 +171,15 @@ async def _gather_context(symbol: str, direction: str,
             opens  = [c[1] for c in recent]
             highs  = [c[2] for c in recent]
             lows   = [c[3] for c in recent]
+            # FIX B5: wick-hunt check uses the SL parameter (not raw_data) so
+            # legacy rows without a stored stop_loss still get a valid check.
+            _sl_for_wick = ctx["stop_loss"] or float(raw_data.get("stop_loss") or 0.0)
             ctx["candles_summary"] = {
                 "closes":    [round(c, 6) for c in closes],
                 "direction": "up" if closes[-1] > closes[0] else "down",
-                "wick_hunt": (
-                    direction == "LONG" and min(lows) < raw_data.get("stop_loss", 0) * 1.002
-                ) or (
-                    direction == "SHORT" and max(highs) > raw_data.get("stop_loss", 0) * 0.998
+                "wick_hunt": (_sl_for_wick > 0) and (
+                    (direction == "LONG" and min(lows) < _sl_for_wick * 1.002)
+                    or (direction == "SHORT" and max(highs) > _sl_for_wick * 0.998)
                 ),
             }
     except Exception:
@@ -184,8 +206,9 @@ def _build_prompt(
 
     funding_block = ""
     if "funding_now" in ctx:
-        fn = ctx["funding_now"] * 100
-        fo = ctx.get("funding_original", 0) * 100
+        # FIX B2: values are already in percentage points — do NOT multiply by 100.
+        fn = float(ctx["funding_now"])
+        fo = float(ctx.get("funding_original", 0) or 0)
         flipped = ctx.get("funding_flipped", False)
         funding_block = (
             f"Funding at signal: {fo:+.4f}%/8h\n"
@@ -272,6 +295,23 @@ def _format_verdict(
     action = verdict.get("action", "HOLD")
     action_reason = verdict.get("action_reason", "")
     sl_valid = verdict.get("sl_still_valid", True)
+
+    # FIX Q19: sanity-override for LLM-supplied action. An "INTACT" verdict
+    # should never produce an EXIT_NOW recommendation, and a trade that is
+    # already profitable should not be told to EXIT_NOW on an INTACT thesis.
+    # Cap the LLM's agency with deterministic rules so a hallucinated action
+    # can't panic a user out of a healthy trade.
+    try:
+        _current_r_f = float(current_r)
+    except (TypeError, ValueError):
+        _current_r_f = 0.0
+    if v == "INTACT" and action in ("EXIT_NOW", "TIGHTEN_TO_TP1"):
+        action = "HOLD"
+        action_reason = (action_reason + " | override: INTACT thesis → HOLD").strip(" |")
+    elif v == "WEAKENED" and action == "EXIT_NOW" and _current_r_f >= 0.5 and sl_valid:
+        # Profitable trade with valid SL shouldn't be force-exited on "weakened".
+        action = "TIGHTEN_TO_TP1"
+        action_reason = (action_reason + " | override: weakened + profit → tighten, not exit").strip(" |")
 
     verdict_emoji = {
         "INTACT":      "✅",

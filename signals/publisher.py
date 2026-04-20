@@ -107,16 +107,19 @@ class SignalPublisher:
             if not message_id:
                 logger.warning(f"Signal saved but Telegram delivery failed: id={signal_id}")
                 return False
-            # Update DB after a confirmed Telegram send; handle DB failure separately
-            # so a transient write error does not mask the fact the message was sent.
+            # FIX B6: The Telegram send is what determines "published" from the
+            # user's perspective.  If the subsequent DB message_id update fails
+            # (transient sqlite lock, etc.), we should still report success so
+            # upstream does NOT treat this as "not sent" and re-publish — that
+            # would cause duplicate Telegram messages to the user.  Log the DB
+            # error as a warning instead so ops can reconcile later.
             try:
                 await db.update_signal_message_id(signal_id, message_id)
             except Exception as db_err:
-                logger.error(
+                logger.warning(
                     f"Execution signal sent (id={signal_id} msg_id={message_id}) "
                     f"but DB message_id update failed — manual recovery may be needed: {db_err}"
                 )
-                return False
             logger.info(f"Execution signal sent: id={signal_id} msg_id={message_id}")
             return True
         except Exception as e:

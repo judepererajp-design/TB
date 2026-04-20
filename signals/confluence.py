@@ -12,6 +12,7 @@ This is the #2 most impactful upgrade for accuracy.
 """
 
 import logging
+from dataclasses import replace
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 
@@ -117,6 +118,15 @@ class ConfluenceScorer:
         if not signals:
             return result
 
+        # FIX B7: defensively shallow-copy inputs.  This scorer mutates
+        # `.confidence`, `.confluence`, and `.confluence_multiplier` on the
+        # picked signal.  If the same SignalResult instance is routed through
+        # score() more than once (re-scan, aggregator retry, future caching),
+        # the +8 bonus / ×1.15 multiplier / −8 dissent penalty silently stack
+        # across cycles — silent confidence drift.  Work on copies so each
+        # score() call is idempotent from the caller's perspective.
+        signals = [replace(s, confluence=list(s.confluence)) for s in signals]
+
         # BUG-NEW-9 FIX: FundingRateArb + whale alignment promotion.
         # If FundingRateArb fires in the SAME direction as dominant whale flow,
         # temporarily remove it from WEAK_VOTERS for this score call — it becomes
@@ -126,14 +136,24 @@ class ConfluenceScorer:
             for sig in signals:
                 if sig.strategy == 'FundingRateArb' and direction_str(sig) == whale_dominant_side:
                     _active_weak_voters.discard('FundingRateArb')
-                    sig.confidence = min(99, sig.confidence + 8)  # reward alignment
+                    # FIX Q8: scale promotion bonus by funding magnitude.
+                    # A 0.05% funding print + whale-aligned is a weak tell;
+                    # +0.3%/8h + whale-aligned is a high-conviction squeeze
+                    # setup.  Cap at +14 so a mega-print can't single-handedly
+                    # over-ride the rest of the confluence stack.
+                    _fund_pp = abs(float(sig.get_raw('funding_rate', 0) or 0))
+                    # Linear ramp: 0.05%→+5, 0.20%→+10, 0.40%+→+14
+                    _bonus = int(min(14, max(5, 5 + (_fund_pp - 0.05) * 30)))
+                    sig.confidence = min(99, sig.confidence + _bonus)
                     result.confluence_notes.append(
                         f"🐳 FundingRateArb promoted: aligns with dominant whale flow "
-                        f"({whale_dominant_side}) — treated as independent signal (+8 conf)"
+                        f"({whale_dominant_side}) — treated as independent signal (+{_bonus} conf, "
+                        f"funding={_fund_pp:.3f}%/8h)"
                     )
                     logger.info(
                         f"FundingRateArb promoted for {signals[0].symbol}: "
-                        f"direction={whale_dominant_side} matches whale flow"
+                        f"direction={whale_dominant_side} matches whale flow "
+                        f"(funding={_fund_pp:.3f}%, bonus={_bonus})"
                     )
                     break
 

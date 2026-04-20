@@ -20,7 +20,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from utils.formatting import fmt_price, fmt_price_raw
 
 logger = logging.getLogger(__name__)
@@ -77,7 +77,17 @@ class WhaleAggregator:
         self._size_history: deque = deque(maxlen=2000)  # ~30d at current flow rate
         self._daily_volume_history: deque = deque(maxlen=30)  # daily totals
         self._current_day_volume: float = 0.0
-        self._current_day_start: float = 0.0
+        # FIX B12: seed with current time, not 0.  A zero seed makes the
+        # first event trip `now - 0 > 86400` and rolls what is effectively
+        # an empty day into daily history.  Harmless today but trap-prone
+        # once downstream consumers compute daily-volume moving averages.
+        self._current_day_start: float = time.time()
+
+        # FIX Q15: per-symbol telegram thresholds scaled by 24h volume.
+        # A flat 250k threshold is noise on BTC ($30B+ daily) and noise-free
+        # on a $20M-daily alt.  Cache computed thresholds for ~1h to avoid
+        # hammering the symbol-volume cache each whale event.
+        self._symbol_threshold_cache: Dict[str, Tuple[float, float]] = {}  # symbol -> (threshold_usd, expires_at)
 
     def add_event(self, whale: Dict):
         """Add a whale detection, recording to 30d history for percentile ranking."""
@@ -145,6 +155,44 @@ class WhaleAggregator:
         sizes = [v for _, v in self._size_history]
         return float(_np.searchsorted(sorted(sizes), order_usd)) / len(sizes)
 
+    def _effective_telegram_threshold(self, symbol: str) -> float:
+        """
+        FIX Q15: return the minimum whale order-size (USD) that qualifies
+        for a Telegram summary on this specific symbol.
+
+        Baseline floor: ``self._min_usd_for_telegram`` (250k default).
+        Scaled floor:   0.5% of rolling 24h quote volume.
+
+        The larger of the two wins so that majors require genuinely large
+        prints before being summarised, while small-caps still surface
+        their (smaller but still-material) whale prints.  Cached for 1h
+        to avoid hitting the volume cache on every event.
+        """
+        now = time.time()
+        cached = self._symbol_threshold_cache.get(symbol)
+        if cached and cached[1] > now:
+            return cached[0]
+
+        threshold = self._min_usd_for_telegram
+        try:
+            # Read 24h quote volume from the scanner/price cache when available.
+            # Be defensive — this helper must never raise during flush.
+            from core.price_cache import price_cache as _pc
+            vol_24h = 0.0
+            getter = getattr(_pc, 'get_24h_volume', None)
+            if callable(getter):
+                vol_24h = float(getter(symbol) or 0.0)
+            if vol_24h > 0:
+                # 0.5% of 24h volume (small enough that alts qualify, large
+                # enough that BTC/ETH need genuine six-figure prints).
+                scaled = 0.005 * vol_24h
+                threshold = max(self._min_usd_for_telegram, scaled)
+        except Exception:
+            pass
+
+        self._symbol_threshold_cache[symbol] = (threshold, now + 3600.0)
+        return threshold
+
     def should_flush(self) -> bool:
         """Check if it's time to flush the buffer"""
         if not self._buffer:
@@ -182,8 +230,15 @@ class WhaleAggregator:
             )
             return None
 
-        # Filter: only include events above Telegram threshold
-        significant = [e for e in events if e.order_usd >= self._min_usd_for_telegram]
+        # Filter: only include events above Telegram threshold.
+        # FIX Q15: scale the threshold per-symbol by 24h volume.  A fixed
+        # 250k is noise on BTC and gated-too-high on a thin alt.  Use
+        # max(250k, 0.5% × 24h_volume) so majors require bigger prints
+        # while small-caps still surface meaningful flow.
+        significant = [
+            e for e in events
+            if e.order_usd >= self._effective_telegram_threshold(e.symbol)
+        ]
 
         # If not enough significant events, skip Telegram
         if len(significant) < self._min_events_to_send:
