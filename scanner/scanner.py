@@ -211,6 +211,9 @@ class Scanner:
         # Persistence restore flag — populated on first await of
         # _restore_persisted_state(). Tolerant of DB unavailability.
         self._persistence_loaded: bool = False
+        self._persistence_dirty: bool = False
+        self._last_persist_at: float = 0.0
+        self._persist_debounce_secs: float = 60.0
 
     # ── Persistence (uses db.learning_state key/value store) ─────
     #
@@ -314,8 +317,23 @@ class Scanner:
                 'whale_snapshot': self._whale_snapshot,
             }
             await db.save_learning_state(self._PERSIST_KEY, payload)
+            self._persistence_dirty = False
+            self._last_persist_at = time.time()
         except Exception as e:
             logger.debug(f"Scanner: persist failed (non-fatal): {e}")
+
+    def _mark_persistence_dirty(self):
+        """Mark runtime state as needing a persistence flush."""
+        self._persistence_dirty = True
+
+    async def _persist_state_if_due(self, force: bool = False):
+        """Flush dirty runtime state, optionally bypassing the debounce window."""
+        if not self._persistence_dirty:
+            return
+        if not force and self._last_persist_at > 0:
+            if time.time() - self._last_persist_at < self._persist_debounce_secs:
+                return
+        await self._persist_state()
 
     # ── Shared cross-path dedup ──────────────────────────────
     def try_mark_signal_dedup(self, key: Tuple[str, str], ttl_secs: float) -> bool:
@@ -329,6 +347,7 @@ class Scanner:
         if now - last < ttl_secs:
             return False
         self._signal_dedup[key] = now
+        self._mark_persistence_dirty()
         # Opportunistic eviction of stale keys on the write path.
         if len(self._signal_dedup) > 256:
             cutoff = now - self._dedup_max_age
@@ -589,6 +608,7 @@ class Scanner:
         until = now + max(1.0, float(duration_secs))
         prev_until = self._temp_excluded_until.get(symbol, 0.0)
         self._temp_excluded_until[symbol] = max(prev_until, until)
+        self._mark_persistence_dirty()
         remaining = int(max(0.0, self._temp_excluded_until[symbol] - now))
         logger.info(
             f"Scanner: temporarily excluded {symbol} for {remaining}s ({reason})"
@@ -601,6 +621,7 @@ class Scanner:
             return False
         if time.time() >= until:
             self._temp_excluded_until.pop(symbol, None)
+            self._mark_persistence_dirty()
             logger.info(f"Scanner: temporary exclusion expired for {symbol}")
             return False
         return True
@@ -743,6 +764,7 @@ class Scanner:
                     )
                     state.tier3_underfloor_since = 0.0
                     state.low_volume_since = 0.0
+                    await self._persist_state_if_due(force=True)
                     return None
             else:
                 state.tier3_underfloor_since = 0.0
@@ -768,11 +790,13 @@ class Scanner:
                     state.low_volume_since = 0.0
                     self._counters['demotions'] = self._counters.get('demotions', 0) + 1
                     await db.upsert_symbol_tier(symbol, new_tier.value, current_volume)
+                    self._mark_persistence_dirty()
                     logger.info(
                         f"📉 {symbol} demoted: Tier {from_tier} → Tier {new_tier.value} "
                         f"(volume ${current_volume:,.0f} < ${current_tier_min:,.0f} "
                         f"for {elapsed_min:.0f} min)"
                     )
+                    await self._persist_state_if_due(force=True)
                     return (from_tier, new_tier.value)
         else:
             state.low_volume_streak = 0
@@ -806,11 +830,12 @@ class Scanner:
             self._counters['promotions'] = self._counters.get('promotions', 0) + 1
 
             await db.record_promotion(symbol, from_tier, to_tier)
+            self._mark_persistence_dirty()
             logger.info(f"🚀 {symbol} promoted: Tier {from_tier} → Tier {to_tier} ({vol_spike_mult:.1f}x volume)")
 
             # Persist so a crash right after promotion doesn't forget the cooldown.
             try:
-                await self._persist_state()
+                await self._persist_state_if_due(force=True)
             except Exception:
                 pass
 
@@ -933,6 +958,7 @@ class Scanner:
             snap = self._whale_snapshot.setdefault(symbol, {})
             prev = float(snap.get(storage_key, 0.0) or 0.0)
             snap[storage_key] = current_usd
+            self._mark_persistence_dirty()
             # Growing wall: accept if prev also meaningfully crossed threshold.
             if prev >= min_order_usd * 0.75:
                 return True
@@ -945,6 +971,7 @@ class Scanner:
         best_candidate: Optional[Dict] = None
         best_score = 0.0
         best_kind = ""   # "wall" | "iceberg"
+        seen_snapshot_keys = set()
 
         for side, orders in [('buy', bids), ('sell', asks)]:
             cumulative_usd = 0.0
@@ -969,6 +996,7 @@ class Scanner:
 
             # Evaluate single-level wall for this side
             if strongest_wall_usd >= min_order_usd:
+                seen_snapshot_keys.add(side)
                 if _accept_persistence(side, side, strongest_wall_usd):
                     fp = _fill_prob(strongest_wall_px, side, strongest_wall_usd, min_order_usd)
                     score = strongest_wall_usd * (0.5 + 0.5 * fp)
@@ -990,6 +1018,7 @@ class Scanner:
             # Evaluate iceberg (cumulative within band) for this side
             if cumulative_usd >= min_order_usd:
                 iceberg_key = f"iceberg_{side}"
+                seen_snapshot_keys.add(iceberg_key)
                 if _accept_persistence(iceberg_key, side, cumulative_usd):
                     fp = _fill_prob(current_price, side, cumulative_usd, min_order_usd)
                     score = cumulative_usd * (0.5 + 0.5 * fp)
@@ -1012,13 +1041,20 @@ class Scanner:
         # so stale prior sightings from the other side can't persist indefinitely.
         snap = self._whale_snapshot.setdefault(symbol, {})
         for key in ('buy', 'sell', 'iceberg_buy', 'iceberg_sell'):
-            snap.setdefault(key, 0.0)
+            if key not in seen_snapshot_keys and float(snap.get(key, 0.0) or 0.0) != 0.0:
+                snap[key] = 0.0
+                self._mark_persistence_dirty()
+            else:
+                snap.setdefault(key, 0.0)
 
         if best_candidate is None:
+            await self._persist_state_if_due()
             return None
 
         # Apply cooldown on firing side only (other side can still fire later).
         self._whale_cooldown[symbol] = time.time()
+        self._mark_persistence_dirty()
+        await self._persist_state_if_due(force=True)
         if best_kind == 'iceberg':
             self._counters['icebergs_fired'] = self._counters.get('icebergs_fired', 0) + 1
             logger.info(
@@ -1266,6 +1302,8 @@ class Scanner:
             await db.upsert_watchlist(symbol, float(score), reasons)
             self._watchlist_cooldown[symbol] = time.time()
             self._counters['alerts_watchlist'] += 1
+            self._mark_persistence_dirty()
+            await self._persist_state_if_due(force=True)
             return {'symbol': symbol, 'score': score, 'reasons': reasons, 'regime': _regime}
 
         return None
