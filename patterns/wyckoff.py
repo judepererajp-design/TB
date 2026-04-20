@@ -74,6 +74,9 @@ class WyckoffResult:
     range_high: float = 0.0         # upper boundary of detected trading range
     range_low:  float = 0.0         # lower boundary of detected trading range
     range_bars: int   = 0           # number of bars the range spans
+    # P2-W1/W2: secondary-test + cause-effect governance lineage
+    lps_confirmed: bool = False                  # LPS/LPSY retest held
+    cause_effect_target: Optional[float] = None  # projected markup/markdown target
 
 
 class WyckoffAnalyzer:
@@ -88,6 +91,12 @@ class WyckoffAnalyzer:
         self._vol_sensitivity = getattr(self._cfg, 'volume_sensitivity', 1.3)
         # P1-W15: max range scan window (was hard-coded 80)
         self._max_range_bars = getattr(self._cfg, 'max_range_bars', 120)
+        # P2-W1: LPS / LPSY secondary-test bonus — after spring/UTAD, a
+        # successful retest that holds above/below the key level is the
+        # classical "Last Point of Support/Supply". Bumps confidence.
+        self._lps_bonus = float(getattr(self._cfg, 'lps_bonus', 5.0))
+        # P2-W2: emit the cause-effect projected target in raw_data & notes.
+        self._emit_cause_effect = bool(getattr(self._cfg, 'emit_cause_effect_target', True))
 
     def analyze(self, ohlcv: List, timeframe: str = '4h') -> Optional[WyckoffResult]:
         """
@@ -152,6 +161,12 @@ class WyckoffAnalyzer:
             if dryup_before_evt:
                 notes.append("✅ Volume dry-up before Spring — textbook setup")
                 conf += 3.0
+            # P2-W1: LPS (Last Point of Support) — bump confidence when a
+            # successful retest has already printed after the spring.
+            lps_ok = self._detect_lps(lows, closes, range_low, spring['bar'], atr)
+            if lps_ok:
+                notes.append("🎯 LPS confirmed — higher low retest held above range")
+                conf += self._lps_bonus
             conf = min(95.0, conf)
 
             # P1-W10: Spring SL must tolerate typical undercut — use the deeper of
@@ -163,6 +178,18 @@ class WyckoffAnalyzer:
             _ez_buffer = max(range_size * 0.02, atr * 0.25) if atr > 0 else range_size * 0.02
             entry_low  = range_low + _ez_buffer * 0.25
             entry_high = range_low + max(range_size * 0.15, _ez_buffer * 2)
+
+            # P2-W2: cause-effect projected target
+            ce_target = None
+            if self._emit_cause_effect:
+                ce_target = self._cause_effect_target(
+                    "LONG", range_high, range_bars, range_size, atr
+                )
+                if ce_target:
+                    notes.append(
+                        f"🎯 Cause-effect target ≈ {fmt_price(ce_target)}"
+                        f" (range_bars={range_bars})"
+                    )
 
             return WyckoffResult(
                 phase=WyckoffPhase.ACCUMULATION_C,
@@ -179,6 +206,8 @@ class WyckoffAnalyzer:
                 range_high=range_high,
                 range_low=range_low,
                 range_bars=range_bars,
+                lps_confirmed=lps_ok,
+                cause_effect_target=ce_target,
             )
 
         # ── Check for UTAD (Upthrust After Distribution) ─────
@@ -200,6 +229,11 @@ class WyckoffAnalyzer:
             if dryup_before_evt:
                 notes.append("✅ Volume dry-up before UTAD — textbook setup")
                 conf += 3.0
+            # P2-W1: LPSY (Last Point of Supply)
+            lpsy_ok = self._detect_lpsy(highs, closes, range_high, utad['bar'], atr)
+            if lpsy_ok:
+                notes.append("🎯 LPSY confirmed — lower high retest capped by range")
+                conf += self._lps_bonus
             conf = min(95.0, conf)
 
             _sl_buffer = max(range_size * 0.25, atr * 1.5) if atr > 0 else range_size * 0.25
@@ -207,6 +241,17 @@ class WyckoffAnalyzer:
             _ez_buffer = max(range_size * 0.02, atr * 0.25) if atr > 0 else range_size * 0.02
             entry_high = range_high - _ez_buffer * 0.25
             entry_low  = range_high - max(range_size * 0.15, _ez_buffer * 2)
+
+            ce_target = None
+            if self._emit_cause_effect:
+                ce_target = self._cause_effect_target(
+                    "SHORT", range_low, range_bars, range_size, atr
+                )
+                if ce_target:
+                    notes.append(
+                        f"🎯 Cause-effect target ≈ {fmt_price(ce_target)}"
+                        f" (range_bars={range_bars})"
+                    )
 
             return WyckoffResult(
                 phase=WyckoffPhase.DISTRIBUTION_C,
@@ -223,6 +268,8 @@ class WyckoffAnalyzer:
                 range_high=range_high,
                 range_low=range_low,
                 range_bars=range_bars,
+                lps_confirmed=lpsy_ok,
+                cause_effect_target=ce_target,
             )
 
         # ── Check for Sign of Strength (SOS) in Phase D ──────
@@ -363,6 +410,87 @@ class WyckoffAnalyzer:
                 if closes[i] > opens[i]:
                     return {'bar': i, 'price': highs[i], 'volume': volumes[i]}
         return None
+
+    def _detect_lps(
+        self, lows, closes, range_low: float, spring_bar: int, atr: float
+    ) -> bool:
+        """
+        P2-W1: Last Point of Support (LPS) after a Spring.
+
+        After the Spring prints, price should pull back toward range_low,
+        make a HIGHER LOW (above the spring low), and resume the rally.
+        We inspect bars AFTER spring_bar and before the current bar looking
+        for this retest geometry.
+        """
+        n = len(lows)
+        if n == 0 or spring_bar < 0 or spring_bar >= n - 2:
+            return False
+        # Require at least one bar between spring and current
+        tail_lows = lows[spring_bar + 1 : n - 1]
+        if len(tail_lows) == 0:
+            return False
+        pullback_low = float(min(tail_lows))
+        spring_low = float(lows[spring_bar])
+        # Must stay above spring low (HL) and above range_low minus small buffer
+        tolerance = atr * 0.25 if atr > 0 else 0.0
+        if pullback_low <= spring_low + tolerance:
+            return False
+        if pullback_low < range_low - tolerance:
+            return False
+        # Current bar should be above pullback low (rally resumed)
+        current = float(closes[-1])
+        return current > pullback_low
+
+    def _detect_lpsy(
+        self, highs, closes, range_high: float, utad_bar: int, atr: float
+    ) -> bool:
+        """P2-W1: mirror of _detect_lps for UTAD → Last Point of Supply."""
+        n = len(highs)
+        if n == 0 or utad_bar < 0 or utad_bar >= n - 2:
+            return False
+        tail_highs = highs[utad_bar + 1 : n - 1]
+        if len(tail_highs) == 0:
+            return False
+        pullback_high = float(max(tail_highs))
+        utad_high = float(highs[utad_bar])
+        tolerance = atr * 0.25 if atr > 0 else 0.0
+        if pullback_high >= utad_high - tolerance:
+            return False
+        if pullback_high > range_high + tolerance:
+            return False
+        current = float(closes[-1])
+        return current < pullback_high
+
+    def _cause_effect_target(
+        self, direction: str, key_level: float, range_bars: int,
+        range_size: float, atr: float,
+    ) -> Optional[float]:
+        """
+        P2-W2: Wyckoff "cause and effect" projected target.
+
+        Cause = time spent in the range (measured by bars, scaled by range
+        size normalized to ATR).  Effect = magnitude of the subsequent move.
+
+        target_distance = range_size × sqrt(range_bars / min_bars)
+
+        The sqrt-scaling is a conservative variant of the point-and-figure
+        "number of columns × box size" rule used in classical Wyckoff — it
+        keeps very-long ranges from producing unreasonably distant targets.
+        """
+        if range_size <= 0 or range_bars <= 0 or key_level <= 0:
+            return None
+        try:
+            import math
+            scale = math.sqrt(max(range_bars / max(self._min_range_bars, 1), 1.0))
+        except Exception:
+            scale = 1.0
+        raw_distance = range_size * scale
+        # Cap to a price-sane distance (same as geometric projection cap)
+        cap = max(key_level * 0.5, atr * 3.0) if atr > 0 else key_level * 0.5
+        distance = min(raw_distance, cap)
+        if direction == "LONG":
+            return key_level + distance
+        return key_level - distance
 
     def _detect_spring(
         self, highs, lows, closes, volumes,

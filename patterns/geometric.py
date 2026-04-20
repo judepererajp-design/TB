@@ -21,6 +21,12 @@ from strategies.base import cfg_min_rr
 from strategies.base import BaseStrategy, SignalResult, SignalDirection
 from utils.formatting import fmt_price
 from utils.risk_params import rp
+from patterns._common import (
+    find_alternating_pivots,
+    clamp_projection,
+    regime_penalty_for_pattern,
+    volume_confirmed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +59,11 @@ class GeometricPatterns(BaseStrategy):
         }
         # P1-G15: flag consolidation tightness knob (default 0.30, was hard 0.40)
         self._flag_consol_ratio = getattr(self._cfg, 'flag_consol_ratio', 0.30)
+        # P2-G1: volume-confirmation gate — when enabled, flag & triangle
+        # breakouts require the breakout bar to print expansion volume.
+        self._require_volume_confirm = bool(getattr(self._cfg, 'require_volume_confirm', False))
+        # P2-G1: volume multiple for confirmation (default 1.3 × 20-bar median)
+        self._volume_confirm_mult = float(getattr(self._cfg, 'volume_confirm_mult', 1.3))
 
     @staticmethod
     def _cfg_bool(sub, key: str, default: bool) -> bool:
@@ -66,16 +77,11 @@ class GeometricPatterns(BaseStrategy):
     @staticmethod
     def _clamp_projection(raw: float, entry: float, atr: float) -> float:
         """
-        BUG-2 ROOT-CAUSE FIX: bound pattern-projected distances (wedge/flag/
-        triangle measured moves) so that when wedge_range > entry (low-priced
-        tokens) projections don't push TP1/TP2/SL into negative price territory.
-        Cap at the smaller of the raw projection or half the entry price, with
-        an ATR floor to keep very low-vol/low-price assets meaningful.
+        BUG-2 ROOT-CAUSE FIX: bound pattern-projected distances so low-priced
+        tokens don't produce negative TPs.  Phase-2: delegates to the shared
+        helper in patterns/_common/projection.py.
         """
-        if entry <= 0:
-            return max(raw, 0.0)
-        cap = max(entry * 0.5, atr * 3.0 if atr > 0 else entry * 0.1)
-        return min(max(raw, 0.0), cap)
+        return clamp_projection(raw, entry, atr)
 
     async def analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:
         # ── Regime gate ───────────────────────────────────────────────────
@@ -153,6 +159,19 @@ class GeometricPatterns(BaseStrategy):
                 # P1-G16: raise the confidence ceiling from 88 to 95 so strong
                 # confluence (cup+volume+MTF) can actually outrank marginal setups.
                 _conf = min(95.0, float(confidence))
+                # P2-R1: per-pattern regime penalty (soft) — map sub-name to
+                # canonical pattern_type used by the regime helper.
+                _pt_map = {
+                    'BullFlag': 'bull_flag', 'BearFlag': 'bear_flag',
+                    'SymTriangle': 'sym_triangle',
+                    'HeadAndShoulders': 'head_shoulders', 'InverseHS': 'inverse_hs',
+                    'DoubleTop': 'double_top', 'DoubleBottom': 'double_bottom',
+                    'RisingWedge': 'rising_wedge', 'FallingWedge': 'falling_wedge',
+                    'CupAndHandle': 'cup_and_handle',
+                }
+                _penalty = regime_penalty_for_pattern(_pt_map.get(pattern_name, ''), regime)
+                if _penalty:
+                    _conf = max(50.0, _conf - _penalty)
 
                 return SignalResult(
                     symbol=symbol,
@@ -170,6 +189,12 @@ class GeometricPatterns(BaseStrategy):
                         'geometric_pattern': pattern_name,   # governance lineage
                         'geometric_sub': sub_name,
                         'geometric_tf': tf,
+                        'regime_at_detection': regime,
+                        # P2 governance: recompute from the known volume series
+                        # rather than parsing note strings (robust + single source).
+                        'volume_confirmed': bool(volume_confirmed(
+                            volumes, mult=self._volume_confirm_mult
+                        )),
                     }
                 )
 
@@ -227,6 +252,10 @@ class GeometricPatterns(BaseStrategy):
         if consol_mean > impulse_mean + atr * 0.5:
             # Breakout confirmation: close above consolidation high + 0.1 ATR
             if current > consol_high + atr * 0.1:
+                # P2-G1: volume-confirmation gate (optional, opt-in via config)
+                vol_ok = volume_confirmed(volumes, mult=self._volume_confirm_mult)
+                if self._require_volume_confirm and not vol_ok:
+                    return None
                 entry      = current
                 stop_loss  = consol_low - atr * rp.sl_atr_mult * 0.4
                 # P1-G9: clamp projections so low-price tokens don't produce
@@ -235,26 +264,35 @@ class GeometricPatterns(BaseStrategy):
                 tp2_dist   = self._clamp_projection(impulse_range,       entry, atr)
                 tp1        = entry + tp1_dist
                 tp2        = entry + tp2_dist
+                conf       = 68 + (4 if vol_ok else 0)
                 notes      = [
                     f"✅ Bull flag breakout — impulse range {fmt_price(impulse_range)}",
                     f"✅ Tight consolidation ({consol_range/impulse_range*100:.0f}% of impulse)",
                 ]
-                return ("LONG", "BullFlag", 68, notes, entry, stop_loss, tp1, tp2)
+                if vol_ok:
+                    notes.append("📊 Volume-confirmed breakout")
+                return ("LONG", "BullFlag", conf, notes, entry, stop_loss, tp1, tp2)
 
         # Bear flag: consolidation mean below impulse mean - 0.5 ATR
         elif consol_mean < impulse_mean - atr * 0.5:
             if current < consol_low - atr * 0.1:
+                vol_ok = volume_confirmed(volumes, mult=self._volume_confirm_mult)
+                if self._require_volume_confirm and not vol_ok:
+                    return None
                 entry      = current
                 stop_loss  = consol_high + atr * rp.sl_atr_mult * 0.4
                 tp1_dist   = self._clamp_projection(impulse_range * 0.6, entry, atr)
                 tp2_dist   = self._clamp_projection(impulse_range,       entry, atr)
                 tp1        = entry - tp1_dist
                 tp2        = entry - tp2_dist
+                conf       = 68 + (4 if vol_ok else 0)
                 notes      = [
                     f"✅ Bear flag breakdown — impulse range {fmt_price(impulse_range)}",
                     f"✅ Tight consolidation ({consol_range/impulse_range*100:.0f}% of impulse)",
                 ]
-                return ("SHORT", "BearFlag", 68, notes, entry, stop_loss, tp1, tp2)
+                if vol_ok:
+                    notes.append("📊 Volume-confirmed breakdown")
+                return ("SHORT", "BearFlag", conf, notes, entry, stop_loss, tp1, tp2)
 
         return None
 
@@ -302,8 +340,12 @@ class GeometricPatterns(BaseStrategy):
             return None  # Not a valid triangle
 
         # P1-G7: ATR-normalized TPs so small triangles don't produce tiny TPs.
+        # P2-G1: optional volume-confirmation gate on breakout.
         # Breakout: price outside triangle
         if current > proj_high:
+            vol_ok = volume_confirmed(volumes, mult=self._volume_confirm_mult)
+            if self._require_volume_confirm and not vol_ok:
+                return None
             entry     = current
             stop_loss = proj_low - atr * 0.5
             tp1_raw   = max(width, atr * 1.5)
@@ -312,10 +354,16 @@ class GeometricPatterns(BaseStrategy):
             tp2_dist  = self._clamp_projection(tp2_raw, entry, atr)
             tp1       = entry + tp1_dist
             tp2       = entry + tp2_dist
+            conf      = 66 + (4 if vol_ok else 0)
             notes     = [f"✅ Symmetrical triangle breakout (width: {fmt_price(width)})"]
-            return ("LONG", "SymTriangle", 66, notes, entry, stop_loss, tp1, tp2)
+            if vol_ok:
+                notes.append("📊 Volume-confirmed breakout")
+            return ("LONG", "SymTriangle", conf, notes, entry, stop_loss, tp1, tp2)
 
         elif current < proj_low:
+            vol_ok = volume_confirmed(volumes, mult=self._volume_confirm_mult)
+            if self._require_volume_confirm and not vol_ok:
+                return None
             entry     = current
             stop_loss = proj_high + atr * 0.5
             tp1_raw   = max(width, atr * 1.5)
@@ -324,8 +372,11 @@ class GeometricPatterns(BaseStrategy):
             tp2_dist  = self._clamp_projection(tp2_raw, entry, atr)
             tp1       = entry - tp1_dist
             tp2       = entry - tp2_dist
+            conf      = 66 + (4 if vol_ok else 0)
             notes     = [f"✅ Symmetrical triangle breakdown (width: {fmt_price(width)})"]
-            return ("SHORT", "SymTriangle", 66, notes, entry, stop_loss, tp1, tp2)
+            if vol_ok:
+                notes.append("📊 Volume-confirmed breakdown")
+            return ("SHORT", "SymTriangle", conf, notes, entry, stop_loss, tp1, tp2)
 
         return None
 

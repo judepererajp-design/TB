@@ -19,6 +19,11 @@ from dataclasses import dataclass
 from config.loader import cfg
 from strategies.base import cfg_min_rr
 from strategies.base import BaseStrategy, SignalResult, SignalDirection
+from patterns._common import (
+    find_alternating_pivots,
+    regime_allows_structural,
+    regime_penalty_for_pattern,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +119,11 @@ class HarmonicDetector(BaseStrategy):
         # XABCD patterns that are just 3 bars apart from being treated as
         # equivalent to multi-week structures. Per-TF in analyze().
         self._min_pivot_spacing = getattr(self._cfg, 'min_pivot_spacing', 3)
+        # P2-H1: PRZ-cluster bonus — when multiple Fib ratios from different
+        # legs land in the same tight zone the reversal probability rises.
+        self._prz_cluster_bonus = getattr(self._cfg, 'prz_cluster_bonus', 5.0)
+        # P2-H2: confidence bump when a bullish/bearish candle prints AT D
+        self._d_reversal_bonus = getattr(self._cfg, 'd_reversal_bonus', 4.0)
 
     async def analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:
         # ── Regime gate ───────────────────────────────────────────────────
@@ -137,6 +147,7 @@ class HarmonicDetector(BaseStrategy):
         ohlcv  = ohlcv_dict[tf]
         df     = pd.DataFrame(ohlcv, columns=['ts','open','high','low','close','volume'])
         df     = df.astype(float)
+        opens  = df['open'].values
         highs  = df['high'].values
         lows   = df['low'].values
         closes = df['close'].values
@@ -146,7 +157,8 @@ class HarmonicDetector(BaseStrategy):
             return None
 
         # Find pivot points (returns list of (bar_idx, price, kind))
-        pivots = self._find_pivots(highs, lows, self._pivot_ord)
+        # P2: delegate to shared helper — identical semantics, one place to fix bugs.
+        pivots = find_alternating_pivots(highs, lows, self._pivot_ord)
         if len(pivots) < 5:
             return None
 
@@ -170,44 +182,116 @@ class HarmonicDetector(BaseStrategy):
             if result:
                 # D point should be near current price (ATR-scaled proximity)
                 if abs(current_price - result.d) <= d_proximity:
-                    return self._build_signal(symbol, result, atr, tf)
+                    # P2-H1: PRZ-cluster bonus. When the XAD and BCD projection
+                    # zones overlap within 0.5*ATR of D the confluence is
+                    # stronger than either ratio alone.
+                    prz_cluster = self._check_prz_cluster(
+                        result.x, result.a, result.b, result.c, result.d, atr
+                    )
+                    # P2-H2: reversal-candle confirmation AT D
+                    d_candle_ok = self._has_reversal_candle_at_d(
+                        opens, highs, lows, closes, result.direction
+                    )
+                    if prz_cluster:
+                        result.confidence = min(
+                            95.0, float(result.confidence) + self._prz_cluster_bonus
+                        )
+                    if d_candle_ok:
+                        result.confidence = min(
+                            95.0, float(result.confidence) + self._d_reversal_bonus
+                        )
+                    # P2-R1: apply regime penalty; hard gate already above.
+                    penalty = regime_penalty_for_pattern("harmonic", regime)
+                    if penalty:
+                        result.confidence = max(50.0, float(result.confidence) - penalty)
+
+                    return self._build_signal(
+                        symbol, result, atr, tf,
+                        prz_cluster=prz_cluster,
+                        d_candle_ok=d_candle_ok,
+                        regime=regime,
+                    )
 
         return None
 
-    def _find_pivots(self, highs, lows, order: int) -> List[tuple]:
+    def _check_prz_cluster(self, x, a, b, c, d, atr: float) -> bool:
         """
-        Find alternating high/low pivot points.
-        Returns list of (bar_index, price, kind) with kind in {'H', 'L'}.
+        P2-H1: PRZ (Potential Reversal Zone) cluster check.
 
-        FIX HARMONIC-1: enforces strict H/L alternation.
-        P1-H5: returns bar index so min-spacing can be enforced by the caller.
+        Harmonic textbooks define the PRZ as the overlap of:
+          * XAD Fib projection (completion level)
+          * BCD Fib projection
+          * Previous swing levels (structural S/R)
+
+        When the XAD-projected D and BCD-projected D land within a 0.5-ATR
+        window of each other (and of the actual pivot D), the reversal is
+        more reliable.  We approximate this by computing both projection
+        targets and comparing their distance to the actual D.
         """
-        tagged = []   # List of (bar_idx, price, 'H'|'L')
-        n = len(highs)
+        if atr <= 0:
+            return False
+        xa = abs(a - x)
+        bc = abs(c - b)
+        if xa == 0 or bc == 0:
+            return False
 
-        for i in range(order, n - order):
-            is_swing_high = (
-                all(highs[i] > highs[i-j] for j in range(1, order+1)) and
-                all(highs[i] > highs[i+j] for j in range(1, order+1))
+        # Use 0.786 (Gartley/Cypher) and 1.272 (Butterfly) as representative
+        # XAD projections; 1.618 (Bat/Crab) as representative BCD.  A real
+        # cluster shows two of these in the same zone.
+        direction_is_down = a < x  # bullish completion (X high → A low)
+        sign = -1 if direction_is_down else 1
+
+        xad_candidates = [x + sign * xa * 0.786, x + sign * xa * 1.272]
+        bcd_candidates = [c + sign * bc * 1.272, c + sign * bc * 1.618]
+
+        tol = atr * 0.5
+        # Cluster exists if any xad candidate is within tolerance of any bcd
+        # candidate AND both are within tolerance of the actual pivot D.
+        for xa_t in xad_candidates:
+            for bc_t in bcd_candidates:
+                if abs(xa_t - bc_t) <= tol and abs(xa_t - d) <= tol:
+                    return True
+        return False
+
+    def _has_reversal_candle_at_d(
+        self, opens, highs, lows, closes, direction: str
+    ) -> bool:
+        """
+        P2-H2: require a confirming candle at D.
+
+        LONG harmonics complete on a bullish hammer/engulfing/morning-star
+        signal; SHORT harmonics mirror.  Use patterns.candlestick to check.
+        """
+        try:
+            from patterns.candlestick import (
+                pin_bar, engulfing, morning_star, evening_star,
+                piercing_line, dark_cloud_cover,
             )
-            is_swing_low = (
-                all(lows[i] < lows[i-j] for j in range(1, order+1)) and
-                all(lows[i] < lows[i+j] for j in range(1, order+1))
-            )
+        except Exception:  # pragma: no cover - defensive
+            return False
 
-            if is_swing_high:
-                if not tagged or tagged[-1][2] != 'H':
-                    tagged.append((i, float(highs[i]), 'H'))
-                elif highs[i] > tagged[-1][1]:
-                    # Replace previous high with the more extreme one (cluster merge)
-                    tagged[-1] = (i, float(highs[i]), 'H')
-            elif is_swing_low:
-                if not tagged or tagged[-1][2] != 'L':
-                    tagged.append((i, float(lows[i]), 'L'))
-                elif lows[i] < tagged[-1][1]:
-                    tagged[-1] = (i, float(lows[i]), 'L')
+        detectors_long = (pin_bar, engulfing, morning_star, piercing_line)
+        detectors_short = (pin_bar, engulfing, evening_star, dark_cloud_cover)
+        detectors = detectors_long if direction == "LONG" else detectors_short
 
-        return tagged
+        for fn in detectors:
+            try:
+                detected, d_dir, strength = fn(opens, highs, lows, closes)
+            except Exception:
+                continue
+            if detected and strength > 0.25 and (
+                d_dir == direction or d_dir == "NEUTRAL"
+            ):
+                return True
+        return False
+
+    # Legacy name kept for backward-compat — delegates to shared impl.
+    def _find_pivots(self, highs, lows, order: int):
+        """
+        Deprecated wrapper; retained so external imports don't break.
+        Use patterns._common.find_alternating_pivots directly.
+        """
+        return find_alternating_pivots(highs, lows, order)
 
     def _check_all_patterns(self, x, a, b, c, d, atr: float = 0) -> Optional[HarmonicResult]:
         """
@@ -380,7 +464,17 @@ class HarmonicDetector(BaseStrategy):
             tp1=tp1, tp2=tp2
         )
 
-    def _build_signal(self, symbol, result: HarmonicResult, atr, tf) -> Optional[SignalResult]:
+    def _build_signal(
+        self,
+        symbol,
+        result: HarmonicResult,
+        atr,
+        tf,
+        *,
+        prz_cluster: bool = False,
+        d_candle_ok: bool = False,
+        regime: Optional[str] = None,
+    ) -> Optional[SignalResult]:
         current = result.d
         risk    = abs(current - result.stop_loss)
         if risk == 0:
@@ -393,6 +487,16 @@ class HarmonicDetector(BaseStrategy):
         if rr < cfg_min_rr("swing"):
             return None
 
+        confluence = [
+            f"✅ {result.pattern} harmonic pattern at D point",
+            f"✅ All 4 Fibonacci ratios validated",
+            f"📐 XABCD: {result.x:.4f} → {result.a:.4f} → {result.b:.4f} → {result.c:.4f} → {result.d:.4f}",
+        ]
+        if prz_cluster:
+            confluence.append("🎯 PRZ cluster — XAD/BCD projections overlap at D")
+        if d_candle_ok:
+            confluence.append("🕯 Confirming reversal candle at D")
+
         # P1-H3: confidence cap removed (was min(88, ...)). Use raw result value.
         return SignalResult(
             symbol=symbol,
@@ -403,16 +507,15 @@ class HarmonicDetector(BaseStrategy):
             stop_loss=result.stop_loss,
             tp1=result.tp1, tp2=result.tp2, tp3=tp3,
             rr_ratio=rr, setup_class="swing", analysis_timeframes=[tf],
-            confluence=[
-                f"✅ {result.pattern} harmonic pattern at D point",
-                f"✅ All 4 Fibonacci ratios validated",
-                f"📐 XABCD: {result.x:.4f} → {result.a:.4f} → {result.b:.4f} → {result.c:.4f} → {result.d:.4f}",
-            ],
+            confluence=confluence,
             raw_data={
                 'pattern': result.pattern,
                 'harmonic_pattern': result.pattern,   # governance lineage
                 'harmonic_tf': tf,
                 'harmonic_direction': result.direction,
+                'prz_cluster': bool(prz_cluster),
+                'd_reversal_candle': bool(d_candle_ok),
+                'regime_at_detection': regime,
                 'x': result.x, 'a': result.a,
                 'b': result.b, 'c': result.c, 'd': result.d,
             }

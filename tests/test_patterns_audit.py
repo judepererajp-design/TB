@@ -1,11 +1,12 @@
 """
-Smoke tests for patterns/ folder — Phase-1 audit fixes.
+Smoke tests for patterns/ folder — Phase-1 and Phase-2 audit fixes.
 
 Full integration tests need unmocked numpy; conftest.py mocks numpy globally.
 These tests exercise:
   * Pure-data ratio tables and config wiring that don't touch numpy.
   * Module importability (catching regressions like TypeErrors in comments
     or undefined names).
+  * Shared `patterns/_common/` helpers (stdlib-only, fully exercisable).
 """
 
 import pytest
@@ -74,3 +75,137 @@ def test_wyckoff_lazy_singleton():
     assert not isinstance(w.wyckoff_analyzer, w.WyckoffAnalyzer)
     # But attribute access must still work (forwarded to a real instance)
     assert hasattr(w.wyckoff_analyzer, 'analyze')
+
+
+# ── Phase-2 structural tests ────────────────────────────────────────
+
+def test_phase2_common_module_importable():
+    """P2: patterns/_common re-exports all helpers."""
+    from patterns._common import (
+        find_alternating_pivots, is_isolated_swing,
+        clamp_projection, price_floor_valid,
+        regime_allows_structural, regime_penalty_for_pattern,
+        volume_confirmed, compute_volume_stats,
+    )
+    # Sanity ping each helper
+    assert find_alternating_pivots([], [], 5) == []
+    assert is_isolated_swing([], 0, 3) is False
+    # clamp_projection: raw=100, entry=10, atr=1 → cap = max(5, 3) = 5
+    assert clamp_projection(100.0, 10.0, atr=1.0) == 5.0
+    assert price_floor_valid(10.0, 5.0, 7.0) is True
+    assert price_floor_valid(10.0, 0.001) is False
+    assert volume_confirmed(None) is False
+    assert compute_volume_stats(None) is None
+
+
+def test_phase2_clamp_projection_caps_negative_and_overshoot():
+    """P2: clamp_projection caps overshoots to entry/2 and blocks negatives."""
+    from patterns._common import clamp_projection
+    # Overshoot: raw much greater than entry → capped at entry * 0.5
+    assert clamp_projection(100.0, 10.0, atr=0.0) == 5.0
+    # With ATR floor, cap = max(entry*0.5, 3*ATR)
+    assert clamp_projection(100.0, 10.0, atr=3.0) == 9.0
+    # Negative raw becomes 0
+    assert clamp_projection(-5.0, 10.0) == 0.0
+    # NaN is treated as 0
+    assert clamp_projection(float('nan'), 10.0) == 0.0
+
+
+def test_phase2_pivots_alternating():
+    """P2: find_alternating_pivots returns strictly alternating H/L pivots."""
+    from patterns._common import find_alternating_pivots
+    # Hand-built alternating series: low, high, low, high, low
+    highs = [2, 3, 5, 3, 4, 7, 4, 5, 9, 5, 6]
+    lows  = [1, 2, 4, 1, 3, 6, 2, 4, 8, 3, 5]
+    pivots = find_alternating_pivots(highs, lows, order=2)
+    # Must alternate strictly
+    for i in range(1, len(pivots)):
+        assert pivots[i][2] != pivots[i-1][2], f"pivots not alternating: {pivots}"
+
+
+def test_phase2_regime_gating():
+    """P2-R1: regime helper gates continuation setups in opposing regimes."""
+    from patterns._common import (
+        regime_allows_structural, regime_penalty_for_pattern,
+    )
+    # Bull flag blocked in BEAR_TREND
+    assert regime_allows_structural("bull_flag", "BEAR_TREND") is False
+    assert regime_allows_structural("bull_flag", "BULL_TREND") is True
+    # Inverse H&S blocked in BEAR_TREND (counter-regime reversal)
+    assert regime_allows_structural("inverse_hs", "BEAR_TREND") is False
+    # Unknown inputs are permissive
+    assert regime_allows_structural("bull_flag", None) is True
+    assert regime_allows_structural("nonexistent", "BULL_TREND") is True
+    # Penalty is modest and typed
+    p = regime_penalty_for_pattern("bull_flag", "CHOPPY")
+    assert isinstance(p, float) and 0 <= p <= 10
+
+
+def test_phase2_volume_confirmed_median_baseline():
+    """P2-G1: volume_confirmed uses median, not mean — one outlier ignored."""
+    from patterns._common import volume_confirmed
+    # 19 quiet bars + 1 spike baseline must not defeat a real 1.5× event
+    baseline = [10.0] * 19 + [500.0]    # median of first 19 is 10
+    volumes = baseline + [25.0]         # event bar 2.5x median of first 19
+    assert volume_confirmed(volumes, mult=1.3, lookback=20) is True
+    # Flat volume: no confirmation
+    assert volume_confirmed([10.0] * 25, mult=1.3) is False
+    # Empty / None returns False
+    assert volume_confirmed(None) is False
+    assert volume_confirmed([]) is False
+
+
+def test_phase2_harmonic_exposes_prz_helpers():
+    """P2-H1/H2: PRZ cluster and D-reversal candle helpers are attached."""
+    from patterns.harmonic import HarmonicDetector
+    assert hasattr(HarmonicDetector, '_check_prz_cluster')
+    assert hasattr(HarmonicDetector, '_has_reversal_candle_at_d')
+    # _build_signal accepts the new kwargs
+    import inspect
+    sig = inspect.signature(HarmonicDetector._build_signal)
+    for kw in ('prz_cluster', 'd_candle_ok', 'regime'):
+        assert kw in sig.parameters
+
+
+def test_phase2_wyckoff_lps_and_cause_effect_fields():
+    """P2-W1/W2: WyckoffResult carries lps_confirmed + cause_effect_target."""
+    from patterns.wyckoff import WyckoffResult
+    fields = {f.name for f in WyckoffResult.__dataclass_fields__.values()}
+    assert 'lps_confirmed' in fields
+    assert 'cause_effect_target' in fields
+
+
+def test_phase2_wyckoff_cause_effect_math():
+    """Cause-effect: sqrt-scaling of range_size with cap at entry * 0.5."""
+    from patterns.wyckoff import WyckoffAnalyzer
+    # Instantiate via the lazy proxy path
+    import patterns.wyckoff as w
+    a = w.WyckoffAnalyzer()
+    # LONG projection: key_level + range_size * sqrt(bars / min_bars)
+    target = a._cause_effect_target("LONG",
+                                    key_level=100.0,
+                                    range_bars=80,
+                                    range_size=10.0,
+                                    atr=1.0)
+    assert target is not None
+    assert target > 100.0
+    # SHORT mirror: target below key_level
+    t2 = a._cause_effect_target("SHORT", 100.0, 80, 10.0, 1.0)
+    assert t2 is not None and t2 < 100.0
+    # Invalid inputs return None
+    assert a._cause_effect_target("LONG", 0.0, 80, 10.0, 1.0) is None
+    assert a._cause_effect_target("LONG", 100.0, 0, 10.0, 1.0) is None
+
+
+def test_phase2_geometric_uses_shared_clamp():
+    """P2: GeometricPatterns._clamp_projection delegates to shared helper."""
+    from patterns.geometric import GeometricPatterns
+    from patterns._common import clamp_projection
+    # The static method should return identical values to the shared helper.
+    for raw, entry, atr in [(100.0, 10.0, 0.0),
+                            (100.0, 10.0, 3.0),
+                            (0.5, 10.0, 1.0),
+                            (-5.0, 10.0, 0.0)]:
+        assert GeometricPatterns._clamp_projection(raw, entry, atr) == \
+               clamp_projection(raw, entry, atr)
+
