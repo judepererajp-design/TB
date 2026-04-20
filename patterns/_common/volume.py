@@ -23,7 +23,10 @@ def compute_volume_stats(
     Median (not mean) keeps a single outlier from pushing the baseline above
     the current bar and silently defeating the confirmation gate.
     """
-    if not volumes:
+    # NB: do NOT use ``if not volumes`` — numpy arrays raise
+    # ``ValueError: truth value of an array is ambiguous`` there. Callers in
+    # patterns/geometric.py pass ``df['volume'].values`` directly.
+    if volumes is None:
         return None
     try:
         vols = list(volumes)

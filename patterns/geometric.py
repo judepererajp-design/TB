@@ -22,7 +22,6 @@ from strategies.base import BaseStrategy, SignalResult, SignalDirection
 from utils.formatting import fmt_price
 from utils.risk_params import rp
 from patterns._common import (
-    find_alternating_pivots,
     clamp_projection,
     regime_penalty_for_pattern,
     volume_confirmed,

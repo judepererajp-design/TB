@@ -40,6 +40,7 @@ from enum import Enum
 
 from config.loader import cfg
 from utils.formatting import fmt_price
+from patterns._common import clamp_projection
 
 logger = logging.getLogger(__name__)
 
@@ -485,9 +486,11 @@ class WyckoffAnalyzer:
         except Exception:
             scale = 1.0
         raw_distance = range_size * scale
-        # Cap to a price-sane distance (same as geometric projection cap)
-        cap = max(key_level * 0.5, atr * 3.0) if atr > 0 else key_level * 0.5
-        distance = min(raw_distance, cap)
+        # Phase-2: use shared projection clamp for consistency with geometric
+        # patterns. clamp_projection caps at max(key_level * 0.5, 3 * atr).
+        distance = clamp_projection(raw_distance, key_level, atr)
+        if distance <= 0:
+            return None
         if direction == "LONG":
             return key_level + distance
         return key_level - distance
