@@ -464,6 +464,19 @@ class InvalidationMonitor:
                     _base_thresh = min(0.030, _base_thresh * 1.6)  # 1.5% → 2.4% in chop
             except Exception:
                 pass
+            # FIX Q14: make the approaching-zone band ATR-relative when raw_data
+            # carries an ATR estimate.  A fixed 1.5% is huge on BTC (~$1500),
+            # tiny on a high-ATR alt.  Compose ATR-based band with the %-based
+            # band and take the max so low-vol assets still get a floor.
+            try:
+                _atr_pub = float((sig.raw_data or {}).get('atr_at_publish', 0) or 0)
+                if _atr_pub > 0 and current_price > 0:
+                    # 0.5×ATR as entry approach band — matches typical
+                    # pullback depth (ATR = expected 1-bar range).
+                    _atr_band_pct = (0.5 * _atr_pub) / current_price
+                    _base_thresh = max(_base_thresh, min(0.035, _atr_band_pct))
+            except Exception:
+                pass
             _approach_thresh = _base_thresh
             if sig.direction == "LONG":
                 # Price should be above entry zone for a "pullback" entry
@@ -573,26 +586,39 @@ class InvalidationMonitor:
 
             # ── 3. FundingArb — funding normalised while pending ───────
             # If funding rate has normalised, the edge that created the signal is gone.
+            # FIX B3: unit mismatch — raw_data['funding_rate'] is stored in
+            # percentage points (see strategies/funding_arb.py:118 / :416 where
+            # funding_rate_pct comes from DerivativesData.funding_rate which is
+            # analyzers/derivatives.py:117 raw *100).  api.fetch_funding_rate()
+            # returns the fractional form from the exchange (0.0005 = 0.05%).
+            # Convert both to the same unit (pp) before comparing.
             if sig.strategy == "FundingRateArb" and sig.raw_data:
-                original_funding = sig.raw_data.get('funding_rate', 0)
-                if abs(original_funding) > 0:
+                original_funding_pp = float(sig.raw_data.get('funding_rate', 0) or 0)  # pp
+                if abs(original_funding_pp) > 0:
                     try:
                         from data.api_client import api as _api_ref
                         _fd = await _api_ref.fetch_funding_rate(sig.symbol)
                         if _fd:
-                            current_funding = float(_fd.get('fundingRate', original_funding) or original_funding)
-                            # Extreme → normal: original was extreme, now within normal range
-                            _extreme_long = 0.05 / 100  # 0.05% per 8h
-                            _extreme_short = -0.03 / 100
-                            original_was_extreme = (
-                                original_funding >= _extreme_long or
-                                original_funding <= _extreme_short
+                            # Exchange returns fractional fundingRate → convert to pp
+                            _current_frac = float(
+                                _fd.get('fundingRate', original_funding_pp / 100.0)
+                                or original_funding_pp / 100.0
                             )
-                            current_is_normal = _extreme_short < current_funding < _extreme_long
+                            current_funding_pp = _current_frac * 100.0
+                            # Extreme thresholds in percentage points
+                            _extreme_long_pp = 0.05   # 0.05%/8h
+                            _extreme_short_pp = -0.03
+                            original_was_extreme = (
+                                original_funding_pp >= _extreme_long_pp or
+                                original_funding_pp <= _extreme_short_pp
+                            )
+                            current_is_normal = (
+                                _extreme_short_pp < current_funding_pp < _extreme_long_pp
+                            )
                             if original_was_extreme and current_is_normal:
                                 return (
                                     f"FundingArb: funding normalised while pending "
-                                    f"({original_funding*100:.3f}% → {current_funding*100:.3f}%) — "
+                                    f"({original_funding_pp:.3f}% → {current_funding_pp:.3f}%) — "
                                     f"squeeze edge no longer present"
                                 )
                     except Exception:
@@ -601,13 +627,18 @@ class InvalidationMonitor:
             # ── 4. Breakout — breakout level retested and failed ───────
             # If a breakout signal's level has been retested, rejected, and price
             # closed back inside the prior range, it's a false breakout.
+            # FIX B4: drop the currently-forming bar (`[:-1]`) before computing
+            # close-based structure decisions — the fresh candle is a few seconds
+            # old and will whipsaw this gate. See scanner-audit memory.
             if sig.strategy == "InstitutionalBreakout" and signal_age_mins > 60:
                 try:
                     from data.api_client import api as _api_ref
-                    _ohlcv = await _api_ref.fetch_ohlcv(sig.symbol, "1h", limit=10)
-                    if _ohlcv and len(_ohlcv) >= 4:
+                    _ohlcv = await _api_ref.fetch_ohlcv(sig.symbol, "1h", limit=12)
+                    # Use closed bars only; require ≥4 closed
+                    if _ohlcv and len(_ohlcv) >= 5:
                         import numpy as np
-                        _closes = np.array([float(b[4]) for b in _ohlcv])
+                        _closed = _ohlcv[:-1]
+                        _closes = np.array([float(b[4]) for b in _closed])
                         _breakout_level = (sig.entry_low + sig.entry_high) / 2
 
                         if sig.direction == "LONG":
@@ -626,6 +657,42 @@ class InvalidationMonitor:
                                 return (
                                     f"Breakdown false — retested {fmt_price(_breakout_level)} "
                                     f"and closed back inside range ({signal_age_mins:.0f}min)"
+                                )
+                except Exception:
+                    pass
+
+            # ── 5. Volatility-expansion gate (Q20) ─────────────────────
+            # A compressed→expanding vol transition is often the first tell
+            # that a pending swing setup is about to get stopped out in the
+            # expansion move.  If ATR has expanded ≥1.5× since publish AND the
+            # signal has aged past 30min, warn.  Only applies to swing/intraday.
+            if (
+                sig.raw_data
+                and signal_age_mins > 30
+                and sig.setup_class in ("swing", "intraday")
+            ):
+                try:
+                    from data.api_client import api as _api_ref
+                    _atr_at_publish = float(sig.raw_data.get('atr_at_publish', 0) or 0)
+                    if _atr_at_publish > 0:
+                        _ohlcv = await _api_ref.fetch_ohlcv(sig.symbol, "1h", limit=20)
+                        if _ohlcv and len(_ohlcv) >= 15:
+                            import numpy as np
+                            _closed = _ohlcv[:-1]
+                            _h = np.array([float(b[2]) for b in _closed[-14:]])
+                            _l = np.array([float(b[3]) for b in _closed[-14:]])
+                            _c = np.array([float(b[4]) for b in _closed[-15:-1]])
+                            _tr = np.maximum.reduce([
+                                _h - _l,
+                                np.abs(_h - _c),
+                                np.abs(_l - _c),
+                            ])
+                            _atr_now = float(np.mean(_tr))
+                            if _atr_now > _atr_at_publish * 1.8:
+                                return (
+                                    f"Volatility expansion {_atr_at_publish:.5g}"
+                                    f"→{_atr_now:.5g} (≥1.8×) — pending setup"
+                                    f" at risk of expansion-sweep"
                                 )
                 except Exception:
                     pass

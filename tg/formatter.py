@@ -672,7 +672,7 @@ class TelegramFormatter:
         # Pre-fetched sync from LiquidationHeatmap cache (no await needed).
         try:
             from signals.liquidation_heatmap import liquidation_heatmap as _lh
-            _cached_clusters = _lh._cluster_cache.get(sig.symbol, [])
+            _cached_clusters = _lh.get_cached_clusters(sig.symbol)
             if _cached_clusters:
                 _sl_danger, _sl_widen, _sl_note = _lh.check_sl_near_cluster(
                     sig.stop_loss, _cached_clusters
@@ -988,7 +988,7 @@ class TelegramFormatter:
             if scored:
                 _sl = scored.base_signal.stop_loss
                 _sym = scored.base_signal.symbol
-                _clusters = _lh._cluster_cache.get(_sym, [])
+                _clusters = _lh.get_cached_clusters(_sym)
                 if _clusters:
                     _danger, _widen, _sl_note = _lh.check_sl_near_cluster(_sl, _clusters)
                     if _danger:

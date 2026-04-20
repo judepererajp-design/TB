@@ -3292,6 +3292,18 @@ class Engine:
 
                     clarity = signal_clarity_scorer.score(signal, _atr_for_clarity)
 
+                    # FIX Q14/Q20: stamp the ATR used here as the reference
+                    # "ATR at publish" so the invalidation monitor can make
+                    # the approaching-zone band ATR-relative and fire the
+                    # volatility-expansion gate for aging pending setups.
+                    # This is the earliest point in the publish path where
+                    # an ATR estimate is reliably available for the signal's
+                    # entry timeframe.
+                    if _atr_for_clarity and _atr_for_clarity > 0:
+                        if getattr(signal, 'raw_data', None) is None:
+                            signal.raw_data = {}
+                        signal.raw_data.setdefault('atr_at_publish', float(_atr_for_clarity))
+
                     # Store clarity score on signal so aggregator can use it
                     # for hourly rate-limit bypass decisions.
                     signal.clarity_score = clarity.score

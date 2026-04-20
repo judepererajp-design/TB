@@ -183,6 +183,13 @@ class EnsembleVoter:
         # Signal quality info for high-confidence override
         signal_confidence: Optional[float] = None,  # raw confidence score (0-100)
         signal_rr:         Optional[float] = None,   # reward/risk ratio
+        # FIX Q17: short-window price momentum (pct change, e.g. last-hour %).
+        # Required to disambiguate "rising OI into rally" (validated longs) from
+        # "rising OI into short (longs getting trapped)".  When omitted, the
+        # ambiguous "rising OI into SHORT" vote is neutralised — fading rising
+        # OI without price confirmation is a low-edge trade that historically
+        # hurt win-rate.  Callers can pass the 1h price change pct when known.
+        price_change_pct:  Optional[float] = None,
     ) -> EnsembleVerdict:
         """
         Collect all votes and produce a verdict.
@@ -253,8 +260,17 @@ class EnsembleVoter:
             elif not is_long and oi_falling:
                 oi_vote = VoteValue.STRONG_SUPPORT if oi_strong else VoteValue.SUPPORT
             elif not is_long and oi_rising:
-                # Rising OI into a short: longs piling in → fade them
-                oi_vote = VoteValue.SUPPORT  # mild support for short
+                # FIX Q17: "Rising OI into a short" only supports the short when
+                # the market is actually going down (rally exhausting into new
+                # longs).  If price is still rising with OI, that's validated
+                # buying — fading it is a low-edge trade.  Neutralise when we
+                # lack price-direction evidence; only credit on clearly negative
+                # price momentum (>0.2% drop in the reference window).
+                if price_change_pct is not None and price_change_pct < -0.002:
+                    # Longs piling in while price is falling → fade them
+                    oi_vote = VoteValue.SUPPORT
+                else:
+                    oi_vote = VoteValue.NEUTRAL
 
         votes.append(Vote(
             source = "oi_trend",
@@ -310,20 +326,31 @@ class EnsembleVoter:
 
         # ── 6. Basis vote (optional supplementary) ────────────────────────────
         if basis_pct is not None:
+            # FIX Q12: threshold scaled per-asset.  Majors trade with tight
+            # basis in normal regimes, so 0.3% is a meaningful extreme.  Mid-
+            # and small-cap alts routinely sit at ±0.5%+ basis with no trading
+            # signal.  Scale the trigger up for non-major symbols so the vote
+            # isn't constantly firing on naturally-wide-basis tokens.
+            _sym_upper = (symbol or "").upper()
+            _is_major = any(
+                _sym_upper.startswith(m)
+                for m in ("BTC", "ETH", "SOL", "BNB")
+            )
+            basis_trigger = 0.3 if _is_major else 0.6
             basis_vote = VoteValue.NEUTRAL
-            if is_long and basis_pct > 0.3:
+            if is_long and basis_pct > basis_trigger:
                 basis_vote = VoteValue.OPPOSE  # longs crowded in perp
-            elif is_long and basis_pct < -0.3:
+            elif is_long and basis_pct < -basis_trigger:
                 basis_vote = VoteValue.SUPPORT  # shorts crowded in perp
-            elif not is_long and basis_pct < -0.3:
+            elif not is_long and basis_pct < -basis_trigger:
                 basis_vote = VoteValue.OPPOSE   # shorts crowded
-            elif not is_long and basis_pct > 0.3:
+            elif not is_long and basis_pct > basis_trigger:
                 basis_vote = VoteValue.SUPPORT  # longs crowded, short them
 
             votes.append(Vote(
                 source = "basis",
                 value  = basis_vote,
-                reason = f"Basis={basis_pct:+.2f}%",
+                reason = f"Basis={basis_pct:+.2f}% vs ±{basis_trigger:.1f}%",
                 weight = weights.get("basis", 1.0),
             ))
 
@@ -500,9 +527,14 @@ class EnsembleVoter:
             reason        = ("Ensemble SUPPRESS: CVD + Smart Money both oppose "
                              "— high-confidence fakeout signal")
 
-        elif weighted_score <= -3.0:
-            # R8-F5: Weighted threshold — strong negative conviction
-            # Use named constant from config/constants.py
+        elif weighted_score <= max(-3.0, _EVC.SUPPRESS_WEIGHTED_THRESHOLD):
+            # R8-F5: Weighted threshold — strong negative conviction.
+            # FIX B8: outer gate was hardcoded -3.0; if an operator tunes
+            # SUPPRESS_WEIGHTED_THRESHOLD to a less-negative value (e.g. -2.5),
+            # scores in (-3.0, -2.5] would have fallen through to the REDUCE
+            # branch instead of being suppressed.  Use max(-3.0, SUPPRESS)
+            # so the outer gate is always at least as permissive as the
+            # configured SUPPRESS threshold.
             if weighted_score <= _EVC.SUPPRESS_WEIGHTED_THRESHOLD:
                 hard_suppress = True
                 action        = "SUPPRESS"
