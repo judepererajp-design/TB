@@ -65,6 +65,7 @@ from core.alpha_model import alpha_model
 from core.portfolio_engine import portfolio_engine
 from core.learning_loop import learning_loop
 from core.feature_store import feature_store
+from core.counter_trend_guard import should_hard_reject_counter_trend_signal
 from utils.formatting import fmt_price
 
 # ── AI + Diagnostic modules ───────────────────────────────────
@@ -89,6 +90,7 @@ from analyzers.wallet_behavior import wallet_profiler
 from analyzers.leverage_mapper import leverage_mapper
 
 logger = logging.getLogger(__name__)
+MAX_ADJUSTED_TP_ENTRY_MULTIPLE = 10.0
 
 
 @dataclass
@@ -1875,6 +1877,7 @@ class Engine:
                     try:
                         if not telegram_bot.is_strategy_enabled(self._strat_key_map.get(strategy.name, strategy.name.lower())):
                             continue
+                        performance_tracker.ensure_strategy(strategy.name)
                         if performance_tracker.is_strategy_disabled(strategy.name):
                             continue
                         # VOLATILE whitelist gate: only permitted strategies run
@@ -1883,6 +1886,13 @@ class Engine:
 
                         signal = await strategy.analyze(symbol, ohlcv_dict)
                         if signal:
+                            _signal_dir = getattr(signal.direction, 'value', str(signal.direction))
+                            if should_hard_reject_counter_trend_signal(signal.strategy, _signal_dir, regime_name):
+                                logger.info(
+                                    f"   ⛔ {symbol}: hard-rejected counter-trend {_signal_dir} "
+                                    f"[{signal.strategy}] in {regime_name}"
+                                )
+                                continue
                             state = scanner._symbols.get(symbol)
                             signal.tier = state.tier.value if state else 2
                             if getattr(signal, 'raw_data', None) is None:
@@ -1900,7 +1910,7 @@ class Engine:
                             self._strategy_last_signal[_strat_key] = time.time()
                             # V2.09: Track per-strategy direction counts for structural audit
                             try:
-                                ai_analyst.record_strategy_signal(signal.strategy, getattr(signal.direction, 'value', str(signal.direction)))
+                                ai_analyst.record_strategy_signal(signal.strategy, _signal_dir)
                             except Exception:
                                 pass
                     except Exception as e:
@@ -3332,7 +3342,7 @@ class Engine:
                 # range structure, and setup class. This is where CHOPPY tightens
                 # targets to range boundaries and TRENDING widens them.
                 try:
-                    from signals.regime_levels import STRUCTURE_MAX_SCORE, adjust_levels
+                    from signals.regime_levels import STRUCTURE_MAX_SCORE, MAX_TARGET_RR, adjust_levels
                     # FIX TP-CORRUPTION: pass the SYMBOL's own range, not BTC's global range.
                     # regime_analyzer.range_high/low is BTC's weekly range (~$70k/$60k).
                     # Passing that to an altcoin at $0.71 caused SL distances of ~$59,000
@@ -3365,8 +3375,14 @@ class Engine:
                     # Safety check: reject adjustments that produce absurd TPs
                     # (e.g. if range data was still wrong for any reason)
                     _entry_mid_check = (signal.entry_low + signal.entry_high) / 2
-                    _max_sane_tp = _entry_mid_check * 10.0  # TP can't be more than 10x entry
-                    if _adj.tp1 > 0 and abs(_adj.tp1 - _entry_mid_check) < abs(_entry_mid_check) * 10.0:
+                    _targets_positive = (
+                        _adj.tp1 > 0
+                        and _adj.tp2 > 0
+                        and (_adj.tp3 is None or _adj.tp3 > 0)
+                    )
+                    _rr_sane = 0 < float(getattr(_adj, "rr_ratio", 0.0)) <= MAX_TARGET_RR
+                    _tp1_sane = abs(_adj.tp1 - _entry_mid_check) < abs(_entry_mid_check) * MAX_ADJUSTED_TP_ENTRY_MULTIPLE
+                    if _targets_positive and _rr_sane and _tp1_sane:
                         signal.stop_loss = _adj.stop_loss
                         signal.tp1 = _adj.tp1
                         signal.tp2 = _adj.tp2
@@ -3374,7 +3390,8 @@ class Engine:
                         signal.rr_ratio = _adj.rr_ratio
                     else:
                         logger.warning(
-                            f"   ⚠️  {symbol}: adjust_levels produced absurd TP1={_adj.tp1:.4f} "
+                            f"   ⚠️  {symbol}: adjust_levels produced absurd levels "
+                            f"(tp1={_adj.tp1:.4f}, tp2={_adj.tp2:.4f}, rr={getattr(_adj, 'rr_ratio', 0.0):.2f}) "
                             f"for entry={_entry_mid_check:.4f} — keeping original levels"
                         )
                     if _adj.adjustments:

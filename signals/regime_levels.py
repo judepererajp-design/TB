@@ -113,6 +113,9 @@ TP1_MIN_R = {
 
 # ── Minimum gap between TPs (in R-multiples) ─────────────────
 MIN_TP_GAP_R = 0.3
+MAX_TARGET_RR = 8.0
+MIN_POSITIVE_PRICE_FRAC = 0.01
+MIN_POSITIVE_PRICE_ABS = 1e-8
 STRUCTURE_LOOKBACK_BARS = 30  # Bars inspected for local structure and VWAP context.
 STRUCTURE_MIN_BARS = 14  # Minimum bars needed to evaluate 13-bar BOS plus the trigger bar.
 STRUCTURE_FALLBACK_BARS = 5  # Consecutive bars used when pivots are too sparse to form swings.
@@ -657,6 +660,25 @@ def adjust_levels(
         _tp3_pct_display = f"{min(_tp3_pct_raw, 9999):.0f}" + ("%" if _tp3_pct_raw < 9999 else "%+ (overflow)")
         adjustments.append(f"TP3 capped: {_tp3_pct_display} → 50%")
         tp3_dist = _max_tp3_dist
+
+    # ── 5c. Hard-cap target ladder to sane R multiples / positive prices ──
+    _max_target_dist = sl_dist * MAX_TARGET_RR
+    if not is_long:
+        _min_positive_price = max(entry_mid * MIN_POSITIVE_PRICE_FRAC, MIN_POSITIVE_PRICE_ABS)
+        _max_target_dist = min(_max_target_dist, max(0.0, entry_mid - _min_positive_price))
+    if _max_target_dist > 0:
+        _has_tp3 = tp3_dist > 0
+        _tp1_cap = _max_target_dist - (2 * min_gap if _has_tp3 else min_gap)
+        _tp2_cap = _max_target_dist - (min_gap if _has_tp3 else 0.0)
+        if _tp1_cap > 0 and tp1_dist > _tp1_cap:
+            adjustments.append(f"TP1 capped at {MAX_TARGET_RR:.1f}R ladder max")
+            tp1_dist = _tp1_cap
+        if _tp2_cap > 0 and tp2_dist > _tp2_cap:
+            adjustments.append(f"TP2 capped at {MAX_TARGET_RR:.1f}R")
+            tp2_dist = _tp2_cap
+        if tp3_dist > 0 and tp3_dist > _max_target_dist:
+            adjustments.append(f"TP3 capped at {MAX_TARGET_RR:.1f}R")
+            tp3_dist = _max_target_dist
 
     # ── 6. Disable TP3 in VOLATILE ─────────────────────────────
     if not profile["tp3_enabled"]:

@@ -46,6 +46,7 @@ def _regime_recently_changed(within_secs: int = 600) -> bool:
         return False
 
 logger = logging.getLogger(__name__)
+PERMA_EXCLUDE_OHLCV_CYCLES = 2
 
 
 class Tier(int, Enum):
@@ -108,7 +109,9 @@ class Scanner:
 
         # OHLCV data-quality cooldown — symbols that fail N times are auto-excluded
         self._ohlcv_fail_counts: Dict[str, int] = {}      # symbol → consecutive failures
+        self._ohlcv_fail_cycles: Dict[str, int] = {}      # symbol → cooldown cycles without recovery
         self._ohlcv_cooldown_until: Dict[str, float] = {} # symbol → cooldown expiry ts
+        self._perma_excluded_symbols: Set[str] = set()    # symbol → permanently excluded from rebuilds
         # Temporary exclusion cooldown (edge-case spam control)
         self._temp_excluded_until: Dict[str, float] = {}  # symbol → temporary exclusion expiry ts
 
@@ -181,6 +184,7 @@ class Scanner:
             excluded = set(cfg.exchange.get('excluded_symbols', [])
                            if isinstance(cfg.exchange.get('excluded_symbols', []), list)
                            else [])
+            excluded.update(self._perma_excluded_symbols)
 
             # Sort by volume descending
             qualified = []
@@ -244,6 +248,7 @@ class Scanner:
                 self._whale_cooldown,
                 self._watchlist_cooldown,
                 self._ohlcv_fail_counts,
+                self._ohlcv_fail_cycles,
                 self._ohlcv_cooldown_until,
                 self._temp_excluded_until,
                 self._whale_snapshot,
@@ -315,8 +320,12 @@ class Scanner:
 
     def exclude_symbol(self, symbol: str):
         """E3: Permanently remove a delisted/bad symbol from the scan universe."""
+        self._perma_excluded_symbols.add(symbol)
         # FIX: pop() is atomic at the GIL level — safe without a lock
         self._symbols.pop(symbol, None)
+        self._ohlcv_fail_counts.pop(symbol, None)
+        self._ohlcv_fail_cycles.pop(symbol, None)
+        self._ohlcv_cooldown_until.pop(symbol, None)
         self._temp_excluded_until.pop(symbol, None)
         logger.info(f"Scanner: excluded {symbol} from universe (delisted or bad symbol)")
 
@@ -361,11 +370,20 @@ class Scanner:
         self._ohlcv_fail_counts[symbol] = count
 
         if count >= OHLCVCooldown.FAIL_THRESHOLD:
+            self._ohlcv_fail_counts.pop(symbol, None)  # reset the per-cycle counter before cooldown/exclusion
+            cycles = self._ohlcv_fail_cycles.get(symbol, 0) + 1
+            self._ohlcv_fail_cycles[symbol] = cycles
+            if cycles >= PERMA_EXCLUDE_OHLCV_CYCLES:
+                logger.warning(
+                    f"📊 OHLCV perma-exclusion: {symbol} hit {cycles} cooldown cycles "
+                    f"without recovery — removing from universe"
+                )
+                self.exclude_symbol(symbol)
+                return True
             self._ohlcv_cooldown_until[symbol] = time.time() + OHLCVCooldown.COOLDOWN_SECS
-            self._ohlcv_fail_counts.pop(symbol, None)  # reset counter
             logger.warning(
                 f"📊 OHLCV cooldown: {symbol} failed {count}× — "
-                f"excluding for {OHLCVCooldown.COOLDOWN_SECS}s"
+                f"excluding for {OHLCVCooldown.COOLDOWN_SECS}s (cycle {cycles})"
             )
             return True
         return False
@@ -373,6 +391,7 @@ class Scanner:
     def record_ohlcv_success(self, symbol: str):
         """Clear the failure counter on a successful OHLCV fetch."""
         self._ohlcv_fail_counts.pop(symbol, None)
+        self._ohlcv_fail_cycles.pop(symbol, None)
 
     def is_ohlcv_cooled_down(self, symbol: str) -> bool:
         """Return True if *symbol* is still in OHLCV cooldown."""

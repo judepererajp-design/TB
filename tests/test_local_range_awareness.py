@@ -321,6 +321,31 @@ class TestCounterTrendPullbackCaps:
         assert result.tp3 is not None, "Trend-aligned trade should keep TP3"
         assert not any("counter-trend pullback" in adj.lower() for adj in result.adjustments)
 
+    def test_tp2_rr_is_hard_capped_at_8r(self):
+        result = adjust_levels(
+            entry_low=99.5, entry_high=100.5,
+            stop_loss=97.0,
+            tp1=120.0, tp2=180.0, tp3=260.0,
+            direction="LONG", setup_class="intraday",
+            regime="BULL_TREND", chop_strength=0.20,
+            range_high=140.0, range_low=90.0, range_eq=115.0,
+        )
+        assert result.rr_ratio <= 8.0
+        assert any("TP2 capped at 8.0R" in adj for adj in result.adjustments)
+
+    def test_short_targets_never_go_negative(self):
+        result = adjust_levels(
+            entry_low=1.42, entry_high=1.44,
+            stop_loss=1.54,
+            tp1=-5.0, tp2=-8.0, tp3=-12.0,
+            direction="SHORT", setup_class="intraday",
+            regime="BULL_TREND", chop_strength=0.20,
+            range_high=1.90, range_low=0.70, range_eq=1.20,
+        )
+        assert result.tp1 > 0
+        assert result.tp2 > 0
+        assert result.tp3 is None or result.tp3 > 0
+
 
 class TestLocalContinuationTradeTypes:
     """Strong local structure should avoid pullback-only handling."""

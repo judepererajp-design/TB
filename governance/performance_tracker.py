@@ -91,6 +91,18 @@ class PerformanceTracker:
         self._max_boost   = getattr(self._adapt_cfg, 'max_weight_boost', 0.15)
         self._max_penalty = getattr(self._adapt_cfg, 'max_weight_penalty', -0.15)
 
+    def ensure_strategy(self, strategy: str) -> Optional[StrategyStats]:
+        """Ensure *strategy* exists in the in-memory registry."""
+        if not isinstance(strategy, str):
+            return None
+        name = strategy.strip()
+        if not name:
+            return None
+        if name not in self._stats:
+            self._stats[name] = StrategyStats(name=name)
+            logger.info(f"📊 Performance tracker registered strategy: {name}")
+        return self._stats[name]
+
     async def initialize(self):
         """Load historical performance from database.
 
@@ -204,10 +216,9 @@ class PerformanceTracker:
             entry_status: IN_ZONE | LATE | EXTENDED — captured at fill time
             max_r: Maximum favourable excursion reached during the trade (R)
         """
-        if strategy not in self._stats:
-            self._stats[strategy] = StrategyStats(name=strategy)
-
-        stats = self._stats[strategy]
+        stats = self.ensure_strategy(strategy)
+        if stats is None:
+            return
         stats.total_signals += 1
 
         if outcome == 'SKIPPED':
@@ -397,15 +408,12 @@ class PerformanceTracker:
         making the suppression instant-reset. Now is_strategy_disabled() checks
         time.time() < disabled_until, which survives restarts correctly.
         """
-        if strategy not in self._stats:
-            logger.warning(
-                f"suppress_strategy: '{strategy}' is not a tracked strategy — "
-                f"suppression ignored. Known strategies: {list(self._stats.keys())}"
-            )
+        stats_obj = self.ensure_strategy(strategy)
+        if stats_obj is None:
+            logger.warning("suppress_strategy: invalid empty strategy name — suppression ignored")
             return
         now = time.time()
         new_until = now + duration_mins * 60
-        stats_obj = self._stats[strategy]
         stats_obj.is_disabled = True
         # HIGH-FIX (suppress_strategy): take max() of the new deadline and any
         # existing deadline so consecutive suppressions do NOT shorten the total
@@ -421,7 +429,7 @@ class PerformanceTracker:
         import asyncio
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(self._save_strategy_state(self._stats[strategy]))
+            loop.create_task(self._save_strategy_state(stats_obj))
         except RuntimeError:
             logger.debug(f"suppress_strategy: no running loop — persistence deferred for {strategy}")
 
