@@ -1834,14 +1834,19 @@ class Engine:
                 # Previously a hard `return` silenced the bot entirely — but REGIME_THRESHOLDS
                 # already defines a whitelist for exactly this scenario. Use it.
                 _risk_off_whitelist = None
-                _current_regime_val = regime_analyzer.regime.value
-                if _current_regime_val in ('VOLATILE', 'VOLATILE_PANIC'):
+                # Resolve the regime name once here so downstream code (e.g. the
+                # per-strategy counter-trend guard at ~1890) can reference it.
+                # Previously ``regime_name`` was only assigned ~200 lines below,
+                # causing UnboundLocalError for every strategy that produced a
+                # signal ("cannot access local variable 'regime_name'...").
+                regime_name = getattr(regime_analyzer.regime, 'value', 'UNKNOWN')
+                if regime_name in ('VOLATILE', 'VOLATILE_PANIC'):
                     from signals.regime_thresholds import REGIME_THRESHOLDS
-                    _regime_cfg = REGIME_THRESHOLDS.get(_current_regime_val, {})
+                    _regime_cfg = REGIME_THRESHOLDS.get(regime_name, {})
                     _risk_off_whitelist = _regime_cfg.get('strategies')
                     # strategies=None means ALL strategies allowed in this regime (normal VOLATILE)
                     # Only VOLATILE_PANIC has an explicit whitelist restriction
-                    if _current_regime_val == 'VOLATILE_PANIC' and not _risk_off_whitelist:
+                    if regime_name == 'VOLATILE_PANIC' and not _risk_off_whitelist:
                         logger.info(f"⚠️ VOLATILE_PANIC with empty whitelist — skipping {symbol}")
                         return
                     # VOLATILE with strategies=None: allow all — no skip
@@ -2101,6 +2106,8 @@ class Engine:
                 # ── Regime threshold filter (soft) ─────────────────
                 from signals.regime_thresholds import apply_regime_filter, is_in_range_outer_zone
                 from analyzers.htf_guardrail import htf_guardrail as _htf_regime_ref
+                # regime_name is already resolved at the top of _scan_symbol; re-read here
+                # defensively in case regime_analyzer.regime rotated mid-scan.
                 regime_name = getattr(regime_analyzer.regime, 'value', 'UNKNOWN')
                 chop_str = regime_analyzer.chop_strength
                 # FIX: initialise adj_conf before the try block. If apply_regime_filter raises

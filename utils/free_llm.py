@@ -32,7 +32,9 @@ _RETRY_DELAY_S  = 2      # seconds between attempt 1 and attempt 2
 _FALLBACK_MODEL = "openai"  # most stable Pollinations model
 
 # Model assignments -- three different architectures for genuine debate diversity
-MODEL_PROPOSER   = "mistral-large"   # Mistral Large -- structured reasoning
+MODEL_PROPOSER   = "openai-large"    # Pollinations: 'mistral-large' was removed from the
+                                     # legacy /openai endpoint (HTTP 404 "Model not found");
+                                     # openai-large keeps "strong reasoning" role alive.
 MODEL_CHALLENGER = "llama"           # Meta Llama 3 70B -- adversarial critique
 MODEL_ARBITRATOR = "openai"          # OpenAI-class -- balanced arbitration
 MODEL_FAST       = "openai"          # Pollinations: 'mistral' model was removed; use openai
