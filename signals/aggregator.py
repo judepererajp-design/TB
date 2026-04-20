@@ -919,7 +919,7 @@ class SignalAggregator:
         # DEDUP-FIX: Dedup now runs AFTER scoring so it compares final vs final confidence.
         # Previously it compared raw strategy confidence (pre-scoring) which caused the
         # breakthrough exception to fire incorrectly.
-        _sig_dir = direction_str(signal) if hasattr(signal.direction, 'value') else str(signal.direction)
+        _sig_dir = direction_str(signal)
 
         # ── 2. Daily signal limit per symbol ────────────────
         # A/A+ signals get a higher daily symbol limit — they represent persistent

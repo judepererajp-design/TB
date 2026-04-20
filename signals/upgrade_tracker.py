@@ -289,9 +289,7 @@ class UpgradeTracker:
             (send_to_user: bool, up_score: float)
         """
         sig = scored.base_signal
-        direction = (direction_str(sig)
-                     if hasattr(sig.direction, 'value')
-                     else str(sig.direction))
+        direction = (direction_str(sig))
         regime = scored.regime or getattr(regime_analyzer.regime, 'value', 'UNKNOWN')
         strategy = sig.strategy or "Unknown"
         context_key = f"{strategy}|{regime}|{direction}"
@@ -475,9 +473,7 @@ class UpgradeTracker:
           20% — Volume presence
         """
         sig = scored.base_signal
-        direction = (direction_str(sig)
-                     if hasattr(sig.direction, 'value')
-                     else str(sig.direction))
+        direction = (direction_str(sig))
         regime = scored.regime or getattr(regime_analyzer.regime, 'value', 'UNKNOWN')
 
         regime_score  = self._score_regime(regime, direction)
@@ -517,9 +513,7 @@ class UpgradeTracker:
         we also score whether confluence, confidence, and orderflow are growing.
         """
         sig = scored.base_signal
-        direction = (direction_str(sig)
-                     if hasattr(sig.direction, 'value')
-                     else str(sig.direction))
+        direction = (direction_str(sig))
         scan_key = f"{sig.symbol}|{sig.strategy}|{direction}"
         now = time.time()
 
@@ -717,9 +711,7 @@ class UpgradeTracker:
         if not self._db:
             return
         sig = scored.base_signal
-        direction = (direction_str(sig)
-                     if hasattr(sig.direction, 'value')
-                     else str(sig.direction))
+        direction = (direction_str(sig))
         regime = scored.regime or getattr(regime_analyzer.regime, 'value', 'UNKNOWN')
         rec = UpgradeRecord(
             signal_id=signal_id,

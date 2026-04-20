@@ -53,7 +53,7 @@ class SignalPublisher:
             return False
 
         sig = scored.base_signal
-        direction = direction_str(sig) if hasattr(sig.direction, 'value') else str(sig.direction)
+        direction = direction_str(sig)
 
         # ── 1. Save to database first (always) ───────────────────────
         signal_record = {

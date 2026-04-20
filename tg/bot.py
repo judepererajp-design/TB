@@ -503,7 +503,7 @@ class TelegramBot(CommandsMixin, CallbacksMixin):
             sig = scored.base_signal
             symbol = sig.symbol
             tf = sig.timeframe
-            direction = direction_str(sig) if hasattr(sig.direction, 'value') else str(sig.direction)
+            direction = direction_str(sig)
             # PHASE 3 AUDIT FIX (P3-4): use alpha grade (execution grade) for
             # keyboard buttons and internal records, matching the formatter card.
             grade = (alpha_score.grade if alpha_score and hasattr(alpha_score, 'grade')
@@ -1129,7 +1129,7 @@ class TelegramBot(CommandsMixin, CallbacksMixin):
             sig = scored.base_signal
             symbol = sig.symbol
             tf = sig.timeframe
-            direction = direction_str(sig) if hasattr(sig.direction, 'value') else str(sig.direction)
+            direction = direction_str(sig)
 
             text = formatter.format_context_signal(scored, signal_id, up_score)
 
@@ -1210,7 +1210,7 @@ class TelegramBot(CommandsMixin, CallbacksMixin):
         try:
             sig = new_scored.base_signal
             symbol = sig.symbol
-            direction = direction_str(sig) if hasattr(sig.direction, 'value') else str(sig.direction)
+            direction = direction_str(sig)
 
             # Upgrade notification message
             upgrade_text = formatter.format_upgrade_message(
