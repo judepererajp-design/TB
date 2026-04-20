@@ -48,6 +48,67 @@ def _regime_recently_changed(within_secs: int = 600) -> bool:
 logger = logging.getLogger(__name__)
 PERMA_EXCLUDE_OHLCV_CYCLES = 2
 
+# ── Shared numeric helpers ────────────────────────────────
+# Incremental Wilder RSI that produces the full series in a single pass —
+# replaces the O(N²) recomputation pattern `[rsi(closes[:i]) for i in ...]`.
+
+def _wilder_rsi_series(closes, period: int = 14):
+    """
+    Return a list of RSI values, one per close, using Wilder's smoothing.
+    Leading `period` values are NaN because RSI is undefined until the first
+    averaging window is filled. Complexity: O(N).
+    """
+    n = len(closes)
+    out = [float('nan')] * n
+    if n < period + 1:
+        return out
+    # Seed: first `period` gains/losses averaged simply (standard Wilder seed).
+    gains_sum = 0.0
+    losses_sum = 0.0
+    for i in range(1, period + 1):
+        d = float(closes[i]) - float(closes[i - 1])
+        if d > 0:
+            gains_sum += d
+        else:
+            losses_sum += -d
+    avg_g = gains_sum / period
+    avg_l = losses_sum / period
+    if avg_l == 0:
+        out[period] = 100.0 if avg_g > 0 else 50.0
+    else:
+        out[period] = 100.0 - 100.0 / (1.0 + avg_g / avg_l)
+    # Wilder smoothing for the remainder.
+    for i in range(period + 1, n):
+        d = float(closes[i]) - float(closes[i - 1])
+        g = d if d > 0 else 0.0
+        l = -d if d < 0 else 0.0
+        avg_g = (avg_g * (period - 1) + g) / period
+        avg_l = (avg_l * (period - 1) + l) / period
+        if avg_l == 0:
+            out[i] = 100.0 if avg_g > 0 else 50.0
+        else:
+            out[i] = 100.0 - 100.0 / (1.0 + avg_g / avg_l)
+    return out
+
+
+def _wilder_rsi_last(closes, period: int = 14) -> float:
+    """O(N) last-value Wilder RSI. Returns 50.0 when insufficient data."""
+    series = _wilder_rsi_series(closes, period)
+    if not series:
+        return 50.0
+    last = series[-1]
+    return 50.0 if last != last else float(last)  # NaN → 50
+
+
+def _true_range(highs, lows, closes, start: int, end: int):
+    """Iterator over true ranges in [start, end)."""
+    for i in range(start, end):
+        yield max(
+            float(highs[i]) - float(lows[i]),
+            abs(float(highs[i]) - float(closes[i - 1])),
+            abs(float(lows[i]) - float(closes[i - 1])),
+        )
+
 
 class Tier(int, Enum):
     TIER1 = 1   # $5M+ volume — scanned every 2 min
@@ -64,8 +125,11 @@ class SymbolState:
     last_scan: float = 0.0
     last_signal: float = 0.0
     activity_score: float = 0.0
+    activity_score_ts: float = 0.0  # Last decay timestamp for activity_score
     promoted_at: float = 0.0        # Timestamp of last promotion
     low_volume_streak: int = 0
+    low_volume_since: float = 0.0   # Timestamp when current low-vol streak began
+    tier3_underfloor_since: float = 0.0  # Timestamp when T3 went below floor
     scan_count: int = 0
     category: str = "UNKNOWN"
 
@@ -123,6 +187,169 @@ class Scanner:
         self._universe_ttl = self._sys_cfg.get('universe_refresh', 3600)
 
         self._lock = asyncio.Lock()
+
+        # Per-path dedup TTL age guard — any key whose ts is older than this
+        # is evicted on read so the dicts can't grow unboundedly.
+        self._dedup_max_age = 4 * 3600   # 4 h covers any regime-dependent TTL
+
+        # Global alert-rate circuit breaker (token-bucket).
+        # Protects Telegram from flooding in violent markets.
+        self._alert_tokens: Dict[str, list] = {}   # path → list of emit ts
+
+        # Observability counters (emitted via get_stats()).
+        self._counters: Dict[str, int] = {
+            'alerts_watchlist': 0,
+            'alerts_watchlist_suppressed_rate': 0,
+            'alerts_watchlist_suppressed_dedup': 0,
+            'whales_fired': 0,
+            'icebergs_fired': 0,
+            'promotions': 0,
+            'demotions': 0,
+            'stalker_panic_skip': 0,
+        }
+
+        # Persistence restore flag — populated on first await of
+        # _restore_persisted_state(). Tolerant of DB unavailability.
+        self._persistence_loaded: bool = False
+
+    # ── Persistence (uses db.learning_state key/value store) ─────
+    #
+    # `volume_ma`, `promoted_at`, the low-volume streak timer and the
+    # whale / stalker cooldown dicts all used to live only in memory.
+    # Every deploy or crash cold-started the scanner, so:
+    #   • `volume_ma` = current 24 h vol → auto-promotion effectively off
+    #     for 1–3 days (the EMA τ) right when operators need it.
+    #   • `_whale_snapshot` = empty → 2-snapshot persistence gate can't fire
+    #     for ~1 cycle, re-firing already-alerted walls.
+    #   • `_watched` / `_watchlist_cooldown` / `_signal_dedup` = empty →
+    #     identical watchlist alerts re-emit after every restart.
+    # We persist these as a single JSON blob under the learning_state kv
+    # store to avoid schema migrations.
+
+    _PERSIST_KEY = "scanner_runtime_state_v1"
+
+    async def _restore_persisted_state(self):
+        """Best-effort load of runtime state from DB. Silent on failure."""
+        if self._persistence_loaded:
+            return
+        self._persistence_loaded = True
+        try:
+            state = await db.load_learning_state(self._PERSIST_KEY)
+        except Exception:
+            return
+        if not isinstance(state, dict):
+            return
+        try:
+            now = time.time()
+            # Only restore entries < 24 h old — older ones are stale.
+            max_age = 24 * 3600
+            sym_state = state.get('symbols', {})
+            if isinstance(sym_state, dict):
+                for sym, blob in sym_state.items():
+                    if sym in self._symbols and isinstance(blob, dict):
+                        st = self._symbols[sym]
+                        st.volume_ma = float(blob.get('volume_ma', st.volume_ma) or 0.0)
+                        st.promoted_at = float(blob.get('promoted_at', st.promoted_at) or 0.0)
+                        st.low_volume_since = float(blob.get('low_volume_since', 0.0) or 0.0)
+                        st.activity_score = float(blob.get('activity_score', 0.0) or 0.0)
+                        st.activity_score_ts = float(blob.get('activity_score_ts', 0.0) or 0.0)
+            for src_key, dst in (
+                ('whale_cooldown', self._whale_cooldown),
+                ('watchlist_cooldown', self._watchlist_cooldown),
+                ('temp_excluded_until', self._temp_excluded_until),
+            ):
+                blob = state.get(src_key)
+                if isinstance(blob, dict):
+                    for k, v in blob.items():
+                        try:
+                            ts = float(v)
+                        except (TypeError, ValueError):
+                            continue
+                        if now - ts < max_age:
+                            dst[k] = ts
+            # signal_dedup: tuple keys encoded as "symbol|setup"
+            sd = state.get('signal_dedup')
+            if isinstance(sd, dict):
+                for encoded, v in sd.items():
+                    if '|' not in str(encoded):
+                        continue
+                    sym, setup = str(encoded).split('|', 1)
+                    try:
+                        ts = float(v)
+                    except (TypeError, ValueError):
+                        continue
+                    if now - ts < max_age:
+                        self._signal_dedup[(sym, setup)] = ts
+            wsnap = state.get('whale_snapshot')
+            if isinstance(wsnap, dict):
+                for sym, sides in wsnap.items():
+                    if isinstance(sides, dict):
+                        self._whale_snapshot[sym] = {k: float(v or 0.0) for k, v in sides.items()}
+            logger.info("Scanner: restored persisted runtime state")
+        except Exception as e:
+            logger.debug(f"Scanner: persisted state partially restored: {e}")
+
+    async def _persist_state(self):
+        """Best-effort snapshot of runtime state to DB."""
+        try:
+            symbols_blob = {
+                sym: {
+                    'volume_ma': st.volume_ma,
+                    'promoted_at': st.promoted_at,
+                    'low_volume_since': st.low_volume_since,
+                    'activity_score': st.activity_score,
+                    'activity_score_ts': st.activity_score_ts,
+                }
+                for sym, st in self._symbols.items()
+            }
+            payload = {
+                'symbols': symbols_blob,
+                'whale_cooldown': dict(self._whale_cooldown),
+                'watchlist_cooldown': dict(self._watchlist_cooldown),
+                'temp_excluded_until': dict(self._temp_excluded_until),
+                'signal_dedup': {
+                    f"{k[0]}|{k[1]}": v for k, v in self._signal_dedup.items()
+                    if isinstance(k, tuple) and len(k) == 2
+                },
+                'whale_snapshot': self._whale_snapshot,
+            }
+            await db.save_learning_state(self._PERSIST_KEY, payload)
+        except Exception as e:
+            logger.debug(f"Scanner: persist failed (non-fatal): {e}")
+
+    # ── Shared cross-path dedup ──────────────────────────────
+    def try_mark_signal_dedup(self, key: Tuple[str, str], ttl_secs: float) -> bool:
+        """
+        Atomically check-and-mark the cross-path signal dedup.
+        Returns True if the caller should proceed (no recent duplicate);
+        False if a duplicate alert was emitted within ``ttl_secs``.
+        """
+        now = time.time()
+        last = self._signal_dedup.get(key, 0.0)
+        if now - last < ttl_secs:
+            return False
+        self._signal_dedup[key] = now
+        # Opportunistic eviction of stale keys on the write path.
+        if len(self._signal_dedup) > 256:
+            cutoff = now - self._dedup_max_age
+            stale = [k for k, ts in self._signal_dedup.items() if ts < cutoff]
+            for k in stale:
+                self._signal_dedup.pop(k, None)
+        return True
+
+    # ── Alert-rate circuit breaker ───────────────────────────
+    def _rate_allow(self, path: str, max_alerts: int, window_secs: int) -> bool:
+        """Token-bucket: ≤ ``max_alerts`` per ``window_secs`` per path."""
+        now = time.time()
+        bucket = self._alert_tokens.setdefault(path, [])
+        cutoff = now - window_secs
+        # Drop stale timestamps in-place
+        while bucket and bucket[0] < cutoff:
+            bucket.pop(0)
+        if len(bucket) >= max_alerts:
+            return False
+        bucket.append(now)
+        return True
 
     # ── Universe Management ───────────────────────────────────
 
@@ -241,6 +468,14 @@ class Scanner:
             self._symbols = new_symbols
             self._last_universe_refresh = now
 
+            # Restore persisted runtime state (volume_ma, cooldowns, dedup)
+            # after the first universe build. Best-effort; no-op on failure.
+            if not self._persistence_loaded:
+                try:
+                    await self._restore_persisted_state()
+                except Exception:
+                    self._persistence_loaded = True  # don't retry storm
+
             # Prune cooldown entries that belong to symbols no longer in the
             # universe so the dicts don't grow unboundedly on long-running instances.
             active_symbols = set(new_symbols)
@@ -281,7 +516,8 @@ class Scanner:
     def get_due_symbols(self) -> List[str]:
         """
         Return symbols that are due for scanning right now.
-        Priority: Tier 1 first, then 2, then 3.
+        Priority: Tier 1 first, then 2, then 3. Ties are broken by
+        how-overdue and recent signal activity.
         """
         now = time.time()
         due = []
@@ -296,13 +532,25 @@ class Scanner:
             if now - state.last_scan >= interval:
                 due.append(symbol)
 
-        # Sort by tier priority (T1 first) then by how overdue they are
+        # Sort by tier priority (T1 first), then by how overdue, then by
+        # activity_score (decayed). Snapshot `now` once instead of per-compare.
+        snapshot = {
+            sym: self._symbols.get(sym) for sym in due
+        }
+
         def priority(sym):
-            state = self._symbols.get(sym)
+            state = snapshot.get(sym)
             if not state:
-                return (99, 0)
-            overdue = (time.time() - state.last_scan) / self._tier_intervals.get(state.tier, 300)
-            return (state.tier.value, -overdue)  # Lower tier = higher priority
+                return (99, 0.0, 0.0)
+            interval = self._tier_intervals.get(state.tier, 300)
+            overdue = (now - state.last_scan) / interval if interval > 0 else 0.0
+            # activity_score is decayed so a dead coin from last week doesn't
+            # keep stealing slots. Half-life ~6 h.
+            age = max(0.0, now - (state.activity_score_ts or 0.0))
+            decayed = state.activity_score * math.exp(-age / (6 * 3600.0))
+            # Lower tier → higher priority. Negative overdue/score so Python's
+            # stable ascending sort gives the desired order.
+            return (state.tier.value, -overdue, -decayed)
 
         due.sort(key=priority)
         return due
@@ -405,12 +653,21 @@ class Scanner:
         return True
 
     def mark_signal(self, symbol: str):
-        """Mark that a signal was generated for this symbol"""
-        # FIX: same as mark_scanned — use direct state mutation via .get()
+        """Mark that a signal was generated for this symbol.
+
+        Adds to a time-decayed activity score used by get_due_symbols() to
+        prioritise historically productive symbols in dense scan cycles.
+        """
         state = self._symbols.get(symbol)
         if state:
-            state.last_signal = time.time()
-            state.activity_score += 10
+            now = time.time()
+            # Decay the existing score first so `+= 10` is not unbounded.
+            age = max(0.0, now - (state.activity_score_ts or now))
+            decayed = state.activity_score * math.exp(-age / (6 * 3600.0))
+            # Cap activity_score to keep priority stable; 30 = 3 signals worth.
+            state.activity_score = min(30.0, decayed + 10.0)
+            state.activity_score_ts = now
+            state.last_signal = now
 
     # ── Auto-Promotion ─────────────────────────────────────────
 
@@ -464,12 +721,41 @@ class Scanner:
         min_vol = getattr(prom_cfg, 'min_volume_for_promotion', 500_000)
 
         # Symmetric low-volume demotion: if a symbol remains below its current
-        # tier's minimum volume for N consecutive checks, demote one enabled tier.
-        demotion_cycles = int(getattr(prom_cfg, 'demotion_cycles', 3) or 3)
+        # tier's minimum volume for at least N minutes *continuously*, demote
+        # one enabled tier. Time-based rather than call-based prevents Tier-1
+        # from demoting in a few minutes of quiet (it scans every 2 min).
+        demotion_minutes = float(getattr(prom_cfg, 'demotion_minutes', 60) or 60)
         current_tier_min = tier_min_vol.get(state.tier, 0.0)
-        if state.tier != Tier.TIER3 and current_volume < current_tier_min:
-            state.low_volume_streak += 1
-            if state.low_volume_streak >= demotion_cycles:
+        under_floor_now = current_volume < current_tier_min
+        # Tier-3 floor: below T3 min for a sustained period → temporary exile.
+        # Without this a dead symbol stays in T3 until the next hourly universe
+        # rebuild (up to 4 wasted 15-min scans).
+        if state.tier == Tier.TIER3:
+            t3_floor_minutes = float(getattr(prom_cfg, 'tier3_exile_minutes', 180) or 180)
+            if under_floor_now:
+                if state.tier3_underfloor_since == 0.0:
+                    state.tier3_underfloor_since = time.time()
+                elif time.time() - state.tier3_underfloor_since >= t3_floor_minutes * 60:
+                    # Exile for 6 h; next universe rebuild reassesses eligibility.
+                    self.temporarily_exclude_symbol(
+                        symbol, duration_secs=6 * 3600,
+                        reason=f"T3 below ${current_tier_min:,.0f} for ≥{int(t3_floor_minutes)} min",
+                    )
+                    state.tier3_underfloor_since = 0.0
+                    state.low_volume_since = 0.0
+                    return None
+            else:
+                state.tier3_underfloor_since = 0.0
+            # Reset legacy streak counter — T3 has no lower tier.
+            state.low_volume_streak = 0
+            state.low_volume_since = 0.0
+        elif under_floor_now:
+            # Start or continue the streak timer.
+            if state.low_volume_since == 0.0:
+                state.low_volume_since = time.time()
+            state.low_volume_streak += 1  # kept for stats / back-compat
+            elapsed_min = (time.time() - state.low_volume_since) / 60.0
+            if elapsed_min >= demotion_minutes:
                 from_tier = state.tier.value
                 next_tier_val = state.tier.value + 1
                 while next_tier_val <= Tier.TIER3.value and not tier_enabled.get(Tier(next_tier_val), True):
@@ -479,14 +765,18 @@ class Scanner:
                     state.tier = new_tier
                     state.volume_24h = current_volume
                     state.low_volume_streak = 0
+                    state.low_volume_since = 0.0
+                    self._counters['demotions'] = self._counters.get('demotions', 0) + 1
                     await db.upsert_symbol_tier(symbol, new_tier.value, current_volume)
                     logger.info(
                         f"📉 {symbol} demoted: Tier {from_tier} → Tier {new_tier.value} "
-                        f"(volume ${current_volume:,.0f} < ${current_tier_min:,.0f} for {demotion_cycles} checks)"
+                        f"(volume ${current_volume:,.0f} < ${current_tier_min:,.0f} "
+                        f"for {elapsed_min:.0f} min)"
                     )
                     return (from_tier, new_tier.value)
         else:
             state.low_volume_streak = 0
+            state.low_volume_since = 0.0
 
         # Cooldown check
         cooldown_hours = getattr(prom_cfg, 'cooldown_hours', 24)
@@ -510,11 +800,19 @@ class Scanner:
             state.promoted_at = time.time()
             state.volume_24h = current_volume
             state.low_volume_streak = 0
+            state.low_volume_since = 0.0
             # Increase scan priority immediately
             state.last_scan = 0  # Force immediate rescan
+            self._counters['promotions'] = self._counters.get('promotions', 0) + 1
 
             await db.record_promotion(symbol, from_tier, to_tier)
             logger.info(f"🚀 {symbol} promoted: Tier {from_tier} → Tier {to_tier} ({vol_spike_mult:.1f}x volume)")
+
+            # Persist so a crash right after promotion doesn't forget the cooldown.
+            try:
+                await self._persist_state()
+            except Exception:
+                pass
 
             return (from_tier, to_tier)
 
@@ -527,14 +825,19 @@ class Scanner:
     ) -> Optional[Dict]:
         """
         Detect whale orders in the order book.
+        Evaluates *both* single-level walls and cumulative (iceberg)
+        accumulations per side, fires the stronger.
         Returns whale info dict if detected.
         """
         whale_cfg = self._scan_cfg.whale_detection
         if not getattr(whale_cfg, 'enabled', True):
             return None
 
-        min_order_usd = getattr(whale_cfg, 'min_order_usd', 75_000)
-        cooldown_min  = getattr(whale_cfg, 'cooldown_minutes', 45)
+        # Absolute USD floor; actual threshold scales with 24 h volume so the
+        # bar is equally meaningful on BTC (huge book) and mid-caps.
+        min_order_usd_floor = getattr(whale_cfg, 'min_order_usd', 75_000)
+        vol_scale_frac      = float(getattr(whale_cfg, 'vol_threshold_frac', 0.005) or 0.005)
+        cooldown_min        = getattr(whale_cfg, 'cooldown_minutes', 45)
 
         # Cooldown check
         last_whale = self._whale_cooldown.get(symbol, 0)
@@ -548,6 +851,13 @@ class Scanner:
         state = self._symbols.get(symbol)
         if not state:
             return None
+
+        # Dynamic threshold: max(floor, vol_scale_frac × 24h quote volume).
+        # 0.5 % of daily volume = a real "needle-mover" across cap tiers.
+        min_order_usd = max(
+            float(min_order_usd_floor),
+            float(state.volume_24h or 0.0) * vol_scale_frac,
+        )
 
         # Use last known price from order book or symbol state
         # order_book bids/asks have prices — use mid of best bid/ask
@@ -570,7 +880,19 @@ class Scanner:
         asks = order_book.get('asks', [])
 
         # ── compute spread for fill-probability scoring ─────────
-        spread_pct = abs(best_ask - best_bid) / current_price if best_ask > 0 and best_bid > 0 else 0.0
+        # Order book invariant: asks ascending, bids descending, so a negative
+        # (ask-bid) indicates a crossed/stale book — skip.
+        if best_ask > 0 and best_bid > 0:
+            raw_spread = best_ask - best_bid
+            if raw_spread < 0:
+                logger.debug(
+                    f"🐋 Skipping {symbol}: crossed book "
+                    f"(ask={best_ask} < bid={best_bid}) — stale snapshot"
+                )
+                return None
+            spread_pct = raw_spread / current_price
+        else:
+            spread_pct = 0.0
 
         def _fill_prob(order_price: float, side: str, order_usd: float, threshold: float) -> float:
             """
@@ -583,100 +905,137 @@ class Scanner:
             fill_score = max(0.0, 1.0 - dist_pct * 10 - spread_pct * 5) * (0.5 + size_ratio * 0.5)
             return round(min(1.0, max(0.0, fill_score)), 3)
 
-        # Check up to 50 levels.  Detect both concentrated single-level whale
-        # walls AND distributed / iceberg orders accumulated within 1% of mid.
-        price_band = current_price * 0.01
+        # Adaptive price band for iceberg accumulation — scale with spread so
+        # tight-book BTC uses a narrow band (avoiding noise) and wide-spread
+        # mid-caps use a proportionate window.
+        price_band = current_price * max(0.005, min(0.02, spread_pct * 20.0))
+        if price_band <= 0:
+            price_band = current_price * 0.01
+
+        def _accept_persistence(storage_key: str, side: str, current_usd: float) -> bool:
+            """
+            Two-snapshot persistence gate.
+            A wall must appear in >= 2 snapshots *AND* the previous snapshot
+            must itself have been at or above a meaningful fraction of the
+            threshold (prevents spoof walls that vanish before the next poll).
+            Growing walls (prev < cur) are explicitly ACCEPTED — the bug was
+            anchoring the ratio to the larger snapshot, which rejected healthy
+            accumulation patterns.
+
+            The 0.75 ratio on each branch means:
+              • Growing:   prev must already be ≥ 75 % of the current
+                           threshold (so we don't count a one-off $10k print
+                           as a "previous sighting" of a $100k wall).
+              • Shrinking: the wall must retain ≥ 75 % of its prior size
+                           (a classic spoof pulls > 50 % between polls; this
+                           catches that while tolerating partial fills).
+            """
+            snap = self._whale_snapshot.setdefault(symbol, {})
+            prev = float(snap.get(storage_key, 0.0) or 0.0)
+            snap[storage_key] = current_usd
+            # Growing wall: accept if prev also meaningfully crossed threshold.
+            if prev >= min_order_usd * 0.75:
+                return True
+            # Shrinking wall: must retain ≥ 75 % of its previous magnitude.
+            if prev > 0 and current_usd >= prev * 0.75:
+                return True
+            return False
+
+        # Scan both sides; track strongest candidate for this book snapshot.
+        best_candidate: Optional[Dict] = None
+        best_score = 0.0
+        best_kind = ""   # "wall" | "iceberg"
+
         for side, orders in [('buy', bids), ('sell', asks)]:
             cumulative_usd = 0.0
+            strongest_wall_usd = 0.0
+            strongest_wall_px  = current_price
+            strongest_wall_qty = 0.0
+
             for price, qty in orders[:50]:
                 price     = float(price)
                 qty       = float(qty)
                 order_usd = price * qty
 
-                # Single-level whale wall
-                if order_usd >= min_order_usd:
-                    # ── Persistence check (relative ratio) ─────────
-                    # Require prev_snapshot >= 50% of current snapshot so that the
-                    # persistence bar scales with order size rather than being
-                    # anchored to the fixed min_order_usd threshold.
-                    # This filters spoofed walls that vanish between polls while
-                    # still allowing genuine whales that grew since last snapshot.
-                    prev = self._whale_snapshot.setdefault(symbol, {}).get(side, 0.0)
-                    self._whale_snapshot[symbol][side] = order_usd
-                    ratio = (
-                        min(prev, order_usd) / max(prev, order_usd)
-                        if max(prev, order_usd) > 0
-                        else 0.0
-                    )
-                    if prev == 0.0 or ratio < 0.5:
-                        # First sighting or too small relative to current — record but don't fire yet
-                        logger.debug(
-                            f"🐋 Whale candidate (first sighting): "
-                            f"{symbol} {side} ${order_usd:,.0f} @ {price}"
-                        )
-                        continue
+                # Track strongest single-level wall
+                if order_usd >= min_order_usd and order_usd > strongest_wall_usd:
+                    strongest_wall_usd = order_usd
+                    strongest_wall_px  = price
+                    strongest_wall_qty = qty
 
-                    self._whale_cooldown[symbol] = time.time()
-                    fp = _fill_prob(price, side, order_usd, min_order_usd)
-                    logger.info(
-                        f"🐋 Whale order: {symbol} {side} ${order_usd:,.0f} @ {price}"
-                        f"  fill_prob={fp:.2f}"
-                    )
-                    return {
-                        'symbol':    symbol,
-                        'side':      side,
-                        'order_usd': order_usd,
-                        'price':     price,
-                        'qty':       qty,
-                        'fill_prob': fp,
-                        'spread_pct': spread_pct,
-                    }
-
-                # Accumulate within the 1% mid-price band to catch iceberg orders
+                # Accumulate within the adaptive band for iceberg detection
                 if abs(price - current_price) <= price_band:
                     cumulative_usd += order_usd
 
-            # Distributed / iceberg whale — same relative persistence check
+            # Evaluate single-level wall for this side
+            if strongest_wall_usd >= min_order_usd:
+                if _accept_persistence(side, side, strongest_wall_usd):
+                    fp = _fill_prob(strongest_wall_px, side, strongest_wall_usd, min_order_usd)
+                    score = strongest_wall_usd * (0.5 + 0.5 * fp)
+                    if score > best_score:
+                        best_score = score
+                        best_kind  = 'wall'
+                        best_candidate = {
+                            'symbol':    symbol,
+                            'side':      side,
+                            'order_usd': strongest_wall_usd,
+                            'price':     strongest_wall_px,
+                            'qty':       strongest_wall_qty,
+                            'fill_prob': fp,
+                            'spread_pct': spread_pct,
+                            'kind':       'wall',
+                            'threshold':  min_order_usd,
+                        }
+
+            # Evaluate iceberg (cumulative within band) for this side
             if cumulative_usd >= min_order_usd:
-                prev = self._whale_snapshot.setdefault(symbol, {}).get(f"iceberg_{side}", 0.0)
-                self._whale_snapshot[symbol][f"iceberg_{side}"] = cumulative_usd
-                ratio = (
-                    min(prev, cumulative_usd) / max(prev, cumulative_usd)
-                    if max(prev, cumulative_usd) > 0
-                    else 0.0
-                )
-                if prev == 0.0 or ratio < 0.5:
-                    logger.debug(
-                        f"🐋 Iceberg candidate (first sighting): "
-                        f"{symbol} {side} ${cumulative_usd:,.0f} cumulative"
-                    )
-                    continue
+                iceberg_key = f"iceberg_{side}"
+                if _accept_persistence(iceberg_key, side, cumulative_usd):
+                    fp = _fill_prob(current_price, side, cumulative_usd, min_order_usd)
+                    score = cumulative_usd * (0.5 + 0.5 * fp)
+                    if score > best_score:
+                        best_score = score
+                        best_kind  = 'iceberg'
+                        best_candidate = {
+                            'symbol':    symbol,
+                            'side':      side,
+                            'order_usd': cumulative_usd,
+                            'price':     current_price,
+                            'qty':       cumulative_usd / current_price if current_price > 0 else 0.0,
+                            'fill_prob': fp,
+                            'spread_pct': spread_pct,
+                            'kind':       'iceberg',
+                            'threshold':  min_order_usd,
+                        }
 
-                self._whale_cooldown[symbol] = time.time()
-                fp = _fill_prob(current_price, side, cumulative_usd, min_order_usd)
-                logger.info(
-                    f"🐋 Iceberg whale: {symbol} {side} "
-                    f"${cumulative_usd:,.0f} cumulative within 1% band"
-                    f"  fill_prob={fp:.2f}"
-                )
-                return {
-                    'symbol':    symbol,
-                    'side':      side,
-                    'order_usd': cumulative_usd,
-                    'price':     current_price,
-                    'qty':       cumulative_usd / current_price,
-                    'fill_prob': fp,
-                    'spread_pct': spread_pct,
-                }
+        # Reset opposite-side snapshot entries that saw no wall this cycle,
+        # so stale prior sightings from the other side can't persist indefinitely.
+        snap = self._whale_snapshot.setdefault(symbol, {})
+        for key in ('buy', 'sell', 'iceberg_buy', 'iceberg_sell'):
+            snap.setdefault(key, 0.0)
 
-        # Order book checked; update snapshot for sides that saw no whale this cycle
-        # (so previous sightings don't carry indefinitely).
-        self._whale_snapshot.setdefault(symbol, {})
-        for side in ('buy', 'sell', 'iceberg_buy', 'iceberg_sell'):
-            if side not in self._whale_snapshot[symbol]:
-                self._whale_snapshot[symbol][side] = 0.0
+        if best_candidate is None:
+            return None
 
-        return None
+        # Apply cooldown on firing side only (other side can still fire later).
+        self._whale_cooldown[symbol] = time.time()
+        if best_kind == 'iceberg':
+            self._counters['icebergs_fired'] = self._counters.get('icebergs_fired', 0) + 1
+            logger.info(
+                f"🐋 Iceberg whale: {symbol} {best_candidate['side']} "
+                f"${best_candidate['order_usd']:,.0f} cumulative within adaptive band"
+                f"  fill_prob={best_candidate['fill_prob']:.2f}"
+                f"  threshold=${min_order_usd:,.0f}"
+            )
+        else:
+            self._counters['whales_fired'] = self._counters.get('whales_fired', 0) + 1
+            logger.info(
+                f"🐋 Whale order: {symbol} {best_candidate['side']} "
+                f"${best_candidate['order_usd']:,.0f} @ {best_candidate['price']}"
+                f"  fill_prob={best_candidate['fill_prob']:.2f}"
+                f"  threshold=${min_order_usd:,.0f}"
+            )
+        return best_candidate
 
     # ── Stalker Engine ────────────────────────────────────────
 
@@ -685,8 +1044,14 @@ class Scanner:
         Pre-breakout detection for watchlist.
         Looks for coiling, compression, and pre-breakout conditions.
         Returns dict with score and reasons if interesting.
+
+        Detectors operate on *closed* bars only (the last OHLCV element is
+        treated as the currently-forming bar and excluded from every
+        comparison). Earlier versions contaminated squeeze / key-level /
+        divergence signals with live tick data and produced false alerts.
         """
-        if not ohlcv or len(ohlcv) < 30:
+        # Need 30 closed bars + 1 still-forming = 31 rows
+        if not ohlcv or len(ohlcv) < 31:
             return None
 
         # Cooldown gate — check before any expensive computation
@@ -694,11 +1059,18 @@ class Scanner:
         if time.time() - _last < self._watchlist_cooldown_secs:
             return None
 
+        # VOLATILE_PANIC: pre-breakout compression alerts in this regime are
+        # overwhelmingly bull traps (squeeze → resolution down). Skip entirely;
+        # reversal strategies handle the direction-aware side of the book.
+        _regime = _get_regime()
+        if _regime == "VOLATILE_PANIC":
+            self._counters['stalker_panic_skip'] = self._counters.get('stalker_panic_skip', 0) + 1
+            return None
+
         # Dynamic threshold: raise the bar in CHOPPY (signal flood risk),
         # lower it in trending regimes (signals are scarcer but higher quality).
         # Hysteresis: damp adjustments 25% within 10 min of a regime flip to
         # prevent violent over-correction right after a transition.
-        _regime = _get_regime()
         _recently_flipped = _regime_recently_changed(600)
         if _regime == "CHOPPY":
             _raw_adj = 8
@@ -731,10 +1103,18 @@ class Scanner:
         df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
         df = df.astype({'open':float,'high':float,'low':float,'close':float,'volume':float})
 
-        highs  = df['high'].values
-        lows   = df['low'].values
-        closes = df['close'].values
-        volumes = df['volume'].values
+        # IMPORTANT: drop the still-forming bar from every detector.
+        # Earlier iterations used arr[-1] = the live candle, whose close
+        # moves tick-by-tick and contaminates squeeze / key-level / divergence
+        # signals (stalker.py._check_ltf_alignment already does this correctly).
+        highs_all   = df['high'].values
+        lows_all    = df['low'].values
+        closes_all  = df['close'].values
+        volumes_all = df['volume'].values
+        highs   = highs_all[:-1]
+        lows    = lows_all[:-1]
+        closes  = closes_all[:-1]
+        volumes = volumes_all[:-1]
 
         score = 0
         reasons = []
@@ -747,33 +1127,46 @@ class Scanner:
             bb_std  = np.std(window)
             bb_width = (bb_std * 4) / bb_mean if bb_mean > 0 else 0.0  # Full band width (upper - lower) / mean
 
-            # Lowest bandwidth in 48 bars = squeeze
-            if len(closes) >= 48:
+            # Extended history: up to 200 closed bars, stride 2, for a stable
+            # 20th-percentile gate (~90 samples instead of ~6). Prior 48-bar
+            # window produced a noisy percentile with only a handful of points.
+            if len(closes) >= bb_period + 20:
                 widths_hist = []
-                start = max(bb_period, len(closes) - 48)
-                for end in range(start, len(closes), 5):
+                start = max(bb_period, len(closes) - 200)
+                for end in range(start, len(closes), 2):
                     w = closes[end - bb_period:end]
                     if len(w) == bb_period:
                         m = np.mean(w)
                         widths_hist.append((np.std(w) * 4) / m if m > 0 else 0.0)
                 if widths_hist and bb_width < np.percentile(widths_hist, 20):
                     score += 30
-                    reasons.append("🌀 Bollinger squeeze — lowest volatility in 48 bars")
+                    reasons.append("🌀 Bollinger squeeze — lowest volatility in recent history")
 
         # ── 2. Key level proximity ─────────────────────────────
+        # Require that the 20-bar extreme has been *touched* within the last 5
+        # closed bars. A close 1.5 % below a distant old-high-that-was-never-
+        # retested was previously mis-flagged as "testing high".
         period_high = np.max(highs[-20:])
         period_low  = np.min(lows[-20:])
         current     = closes[-1]
 
-        high_dist = (period_high - current) / current
-        low_dist  = (current - period_low) / current
+        high_dist = (period_high - current) / current if current > 0 else 1.0
+        low_dist  = (current - period_low) / current if current > 0 else 1.0
+
+        recent_touch_lookback = 5
+        recent_high_touched = bool(np.any(np.isclose(
+            highs[-recent_touch_lookback:], period_high, rtol=0, atol=period_high * 0.001
+        ))) or bool(np.max(highs[-recent_touch_lookback:]) >= period_high * 0.999)
+        recent_low_touched = bool(np.any(np.isclose(
+            lows[-recent_touch_lookback:], period_low, rtol=0, atol=period_low * 0.001
+        ))) or bool(np.min(lows[-recent_touch_lookback:]) <= period_low * 1.001)
 
         near_key_level = False
-        if high_dist < 0.015:   # Within 1.5% of 20-bar high
+        if high_dist < 0.015 and recent_high_touched:
             score += 20
             near_key_level = True
             reasons.append(f"📈 Testing 20-bar high ({fmt_price(period_high)}) — breakout alert")
-        elif low_dist < 0.015:
+        elif low_dist < 0.015 and recent_low_touched:
             score += 20
             near_key_level = True
             reasons.append(f"📉 Testing 20-bar low ({fmt_price(period_low)}) — breakdown alert")
@@ -791,8 +1184,15 @@ class Scanner:
             reasons.append("📊 Volume cooling inside tight key-level range — coiling setup")
 
         # ── 4. RSI divergence ─────────────────────────────────
+        # Incremental Wilder RSI (O(N)); prior impl was O(N²) and dominated
+        # stalker CPU on hot paths.
+        # Stricter gates to cut noise divergence:
+        #   • pivots must be ≥ 5 bars apart (prevents micro-wiggle matches),
+        #   • pivot RSI must sit in the extreme band (>=60 for bearish pivot
+        #     highs, <=40 for bullish pivot lows) so we ignore mid-range noise,
+        #   • divergence magnitude raised to 12 RSI-points (was 10).
         if len(closes) >= 40:
-            def _swing_idxs(arr: np.ndarray, is_high: bool, look: int = 2) -> List[int]:
+            def _swing_idxs(arr, is_high: bool, look: int = 2) -> List[int]:
                 idxs: List[int] = []
                 for i in range(look, len(arr) - look):
                     left = arr[i - look:i]
@@ -803,88 +1203,111 @@ class Scanner:
                         idxs.append(i)
                 return idxs
 
-            rsi_series = np.full(len(closes), np.nan, dtype=float)
-            for i in range(15, len(closes) + 1):
-                rsi_series[i - 1] = self._quick_rsi(closes[:i], 14)
+            rsi_series = _wilder_rsi_series(list(closes), 14)
 
-            hi_swings = _swing_idxs(closes[-30:], is_high=True)
-            lo_swings = _swing_idxs(closes[-30:], is_high=False)
+            window = closes[-30:]
+            hi_swings = _swing_idxs(window, is_high=True)
+            lo_swings = _swing_idxs(window, is_high=False)
+            base = len(closes) - 30
 
+            min_pivot_sep = 5
             if len(hi_swings) >= 2:
                 a, b = hi_swings[-2], hi_swings[-1]
-                pa = closes[-30 + a]
-                pb = closes[-30 + b]
-                ra = rsi_series[-30 + a]
-                rb = rsi_series[-30 + b]
-                if pb > pa and not np.isnan(ra) and not np.isnan(rb) and rb <= ra - 10:
-                    score += 15
-                    reasons.append("⚡ RSI bearish divergence on swing highs")
+                if (b - a) >= min_pivot_sep:
+                    pa, pb = closes[base + a], closes[base + b]
+                    ra, rb = rsi_series[base + a], rsi_series[base + b]
+                    if (
+                        pb > pa
+                        and ra == ra and rb == rb   # NaN check
+                        and ra >= 60 and rb <= ra - 12
+                    ):
+                        score += 15
+                        reasons.append("⚡ RSI bearish divergence on swing highs")
             if len(lo_swings) >= 2:
                 a, b = lo_swings[-2], lo_swings[-1]
-                pa = closes[-30 + a]
-                pb = closes[-30 + b]
-                ra = rsi_series[-30 + a]
-                rb = rsi_series[-30 + b]
-                if pb < pa and not np.isnan(ra) and not np.isnan(rb) and rb >= ra + 10:
-                    score += 15
-                    reasons.append("⚡ RSI bullish divergence on swing lows")
+                if (b - a) >= min_pivot_sep:
+                    pa, pb = closes[base + a], closes[base + b]
+                    ra, rb = rsi_series[base + a], rsi_series[base + b]
+                    if (
+                        pb < pa
+                        and ra == ra and rb == rb
+                        and ra <= 40 and rb >= ra + 12
+                    ):
+                        score += 15
+                        reasons.append("⚡ RSI bullish divergence on swing lows")
 
         # ── 5. ATR compression ────────────────────────────────
         if len(closes) >= 60:
-            atr_now = self._quick_atr(highs[-14:], lows[-14:], closes[-14:])
+            atr_now = self._quick_atr(highs[-15:], lows[-15:], closes[-15:])
             atr_base = self._quick_atr(highs[-51:], lows[-51:], closes[-51:], period=50)
             if atr_base > 0 and atr_now < atr_base * 0.6:
                 score += 10
                 reasons.append(f"🔇 ATR compressed {atr_now/atr_base:.0%} of 50-bar baseline")
 
         if score >= _min_score:
-            # Cross-path dedup: if stalker.StalkerEngine already raised this
-            # symbol / setup within the regime-dependent TTL window, don't double-fire.
+            # Cross-path dedup via shared helper — both scanner.stalker_scan
+            # and stalker.StalkerEngine consult the same dict so the same
+            # symbol/setup can't double-fire within the regime-aware TTL.
             setup_type = "pre_breakout"
             dedup_key  = (symbol, setup_type)
-            now        = time.time()
-            if now - self._signal_dedup.get(dedup_key, 0) < _dedup_ttl:
+            if not self.try_mark_signal_dedup(dedup_key, _dedup_ttl):
+                self._counters['alerts_watchlist_suppressed_dedup'] += 1
+                return None
+
+            # Global alert-rate circuit breaker: ≤ 20 watchlist alerts / 10 min.
+            if not self._rate_allow('watchlist', max_alerts=20, window_secs=600):
+                self._counters['alerts_watchlist_suppressed_rate'] += 1
+                logger.info(
+                    f"Watchlist rate-limit hit — suppressing {symbol} "
+                    f"(score={score})"
+                )
                 return None
 
             await db.upsert_watchlist(symbol, float(score), reasons)
-            self._watchlist_cooldown[symbol] = now
-            self._signal_dedup[dedup_key]    = now
+            self._watchlist_cooldown[symbol] = time.time()
+            self._counters['alerts_watchlist'] += 1
             return {'symbol': symbol, 'score': score, 'reasons': reasons, 'regime': _regime}
 
         return None
 
     @staticmethod
     def _quick_rsi(closes, period=14) -> float:
-        """RSI using Wilder's smoothed moving average (matches standard chart RSI)."""
-        if len(closes) < period + 1:
-            return 50.0
-        deltas = np.diff(closes)
-        gains  = np.where(deltas > 0, deltas, 0.0)
-        losses = np.where(deltas < 0, -deltas, 0.0)
-        # Seed with SMA of the first `period` bars, then apply Wilder's EMA
-        avg_g = float(np.mean(gains[:period]))
-        avg_l = float(np.mean(losses[:period]))
-        for g, l in zip(gains[period:], losses[period:]):
-            avg_g = (avg_g * (period - 1) + float(g)) / period
-            avg_l = (avg_l * (period - 1) + float(l)) / period
-        if avg_l == 0:
-            return 100.0
-        return float(100 - 100 / (1 + avg_g / avg_l))
+        """RSI using Wilder's smoothed moving average (matches standard chart RSI).
+
+        Single-value convenience wrapper around ``_wilder_rsi_last``. Callers
+        that need the full series should prefer ``_wilder_rsi_series`` to
+        avoid O(N²) recomputation.
+        """
+        return _wilder_rsi_last(closes, period)
 
     @staticmethod
     def _quick_atr(highs, lows, closes, period=14) -> float:
+        """Wilder-style ATR over the last `period` true ranges.
+
+        Convention: `period` is the number of TRs to average, **not** the
+        number of bars. N bars produce N-1 TRs, so callers that want an
+        "N-bar ATR" should pass N+1 bars. Prior impl silently capped at
+        `len(closes)-1` TRs regardless of the requested period, making a
+        14-bar tail produce a 13-TR ATR. The fix lives at the call sites
+        (pass period+1 bars); this function itself simply averages the last
+        `period` TRs of whatever window it receives, or fewer if not enough
+        bars are supplied.
+        """
         if len(closes) < 2:
             return 0.0
-        trs = [max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
-               for i in range(1, len(closes))]
+        trs = list(_true_range(highs, lows, closes, 1, len(closes)))
         return float(np.mean(trs[-period:])) if trs else 0.0
 
     def get_stats(self) -> Dict:
-        """Stats for status display"""
+        """Stats for status display (includes operational counters)."""
         t1 = sum(1 for s in self._symbols.values() if s.tier == Tier.TIER1)
         t2 = sum(1 for s in self._symbols.values() if s.tier == Tier.TIER2)
         t3 = sum(1 for s in self._symbols.values() if s.tier == Tier.TIER3)
-        return {'tier1': t1, 'tier2': t2, 'tier3': t3, 'total': len(self._symbols)}
+        stats: Dict = {'tier1': t1, 'tier2': t2, 'tier3': t3, 'total': len(self._symbols)}
+        # Merge counters so observability is available in one call.
+        for k, v in self._counters.items():
+            stats[f'counter_{k}'] = v
+        return stats
 
 
 # ── Singleton ──────────────────────────────────────────────
