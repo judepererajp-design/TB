@@ -21,6 +21,7 @@ from analyzers.altcoin_rotation import rotation_tracker
 from config.loader import cfg
 from utils.formatting import fmt_price
 from utils.signal_guidance import guidance_payload
+from strategies.base import direction_str
 
 
 TF_MINUTES = {
@@ -328,7 +329,7 @@ class TelegramFormatter:
         current_price: float = 0.0,
     ) -> str:
         sig = scored.base_signal
-        direction = getattr(sig.direction, 'value', str(sig.direction)) if hasattr(sig.direction, 'value') else str(sig.direction)
+        direction = direction_str(sig)
         # PHASE 3 AUDIT FIX (P3-4): Use alpha model grade (the grade that drives
         # execution gating) instead of the aggregator confidence grade.  This
         # ensures the Telegram card shows the same grade that execution_engine
@@ -732,7 +733,7 @@ class TelegramFormatter:
         sig = scored.base_signal
         strategy = sig.strategy or "Unknown"
         raw = sig.raw_data or {}
-        direction = getattr(sig.direction, 'value', str(sig.direction)) if hasattr(sig.direction, 'value') else str(sig.direction)
+        direction = direction_str(sig)
         edge_types = []
         if raw.get('has_ob') and raw.get('has_fvg'):
             edge_types.append("Smart Money")
@@ -813,7 +814,7 @@ class TelegramFormatter:
     def format_trade_plan_panel(self, scored: ScoredSignal,
                                  alpha_score=None, prob_estimate=None, sizing=None) -> str:
         sig = scored.base_signal
-        direction = getattr(sig.direction, 'value', str(sig.direction)) if hasattr(sig.direction, 'value') else str(sig.direction)
+        direction = direction_str(sig)
         entry_mid = (sig.entry_low + sig.entry_high) / 2
         sl_pct = abs(entry_mid - sig.stop_loss) / entry_mid * 100 if entry_mid else 0
         tp1_pct = abs(sig.tp1 - entry_mid) / entry_mid * 100 if entry_mid else 0
@@ -859,7 +860,7 @@ class TelegramFormatter:
         sig = scored.base_signal
         strategy = sig.strategy or "Unknown"
         raw = sig.raw_data or {}
-        direction = getattr(sig.direction, 'value', str(sig.direction)) if hasattr(sig.direction, 'value') else str(sig.direction)
+        direction = direction_str(sig)
 
         lines = [f"🧠 <b>CONFLUENCE LOGIC</b>\n", f"<b>{strategy}</b>\n"]
 
@@ -1101,7 +1102,7 @@ class TelegramFormatter:
         Covers: TP management, trailing, invalidation, regime-based early exit.
         """
         sig = scored.base_signal
-        direction = getattr(sig.direction, 'value', str(sig.direction)) if hasattr(sig.direction, 'value') else str(sig.direction)
+        direction = direction_str(sig)
         strategy = sig.strategy or "Unknown"
         regime = getattr(regime_analyzer.regime, 'value', 'UNKNOWN')
         is_long = direction == "LONG"
@@ -1389,7 +1390,7 @@ class TelegramFormatter:
         Psychological design: narrative = observation, not action.
         """
         sig = scored.base_signal
-        direction = getattr(sig.direction, 'value', str(sig.direction)) if hasattr(sig.direction, 'value') else str(sig.direction)
+        direction = direction_str(sig)
         strategy = sig.strategy or "Unknown"
 
         regime = scored.regime or getattr(regime_analyzer.regime, 'value', 'UNKNOWN')
@@ -1464,7 +1465,7 @@ class TelegramFormatter:
         Operators can see what was filtered and why.
         """
         sig = scored.base_signal
-        direction = getattr(sig.direction, 'value', str(sig.direction)) if hasattr(sig.direction, 'value') else str(sig.direction)
+        direction = direction_str(sig)
         entry_mid = (sig.entry_low + sig.entry_high) / 2
         tp2_pct = abs(sig.tp2 - entry_mid) / entry_mid * 100 if entry_mid else 0
         return (

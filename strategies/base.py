@@ -88,6 +88,31 @@ class SignalDirection(str, Enum):
     SHORT = "SHORT"
 
 
+def direction_str(obj: Any) -> str:
+    """
+    Resolve a direction value to its canonical string form ("LONG"/"SHORT").
+
+    Accepts either a signal-like object with a ``direction`` attribute, or a
+    raw direction value (``SignalDirection`` enum member or string). Built to
+    replace the repeated ``getattr(x.direction, 'value', str(x.direction))``
+    idiom that appears throughout the codebase — some code paths construct
+    signals with the enum while others assign raw strings, so both need to
+    round-trip through the same canonical form.
+    """
+    d = getattr(obj, 'direction', obj)
+    return getattr(d, 'value', str(d))
+
+
+def is_long(obj: Any) -> bool:
+    """True if ``obj`` is a LONG signal / direction (enum or string tolerant)."""
+    return direction_str(obj) == "LONG"
+
+
+def is_short(obj: Any) -> bool:
+    """True if ``obj`` is a SHORT signal / direction (enum or string tolerant)."""
+    return direction_str(obj) == "SHORT"
+
+
 # ── Signal Result ─────────────────────────────────────────────────────────
 @dataclass
 class SignalResult:
@@ -129,6 +154,21 @@ class SignalResult:
     regime: Optional[str] = None
     sector: Optional[str] = None
     tier: Optional[int] = None
+
+    def get_raw(self, key: str, default: Any = None) -> Any:
+        """
+        Safe accessor for ``raw_data`` entries.
+
+        ``raw_data`` is typed ``Optional[Dict[str, Any]]`` and is set by many
+        producer sites, some of which leave it as ``None``. This helper
+        collapses the defensive ``hasattr(signal, 'raw_data') and signal.raw_data``
+        dance to a single call and returns ``default`` whenever ``raw_data``
+        is missing, ``None``, or not a dict.
+        """
+        raw = self.raw_data
+        if not isinstance(raw, dict):
+            return default
+        return raw.get(key, default)
 
 
 # ── Base Strategy ─────────────────────────────────────────────────────────

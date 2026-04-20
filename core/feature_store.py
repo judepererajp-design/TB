@@ -441,10 +441,14 @@ class FeatureStore:
             from datetime import datetime, timezone
             now = datetime.now(timezone.utc)
             hour = now.hour
+            # NY ends where OVERLAP begins (13 UTC); keeping `12 <= hour < 14`
+            # for NY would eat the first hour of the London-NY overlap and
+            # make "OVERLAP" only reachable for hour=14-15, silently losing
+            # the killzone label during one of the highest-volume hours.
             if 7 <= hour < 9:
                 fs.session = "LONDON"
                 fs.is_killzone = True
-            elif 12 <= hour < 14:
+            elif 12 <= hour < 13:
                 fs.session = "NY"
                 fs.is_killzone = True
             elif 13 <= hour < 16:

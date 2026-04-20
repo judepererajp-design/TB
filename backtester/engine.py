@@ -48,6 +48,7 @@ import numpy as np
 
 from config.loader import cfg
 from config.constants import Backtester as BTC, STRATEGY_KEY_MAP
+from strategies.base import direction_str
 
 logger = logging.getLogger(__name__)
 
@@ -442,7 +443,7 @@ class BacktestEngine:
                         continue
 
                     # 6. Direction cooldown — prevent same-direction signal spam
-                    _dir_key = getattr(signal.direction, 'value', str(signal.direction))
+                    _dir_key = direction_str(signal)
                     _last_bar = _last_signal_bar.get(_dir_key, -BTC.SIGNAL_COOLDOWN_BARS - 1)
                     if bar_idx - _last_bar < BTC.SIGNAL_COOLDOWN_BARS:
                         continue
@@ -510,7 +511,7 @@ class BacktestEngine:
                         all_trades.append(trade)
                         signal_idx += 1
                         # Update cooldown tracker for this direction
-                        _dir_taken = getattr(signal.direction, 'value', str(signal.direction))
+                        _dir_taken = direction_str(signal)
                         _last_signal_bar[_dir_taken] = bar_idx
 
                 except Exception as e:
@@ -600,7 +601,7 @@ class BacktestEngine:
             a full -1R loss. This reflects the realistic outcome under a
             tracking algorithm that monitors TP1 inside the bar.
         """
-        direction = getattr(signal.direction, 'value', str(signal.direction))
+        direction = direction_str(signal)
         entry_low = signal.entry_low
         entry_high = signal.entry_high
         entry_mid = (entry_low + entry_high) / 2

@@ -24,6 +24,7 @@ from data.database import db
 from signals.aggregator import ScoredSignal
 from risk.circuit_breaker import circuit_breaker as CircuitBreaker
 from governance.performance_tracker import performance_tracker
+from strategies.base import direction_str
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +106,7 @@ class RiskManager:
             _liq_buf  = float(self._risk_cfg.get('liq_min_buffer_pct', 0.02))
             if _leverage > 1 and _base.entry_low > 0 and _base.entry_high > 0:
                 _entry_mid = (_base.entry_low + _base.entry_high) / 2.0
-                _dir = getattr(_base.direction, 'value', str(_base.direction))
+                _dir = direction_str(_base)
                 if _dir == "LONG":
                     _liq_price = _entry_mid * (1.0 - 1.0 / _leverage)
                     _required_sl = _liq_price + _liq_buf * _entry_mid

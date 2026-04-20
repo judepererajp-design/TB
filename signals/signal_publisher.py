@@ -21,6 +21,7 @@ from typing import Dict, Optional
 
 from config.constants import RateLimiting
 from utils.formatting import fmt_price
+from strategies.base import direction_str
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +130,7 @@ class SignalPublisher:
         import time as _pub_time
         _now = _pub_time.time()
         _grade = getattr(alpha_score, 'grade', None) or "?"
-        _dir_str = getattr(signal.direction, 'value', str(signal.direction))
+        _dir_str = direction_str(signal)
 
         # Per-symbol cooldown (telegram.min_signal_interval). Prevents two back-to-back
         # alerts on the same symbol (e.g. from different strategies scoring the same
@@ -179,7 +180,7 @@ class SignalPublisher:
                 _pwin     = f"{prob_estimate.p_win*100:.0f}%" if prob_estimate else "?"
                 _ev       = f"{alpha_score.expected_value_r:+.2f}R" if alpha_score else "?"
                 _regime   = getattr(scored, 'regime', None) or getattr(signal, 'regime', 'UNKNOWN')
-                _dir      = getattr(signal.direction, 'value', str(signal.direction))
+                _dir      = direction_str(signal)
                 _grade_hd = {"A+": "🟢 A+", "A": "🟡 A", "B": "🔵 B"}.get(_grade, "⚪")
                 _dir_arr  = "LONG ↑" if _dir == "LONG" else "SHORT ↓"
                 _entry_mid = (signal.entry_low + signal.entry_high) / 2
@@ -259,7 +260,7 @@ class SignalPublisher:
             invalidation_monitor.track_signal(
                 signal_id=signal_id,
                 symbol=signal.symbol,
-                direction=getattr(signal.direction, 'value', str(signal.direction)),
+                direction=direction_str(signal),
                 strategy=signal.strategy,
                 entry_low=signal.entry_low,
                 entry_high=signal.entry_high,
@@ -276,7 +277,7 @@ class SignalPublisher:
             )
             # Notify of potential counter-signals
             invalidation_monitor.notify_counter_signal(
-                signal.symbol, getattr(signal.direction, 'value', str(signal.direction))
+                signal.symbol, direction_str(signal)
             )
         except Exception as e:
             logger.error(f"Invalidation monitor registration failed: {e}")
@@ -290,7 +291,7 @@ class SignalPublisher:
             _asyncio.create_task(
                 _pa.notify_opposing_signal(
                     signal.symbol,
-                    getattr(signal.direction, 'value', str(signal.direction)),
+                    direction_str(signal),
                     signal.strategy or "",
                     scored.final_confidence,
                 )
@@ -304,7 +305,7 @@ class SignalPublisher:
         _conf_log = len(confluence.agreeing_strategies) if confluence else 0
         logger.info(
             f"📊 Signal published: {signal.symbol} "
-            f"{getattr(signal.direction, 'value', str(signal.direction))} "
+            f"{direction_str(signal)} "
             f"grade={_grade_log} "
             f"P(win)={_pwin_log:.2f} "
             f"EV={_ev_log:+.3f}R "

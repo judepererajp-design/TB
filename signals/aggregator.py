@@ -31,7 +31,7 @@ import numpy as np
 
 from config.loader import cfg
 from signals.context_contracts import build_setup_context
-from strategies.base import SignalResult, SignalDirection
+from strategies.base import SignalResult, SignalDirection, direction_str, is_long, is_short
 
 # Named tuple for a single dedup entry — consolidates the three parallel dicts
 # (_recent, _recent_conf, _recent_grade) that previously had to be kept in sync.
@@ -460,11 +460,11 @@ class SignalAggregator:
             if _eh_snap.should_block:
                 logger.info(
                     f"❌ Signal died (agg) | {signal.symbol} "
-                    f"{getattr(signal.direction, 'value', str(signal.direction))} "
+                    f"{direction_str(signal)} "
                     f"| reason=EXCHANGE_UNHEALTHY | {_eh_snap.reason}"
                 )
                 if _tl:
-                    _dir = getattr(signal.direction, 'value', str(signal.direction))
+                    _dir = direction_str(signal)
                     _tl.signal(symbol=signal.symbol, direction=_dir, grade="?",
                                confidence=signal.confidence,
                                entry_low=signal.entry_low, entry_high=signal.entry_high,
@@ -476,7 +476,7 @@ class SignalAggregator:
                     from core.diagnostic_engine import diagnostic_engine
                     diagnostic_engine.record_signal_death(
                         symbol=signal.symbol,
-                        direction=getattr(signal.direction, 'value', str(signal.direction)),
+                        direction=direction_str(signal),
                         strategy=signal.strategy, kill_reason="EXCHANGE_UNHEALTHY",
                         rr=getattr(signal, 'rr_ratio', 0.0),
                         confidence=signal.confidence, regime="UNKNOWN",
@@ -493,11 +493,11 @@ class SignalAggregator:
             if await _sd.should_block_symbol(signal.symbol):
                 logger.info(
                     f"❌ Signal died (agg) | {signal.symbol} "
-                    f"{getattr(signal.direction, 'value', str(signal.direction))} "
+                    f"{direction_str(signal)} "
                     f"| reason=STABLECOIN_DEPEG"
                 )
                 if _tl:
-                    _dir = getattr(signal.direction, 'value', str(signal.direction))
+                    _dir = direction_str(signal)
                     _tl.signal(symbol=signal.symbol, direction=_dir, grade="?",
                                confidence=signal.confidence,
                                entry_low=signal.entry_low, entry_high=signal.entry_high,
@@ -509,7 +509,7 @@ class SignalAggregator:
                     from core.diagnostic_engine import diagnostic_engine
                     diagnostic_engine.record_signal_death(
                         symbol=signal.symbol,
-                        direction=getattr(signal.direction, 'value', str(signal.direction)),
+                        direction=direction_str(signal),
                         strategy=signal.strategy, kill_reason="STABLECOIN_DEPEG",
                         rr=getattr(signal, 'rr_ratio', 0.0),
                         confidence=signal.confidence, regime="UNKNOWN",
@@ -724,7 +724,7 @@ class SignalAggregator:
                 if _s.strategy == "SmartMoneyConcepts":
                     _smc_direction = _s.direction.value if hasattr(_s.direction, 'value') else _s.direction
                     break
-            if _smc_direction and _smc_direction != getattr(signal.direction, 'value', str(signal.direction)):
+            if _smc_direction and _smc_direction != direction_str(signal):
                 # FIX SMC-VETO: was -20, changed to -12.
                 # -20 on a 65-confidence signal dropped it to 45, killing it before
                 # the aggregator's weighted scoring had a chance to run. The veto
@@ -734,29 +734,29 @@ class SignalAggregator:
                 signal.confidence = max(Penalties.SMC_VETO_CONF_FLOOR, signal.confidence - Penalties.SMC_VETO_PENALTY_PTS)
                 signal.confluence.append(
                     f"⚠️ SMC structural conflict: SMC={_smc_direction}, "
-                    f"signal={getattr(signal.direction, 'value', str(signal.direction))} — confidence -12"
+                    f"signal={direction_str(signal)} — confidence -12"
                 )
                 logger.info(
-                    f"P2-C SMC veto: SMC {_smc_direction} vs {getattr(signal.direction, 'value', str(signal.direction))} → -12"
+                    f"P2-C SMC veto: SMC {_smc_direction} vs {direction_str(signal)} → -12"
                 )
         except Exception:
             pass
 
         if signal.rr_ratio < _rr_floor:
             logger.info(
-                f"❌ Signal died (agg) | {signal.symbol} {getattr(signal.direction, 'value', str(signal.direction))} "
+                f"❌ Signal died (agg) | {signal.symbol} {direction_str(signal)} "
                 f"| reason=RR_FLOOR | rr={signal.rr_ratio:.2f} < {_rr_floor:.2f} "
                 f"({getattr(signal, 'setup_class', 'intraday')})"
             )
             if _tl:
-                _dir = getattr(signal.direction, 'value', str(signal.direction))
+                _dir = direction_str(signal)
                 _rr_regime = getattr(regime_analyzer.regime, 'value', 'UNKNOWN')
                 _tl.signal(symbol=signal.symbol, direction=_dir, grade="?", confidence=signal.confidence, entry_low=signal.entry_low, entry_high=signal.entry_high, stop_loss=signal.stop_loss, tp1=signal.tp1, tp2=signal.tp2, rr=signal.rr_ratio, strategy=signal.strategy, regime=_rr_regime, result=f"REJECTED(RR_FLOOR rr={signal.rr_ratio:.2f}<{_rr_floor:.2f})")
             # Feed diagnostic engine
             try:
                 from core.diagnostic_engine import diagnostic_engine
                 diagnostic_engine.record_signal_death(
-                    symbol=signal.symbol, direction=getattr(signal.direction, 'value', str(signal.direction)),
+                    symbol=signal.symbol, direction=direction_str(signal),
                     strategy=signal.strategy, kill_reason="RR_FLOOR",
                     rr=signal.rr_ratio, confidence=signal.confidence,
                     regime=self._agg_cfg.get('regime', 'UNKNOWN') if hasattr(self._agg_cfg, 'get') else 'UNKNOWN',
@@ -781,12 +781,12 @@ class SignalAggregator:
             if _adj_rr is not None and _adj_rr < _FM.MIN_FEE_ADJUSTED_RR:
                 logger.info(
                     f"❌ Signal died (agg) | {signal.symbol} "
-                    f"{getattr(signal.direction, 'value', str(signal.direction))} "
+                    f"{direction_str(signal)} "
                     f"| reason=FEE_ADJUSTED_RR | raw_rr={signal.rr_ratio:.2f} "
                     f"adj_rr={_adj_rr:.2f} < {_FM.MIN_FEE_ADJUSTED_RR:.2f}"
                 )
                 if _tl:
-                    _dir = getattr(signal.direction, 'value', str(signal.direction))
+                    _dir = direction_str(signal)
                     _rr_regime = getattr(regime_analyzer.regime, 'value', 'UNKNOWN')
                     _tl.signal(symbol=signal.symbol, direction=_dir, grade="?",
                                confidence=signal.confidence,
@@ -798,7 +798,7 @@ class SignalAggregator:
                     from core.diagnostic_engine import diagnostic_engine
                     diagnostic_engine.record_signal_death(
                         symbol=signal.symbol,
-                        direction=getattr(signal.direction, 'value', str(signal.direction)),
+                        direction=direction_str(signal),
                         strategy=signal.strategy, kill_reason="FEE_ADJUSTED_RR",
                         rr=signal.rr_ratio, confidence=signal.confidence,
                         regime=self._agg_cfg.get('regime', 'UNKNOWN') if hasattr(self._agg_cfg, 'get') else 'UNKNOWN',
@@ -821,7 +821,7 @@ class SignalAggregator:
 
             _ff_state = ff.get_state("SIGNAL_VALIDATOR")
             if _ff_state in ("live", "shadow"):
-                _dir_str_v = getattr(signal.direction, 'value', str(signal.direction))
+                _dir_str_v = direction_str(signal)
                 _regime_str_v = getattr(regime_analyzer.regime, 'value', 'UNKNOWN')
                 _val_data = {
                     "symbol": signal.symbol,
@@ -919,7 +919,7 @@ class SignalAggregator:
         # DEDUP-FIX: Dedup now runs AFTER scoring so it compares final vs final confidence.
         # Previously it compared raw strategy confidence (pre-scoring) which caused the
         # breakthrough exception to fire incorrectly.
-        direction_str = getattr(signal.direction, 'value', str(signal.direction)) if hasattr(signal.direction, 'value') else str(signal.direction)
+        _sig_dir = direction_str(signal)
 
         # ── 2. Daily signal limit per symbol ────────────────
         # A/A+ signals get a higher daily symbol limit — they represent persistent
@@ -939,11 +939,11 @@ class SignalAggregator:
         symbol_count = len(_sym_times)  # rolling count
         if symbol_count >= max_per_symbol:
             logger.info(
-                f"❌ Signal died (agg) | {signal.symbol} {getattr(signal.direction, 'value', str(signal.direction))} "
+                f"❌ Signal died (agg) | {signal.symbol} {direction_str(signal)} "
                 f"| reason=DAILY_SYMBOL_LIMIT | count={symbol_count}/{max_per_symbol}"
             )
             if _tl:
-                _dir = getattr(signal.direction, 'value', str(signal.direction))
+                _dir = direction_str(signal)
                 _tl.signal(symbol=signal.symbol, direction=_dir, grade="?", confidence=signal.confidence, entry_low=signal.entry_low, entry_high=signal.entry_high, stop_loss=signal.stop_loss, tp1=signal.tp1, tp2=signal.tp2, rr=signal.rr_ratio, strategy=signal.strategy, regime="UNKNOWN", result=f"REJECTED(DAILY_SYMBOL_LIMIT count={symbol_count}/{max_per_symbol})")
             return None
 
@@ -968,8 +968,8 @@ class SignalAggregator:
         try:
             from analyzers.htf_guardrail import htf_guardrail as _agg_htf
             _is_htf_aligned_exempt = (
-                (getattr(signal.direction, 'value', str(signal.direction)) == "SHORT" and _agg_htf._weekly_bias == "BEARISH") or
-                (getattr(signal.direction, 'value', str(signal.direction)) == "LONG" and _agg_htf._weekly_bias == "BULLISH")
+                (is_short(signal) and _agg_htf._weekly_bias == "BEARISH") or
+                (is_long(signal) and _agg_htf._weekly_bias == "BULLISH")
             )
         except Exception:
             pass
@@ -988,7 +988,7 @@ class SignalAggregator:
         # signal is exceptionally clean — bypasses hourly cap even if
         # confidence is slightly below A+ threshold (80 vs 88).
         _clarity = getattr(signal, 'clarity_score', 0) or 0
-        _dir_str_cl = getattr(signal.direction, 'value', str(signal.direction))
+        _dir_str_cl = direction_str(signal)
         _clarity_key = (signal.symbol, _dir_str_cl)
 
         # CLARITY-SPAM FIX: check if this symbol×direction has already exhausted
@@ -1028,22 +1028,22 @@ class SignalAggregator:
                 and not _is_exempt
                 and self._hourly_total < max_hourly):
             logger.info(
-                f"❌ Signal died (agg) | {signal.symbol} {getattr(signal.direction, 'value', str(signal.direction))} "
+                f"❌ Signal died (agg) | {signal.symbol} {direction_str(signal)} "
                 f"| reason=HOURLY_QUALITY_RESERVE | total={self._hourly_total}/{max_hourly} "
                 f"(reserve threshold={_quality_reserve_threshold}, conf={_raw_conf:.0f})"
             )
             if _tl:
-                _dir = getattr(signal.direction, 'value', str(signal.direction))
+                _dir = direction_str(signal)
                 _tl.signal(symbol=signal.symbol, direction=_dir, grade="?", confidence=signal.confidence, entry_low=signal.entry_low, entry_high=signal.entry_high, stop_loss=signal.stop_loss, tp1=signal.tp1, tp2=signal.tp2, rr=signal.rr_ratio, strategy=signal.strategy, regime="UNKNOWN", result=f"REJECTED(HOURLY_QUALITY_RESERVE total={self._hourly_total}/{max_hourly})")
             return None
 
         if self._hourly_total >= max_hourly and not _is_exempt:
             logger.info(
-                f"❌ Signal died (agg) | {signal.symbol} {getattr(signal.direction, 'value', str(signal.direction))} "
+                f"❌ Signal died (agg) | {signal.symbol} {direction_str(signal)} "
                 f"| reason=HOURLY_TOTAL_LIMIT | total={self._hourly_total}/{max_hourly}"
             )
             if _tl:
-                _dir = getattr(signal.direction, 'value', str(signal.direction))
+                _dir = direction_str(signal)
                 _tl.signal(symbol=signal.symbol, direction=_dir, grade="?", confidence=signal.confidence, entry_low=signal.entry_low, entry_high=signal.entry_high, stop_loss=signal.stop_loss, tp1=signal.tp1, tp2=signal.tp2, rr=signal.rr_ratio, strategy=signal.strategy, regime="UNKNOWN", result=f"REJECTED(HOURLY_TOTAL_LIMIT total={self._hourly_total}/{max_hourly})")
             return None
         elif _is_exempt and self._hourly_total >= max_hourly:
@@ -1054,7 +1054,7 @@ class SignalAggregator:
             )
             logger.info(
                 f"✅ {_exempt_reason} signal bypasses hourly limit | {signal.symbol} "
-                f"{getattr(signal.direction, 'value', str(signal.direction))} | limit={self._hourly_total}/{max_hourly}"
+                f"{direction_str(signal)} | limit={self._hourly_total}/{max_hourly}"
             )
 
         # ── 3b. Slot-reuse cooldown ───────────────────────────
@@ -1111,7 +1111,7 @@ class SignalAggregator:
                 volume_quality = volume_analyzer.assess_volume_quality(
                     ohlcv_1h,
                     _entry_mid,
-                    direction=direction_str,
+                    direction=_sig_dir,
                     trade_type=_trade_type,
                 )
                 scored.volume_score = self._clamp_score(
@@ -1222,7 +1222,7 @@ class SignalAggregator:
             _entry_mid_ls = (signal.entry_low + signal.entry_high) / 2
             _ohlcv_1h = (signal.raw_data or {}).get("ohlcv_1h")
             _sweep = liq_sweep_estimator.estimate(
-                direction=direction_str,
+                direction=_sig_dir,
                 entry=_entry_mid_ls,
                 stop=signal.stop_loss,
                 ohlcv=_ohlcv_1h,
@@ -1247,11 +1247,11 @@ class SignalAggregator:
         if scored.derivatives_data:
             scored.derivatives_score = scored.derivatives_data.score
             is_valid, conf_adj, der_notes = derivatives_analyzer.assess_entry_validity(
-                scored.derivatives_data, direction_str
+                scored.derivatives_data, _sig_dir
             )
             if not is_valid:
                 logger.info(
-                    f"❌ Signal died (agg) | {signal.symbol} {getattr(signal.direction, 'value', str(signal.direction))} "
+                    f"❌ Signal died (agg) | {signal.symbol} {direction_str(signal)} "
                     f"| reason=DERIVATIVES_INVALID | strategy={signal.strategy}"
                 )
                 return None
@@ -1266,7 +1266,7 @@ class SignalAggregator:
         if isinstance(order_book, dict) and order_book:
             _of_entry_mid = (signal.entry_low + signal.entry_high) / 2
             scored.orderflow_score = self._score_orderflow(
-                order_book, _of_entry_mid, direction_str
+                order_book, _of_entry_mid, _sig_dir
             )
             # Wire absorption detection from spoof detector
             try:
@@ -1313,12 +1313,12 @@ class SignalAggregator:
                 and abs(scored.orderflow_score - _neutral) <= _margin):
             logger.info(
                 f"❌ Signal died (agg) | {signal.symbol} "
-                f"{getattr(signal.direction, 'value', str(signal.direction))} "
+                f"{direction_str(signal)} "
                 f"| reason=ZERO_DATA_SIGNAL | tech={scored.technical_score:.1f} "
                 f"vol={scored.volume_score:.1f} of={scored.orderflow_score:.1f}"
             )
             if _tl:
-                _dir = getattr(signal.direction, 'value', str(signal.direction))
+                _dir = direction_str(signal)
                 _tl.signal(
                     symbol=signal.symbol, direction=_dir, grade="?",
                     confidence=signal.confidence,
@@ -1348,7 +1348,7 @@ class SignalAggregator:
         if (not _is_aplus_est
                 and scored.derivatives_score < _COMPONENT_FLOOR
                 and scored.orderflow_score < _COMPONENT_FLOOR):
-            _dir_cf = getattr(signal.direction, 'value', str(signal.direction))
+            _dir_cf = direction_str(signal)
             logger.info(
                 f"❌ Signal died (agg) | {signal.symbol} {_dir_cf} "
                 f"| reason=COMPONENT_FLOOR | deriv={scored.derivatives_score:.1f} "
@@ -1368,10 +1368,10 @@ class SignalAggregator:
             return None
 
         # Sentiment score (from Fear & Greed + derivatives data)
-        scored.sentiment_score = self._score_sentiment(direction_str, scored.derivatives_data)
+        scored.sentiment_score = self._score_sentiment(_sig_dir, scored.derivatives_data)
         try:
             from analyzers.wallet_behavior import wallet_profiler
-            whale_intent = wallet_profiler.get_advanced_intent(direction_str)
+            whale_intent = wallet_profiler.get_advanced_intent(_sig_dir)
             whale_component = self._clamp_score(50.0 + whale_intent.confidence_delta * 4.0)
             scored.sentiment_score = self._clamp_score(
                 scored.sentiment_score * 0.75 + whale_component * 0.25
@@ -1417,7 +1417,7 @@ class SignalAggregator:
 
         # ── 7. Sector rotation adjustment ─────────────────────
         sector_adj, sector_note = rotation_tracker.get_signal_adjustment(
-            signal.symbol, direction_str
+            signal.symbol, _sig_dir
         )
         scored.sector_adjustment = sector_adj
         scored.sector_note = sector_note
@@ -1438,7 +1438,7 @@ class SignalAggregator:
                 _h = _np.array([c[2] for c in _ohlcv_raw], dtype=float)
                 _l = _np.array([c[3] for c in _ohlcv_raw], dtype=float)
                 _c = _np.array([c[4] for c in _ohlcv_raw], dtype=float)
-                _dir = direction_str
+                _dir = _sig_dir
                 for p in _detect_candles(_o, _h, _l, _c):
                     if p['direction'] in (_dir, 'NEUTRAL'):
                         _candle_bonus += p['strength'] * 5.0  # max ~5 pts per pattern
@@ -1480,7 +1480,7 @@ class SignalAggregator:
                 )
                 if _blocked:
                     logger.info(
-                        f"❌ Signal died (agg) | {signal.symbol} {direction_str} "
+                        f"❌ Signal died (agg) | {signal.symbol} {_sig_dir} "
                         f"| reason=SECTOR_CONCENTRATION | {_block_reason}"
                     )
                     return None
@@ -1520,7 +1520,7 @@ class SignalAggregator:
         # alts with chronic adverse slippage executed at the same confidence as BTC.
         try:
             from core.slippage_tracker import slippage_tracker as _st
-            _slip_factor = _st.get_adjustment_factor(signal.symbol, direction_str)
+            _slip_factor = _st.get_adjustment_factor(signal.symbol, _sig_dir)
             if _slip_factor < 1.0:
                 final = final * _slip_factor
         except Exception:
@@ -1600,16 +1600,16 @@ class SignalAggregator:
 
         if final < min_conf:
             logger.info(
-                f"❌ Signal died (agg) | {signal.symbol} {direction_str} "
+                f"❌ Signal died (agg) | {signal.symbol} {_sig_dir} "
                 f"| reason=AGG_THRESHOLD | score={final:.1f}/{min_conf} "
                 f"| strategy={signal.strategy}"
             )
             if _tl:
-                _tl.signal(symbol=signal.symbol, direction=direction_str, grade="?", confidence=final, entry_low=signal.entry_low, entry_high=signal.entry_high, stop_loss=signal.stop_loss, tp1=signal.tp1, tp2=signal.tp2, rr=signal.rr_ratio, strategy=signal.strategy, regime=scored.regime, tech=scored.technical_score, vol=scored.volume_score, flow=scored.orderflow_score, deriv=scored.derivatives_score, sent=scored.sentiment_score, corr=scored.correlation_score, result=f"REJECTED(AGG_THRESHOLD score={final:.1f}<{min_conf})")
+                _tl.signal(symbol=signal.symbol, direction=_sig_dir, grade="?", confidence=final, entry_low=signal.entry_low, entry_high=signal.entry_high, stop_loss=signal.stop_loss, tp1=signal.tp1, tp2=signal.tp2, rr=signal.rr_ratio, strategy=signal.strategy, regime=scored.regime, tech=scored.technical_score, vol=scored.volume_score, flow=scored.orderflow_score, deriv=scored.derivatives_score, sent=scored.sentiment_score, corr=scored.correlation_score, result=f"REJECTED(AGG_THRESHOLD score={final:.1f}<{min_conf})")
             # CLARITY-SPAM FIX: record this failure so repeated clarity bypasses
             # that never clear AGG_THRESHOLD eventually get suspended.
             try:
-                _cl_fail_key = (signal.symbol, direction_str)
+                _cl_fail_key = (signal.symbol, _sig_dir)
                 _existing_cf = self._clarity_failure_counts.get(_cl_fail_key)
                 if _existing_cf is None:
                     self._clarity_failure_counts[_cl_fail_key] = (1, time.time())
@@ -1623,7 +1623,7 @@ class SignalAggregator:
                 from core.diagnostic_engine import diagnostic_engine
                 from analyzers.regime import regime_analyzer as _ra_diag
                 diagnostic_engine.record_signal_death(
-                    symbol=signal.symbol, direction=direction_str,
+                    symbol=signal.symbol, direction=_sig_dir,
                     strategy=signal.strategy, kill_reason="AGG_THRESHOLD",
                     rr=signal.rr_ratio, confidence=final,
                     regime=getattr(_ra_diag, 'regime', type('', (), {'value': 'UNKNOWN'})()).value,
@@ -1740,12 +1740,12 @@ class SignalAggregator:
         # mark_sent deferred to after Telegram send (V17), both concurrent scan tasks
         # would see is_duplicate=False and both publish the same signal.
         if await self._deduplicator.check_and_mark(
-            signal.symbol, direction_str,
+            signal.symbol, _sig_dir,
             confidence=final, grade=scored.grade,
         ):
             logger.debug(
                 f"Duplicate signal filtered (post-scoring): "
-                f"{signal.symbol} {direction_str} final={final:.1f}"
+                f"{signal.symbol} {_sig_dir} final={final:.1f}"
             )
             return None
 
@@ -1767,12 +1767,12 @@ class SignalAggregator:
             self._persist_hourly_counter()  # L3-FIX: persist to survive restarts
 
         logger.info(
-            f"✅ Signal approved: {signal.symbol} {direction_str} "
+            f"✅ Signal approved: {signal.symbol} {_sig_dir} "
             f"grade={scored.grade} confidence={final:.1f} "
             f"strategy={signal.strategy}"
         )
         if _tl:
-            _tl.signal(symbol=signal.symbol, direction=direction_str, grade=scored.grade, confidence=final, entry_low=signal.entry_low, entry_high=signal.entry_high, stop_loss=signal.stop_loss, tp1=signal.tp1, tp2=signal.tp2, rr=signal.rr_ratio, strategy=signal.strategy, regime=scored.regime, tech=scored.technical_score, vol=scored.volume_score, flow=scored.orderflow_score, deriv=scored.derivatives_score, sent=scored.sentiment_score, corr=scored.correlation_score, result="APPROVED")
+            _tl.signal(symbol=signal.symbol, direction=_sig_dir, grade=scored.grade, confidence=final, entry_low=signal.entry_low, entry_high=signal.entry_high, stop_loss=signal.stop_loss, tp1=signal.tp1, tp2=signal.tp2, rr=signal.rr_ratio, strategy=signal.strategy, regime=scored.regime, tech=scored.technical_score, vol=scored.volume_score, flow=scored.orderflow_score, deriv=scored.derivatives_score, sent=scored.sentiment_score, corr=scored.correlation_score, result="APPROVED")
 
         return scored
 
@@ -2128,7 +2128,7 @@ class SignalAggregator:
         regime = getattr(scored, 'regime', '')
         # FIX: must verify signal direction aligns with regime — otherwise a SHORT in
         # BULL_TREND at conf ≥ 88 would get A+ and bypass the execution engine entirely.
-        _direction = getattr(scored.base_signal.direction, 'value', str(scored.base_signal.direction))
+        _direction = direction_str(scored.base_signal)
         _regime_aligned = (
             (regime == 'BULL_TREND' and _direction == 'LONG') or
             (regime == 'BEAR_TREND' and _direction == 'SHORT')

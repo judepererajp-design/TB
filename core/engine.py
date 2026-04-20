@@ -46,7 +46,7 @@ from strategies.elliott_wave import ElliottWaveStrategy
 from strategies.funding_arb import FundingArbStrategy
 from strategies.range_scalper import RangeScalperStrategy
 from strategies.wyckoff import WyckoffStrategy
-from strategies.base import SignalDirection, normalize_confidence  # FIX #3 + live-log fix
+from strategies.base import SignalDirection, direction_str, is_long, is_short, normalize_confidence  # FIX #3 + live-log fix
 from patterns.harmonic import HarmonicDetector
 from patterns.geometric import GeometricPatterns
 from signals.aggregator import signal_aggregator, ScoredSignal
@@ -109,7 +109,7 @@ class PreparedPublishCandidate:
 
     @property
     def direction(self) -> str:
-        return getattr(self.signal.direction, 'value', str(self.signal.direction))
+        return direction_str(self.signal)
 
 
 async def _bootstrap_oi_history():
@@ -406,7 +406,7 @@ class Engine:
         )
 
     async def _directional_stability_block_reason(self, symbol: str, signal: object) -> str:
-        direction = getattr(signal.direction, 'value', str(signal.direction))
+        direction = direction_str(signal)
         setup_context = getattr(signal, 'setup_context', None)
         execution_context = getattr(signal, 'execution_context', None)
 
@@ -487,8 +487,8 @@ class Engine:
                 _recent_w = whale_aggregator.get_recent_events(symbol=symbol, max_age_secs=300)
                 if _recent_w:
                     _aligned = [w for w in _recent_w if
-                        (w.side == 'buy' and getattr(signal.direction, 'value', str(signal.direction)) == 'LONG') or
-                        (w.side == 'sell' and getattr(signal.direction, 'value', str(signal.direction)) == 'SHORT')]
+                        (w.side == 'buy' and direction_str(signal) == 'LONG') or
+                        (w.side == 'sell' and direction_str(signal) == 'SHORT')]
                     if _aligned:
                         _total_usd = sum(w.order_usd for w in _aligned)
                         _whale_ctx = f"{len(_aligned)} whale orders aligned (${_total_usd/1000:.0f}k)"
@@ -498,7 +498,7 @@ class Engine:
                             _ht_mp, _ht_sm = await hypertracker.get_primary_cohort_bias()
                             _ht_oi = await hypertracker.get_coin_intelligence(symbol)
                             _ht_intel = hypertracker.format_signal_intel(
-                                _ht_mp, _ht_sm, _ht_oi, getattr(signal.direction, 'value', str(signal.direction))
+                                _ht_mp, _ht_sm, _ht_oi, direction_str(signal)
                             )
                             if _ht_intel:
                                 signal.raw_data['ht_intel'] = _ht_intel
@@ -538,7 +538,7 @@ class Engine:
                 self._cycle_signals_found += 1
                 self._strategy_last_signal[signal.strategy.lower()] = time.time()
                 self._recent_symbol_direction[symbol] = {
-                    "direction": getattr(signal.direction, 'value', str(signal.direction)),
+                    "direction": direction_str(signal),
                     "strategy": signal.strategy,
                     "ts": time.time(),
                     "grade": getattr(alpha_score, "grade", ""),
@@ -569,7 +569,7 @@ class Engine:
                         _quality = await ai_analyst.review_narrative(
                             narrative=_narr,
                             symbol=symbol,
-                            direction=getattr(signal.direction, 'value', str(signal.direction)),
+                            direction=direction_str(signal),
                             grade=scored.grade,
                         )
                         if _quality:
@@ -601,7 +601,7 @@ class Engine:
                         from core.execution_engine import execution_engine
                         execution_engine.track(
                             signal_id=signal_id, symbol=symbol,
-                            direction=getattr(signal.direction, 'value', str(signal.direction)), strategy=signal.strategy,
+                            direction=direction_str(signal), strategy=signal.strategy,
                             entry_low=signal.entry_low, entry_high=signal.entry_high,
                             stop_loss=signal.stop_loss,
                             confidence=scored.final_confidence,
@@ -615,7 +615,7 @@ class Engine:
                             from signals.outcome_monitor import outcome_monitor
                             outcome_monitor.track_signal(
                                 signal_id=signal_id, symbol=symbol,
-                                direction=getattr(signal.direction, 'value', str(signal.direction)), strategy=signal.strategy,
+                                direction=direction_str(signal), strategy=signal.strategy,
                                 entry_low=signal.entry_low, entry_high=signal.entry_high,
                                 stop_loss=signal.stop_loss,
                                 tp1=signal.tp1, tp2=signal.tp2, tp3=signal.tp3,
@@ -638,7 +638,7 @@ class Engine:
                         execution_engine.track(
                             signal_id=signal_id,
                             symbol=symbol,
-                            direction=getattr(signal.direction, 'value', str(signal.direction)),
+                            direction=direction_str(signal),
                             strategy=signal.strategy,
                             entry_low=signal.entry_low,
                             entry_high=signal.entry_high,
@@ -1886,7 +1886,7 @@ class Engine:
 
                         signal = await strategy.analyze(symbol, ohlcv_dict)
                         if signal:
-                            _signal_dir = getattr(signal.direction, 'value', str(signal.direction))
+                            _signal_dir = direction_str(signal)
                             if should_hard_reject_counter_trend_signal(signal.strategy, _signal_dir, regime_name):
                                 logger.info(
                                     f"   ⛔ {symbol}: hard-rejected counter-trend {_signal_dir} "
@@ -1942,13 +1942,13 @@ class Engine:
                             _stm_pct = (_stm_close_now - _stm_close_3ago) / _stm_close_3ago
                             for _stm_sig in all_signals:
                                 # LONG signal but last 3 bars falling > 1%
-                                if getattr(_stm_sig.direction, 'value', str(_stm_sig.direction)) == "LONG" and _stm_pct < -0.01:
+                                if is_long(_stm_sig) and _stm_pct < -0.01:
                                     _stm_sig.confidence -= 8
                                     _stm_sig.confluence.append(
                                         f"⚠️ Counter-momentum: price falling {_stm_pct:.1%} last 3 bars"
                                     )
                                 # SHORT signal but last 3 bars rising > 1%
-                                elif getattr(_stm_sig.direction, 'value', str(_stm_sig.direction)) == "SHORT" and _stm_pct > 0.01:
+                                elif is_short(_stm_sig) and _stm_pct > 0.01:
                                     _stm_sig.confidence -= 8
                                     _stm_sig.confluence.append(
                                         f"⚠️ Counter-momentum: price rising {_stm_pct:+.1%} last 3 bars"
@@ -1969,12 +1969,12 @@ class Engine:
                     _now_cd = time.time()
                     _blocked = []
                     for _pre_check_sig in all_signals:
-                        _cd_key = (symbol, getattr(_pre_check_sig.direction, 'value', str(_pre_check_sig.direction)))
+                        _cd_key = (symbol, direction_str(_pre_check_sig))
                         _last_loss = self._loss_cooldown.get(_cd_key, 0)
                         if _last_loss > 0 and _now_cd - _last_loss < self._reentry_cooldown_mins * 60:
                             _mins_left = int((_last_loss + self._reentry_cooldown_mins * 60 - _now_cd) / 60)
                             logger.info(
-                                f"{symbol} {getattr(_pre_check_sig.direction, 'value', str(_pre_check_sig.direction))}"
+                                f"{symbol} {direction_str(_pre_check_sig)}"
                                 f"| cooldown {_mins_left}min remaining after last loss"
                             )
                             _blocked.append(_pre_check_sig)
@@ -1999,14 +1999,14 @@ class Engine:
                     from analyzers.htf_guardrail import htf_guardrail as _ctr_htf
                     for _ctr_sig in all_signals:
                         _is_counter_dir = (
-                            (getattr(_ctr_sig.direction, 'value', str(_ctr_sig.direction)) == "LONG" and _ctr_htf._weekly_bias == "BEARISH") or
-                            (getattr(_ctr_sig.direction, 'value', str(_ctr_sig.direction)) == "SHORT" and _ctr_htf._weekly_bias == "BULLISH")
+                            (is_long(_ctr_sig) and _ctr_htf._weekly_bias == "BEARISH") or
+                            (is_short(_ctr_sig) and _ctr_htf._weekly_bias == "BULLISH")
                         )
                         if _is_counter_dir and _ctr_htf._weekly_adx >= Penalties.ADX_COUNTER_TREND_MIN:
                             _ctr_sig.confidence *= Penalties.COUNTER_TREND_CONF_MULT
                             logger.debug(
                                 f"Counter-regime penalty ×0.80 | {symbol} "
-                                f"{getattr(_ctr_sig.direction, 'value', str(_ctr_sig.direction))} [{_ctr_sig.strategy}] "
+                                f"{direction_str(_ctr_sig)} [{_ctr_sig.strategy}] "
                                 f"weekly={_ctr_htf._weekly_bias} ADX={_ctr_htf._weekly_adx:.0f}"
                             )
                 except Exception as _ctr_err:
@@ -2020,19 +2020,19 @@ class Engine:
                     from analyzers.htf_guardrail import htf_guardrail as _htf_pre
                     for _pre_sig in all_signals[:]:  # iterate copy to allow removal
                         _blocked, _block_reason = _htf_pre.is_hard_blocked(
-                            signal_direction=getattr(_pre_sig.direction, 'value', str(_pre_sig.direction)),
+                            signal_direction=direction_str(_pre_sig),
                             raw_confidence=_pre_sig.confidence,
                             strategy_name=_pre_sig.strategy,
                         )
                         if _blocked:
                             all_signals.remove(_pre_sig)
                             logger.info(
-                                f"🚫 Pre-agg HTF block | {symbol} {getattr(_pre_sig.direction, 'value', str(_pre_sig.direction))} "
+                                f"🚫 Pre-agg HTF block | {symbol} {direction_str(_pre_sig)} "
                                 f"[{_pre_sig.strategy}] | {_block_reason}"
                             )
                             # V2.09: Track HTF block direction for structural audit
                             try:
-                                ai_analyst.record_htf_block(getattr(_pre_sig.direction, 'value', str(_pre_sig.direction)))
+                                ai_analyst.record_htf_block(direction_str(_pre_sig))
                             except Exception:
                                 pass
                     if not all_signals:
@@ -2081,8 +2081,8 @@ class Engine:
                     # it equally to a counter-trend signal is overly conservative.
                     from analyzers.htf_guardrail import htf_guardrail as _htf_ref
                     _is_aligned = (
-                        (getattr(signal.direction, 'value', str(signal.direction)) == "SHORT" and _htf_ref._weekly_bias == "BEARISH")
-                        or (getattr(signal.direction, 'value', str(signal.direction)) == "LONG" and _htf_ref._weekly_bias == "BULLISH")
+                        (is_short(signal) and _htf_ref._weekly_bias == "BEARISH")
+                        or (is_long(signal) and _htf_ref._weekly_bias == "BULLISH")
                     )
                     _time_pen = Penalties.TIME_PENALTY_ALIGNED_PTS if _is_aligned else Penalties.TIME_PENALTY_COUNTER_PTS
                     signal.confidence -= _time_pen
@@ -2113,12 +2113,12 @@ class Engine:
                 # weekly HTF trend. If weekly=BEARISH and signal=SHORT, the regime's
                 # short_bias penalty would fight the HTF — skip it.
                 _htf_aligned = (
-                    (getattr(signal.direction, 'value', str(signal.direction)) == "SHORT" and _htf_regime_ref._weekly_bias == "BEARISH")
-                    or (getattr(signal.direction, 'value', str(signal.direction)) == "LONG"  and _htf_regime_ref._weekly_bias == "BULLISH")
+                    (is_short(signal) and _htf_regime_ref._weekly_bias == "BEARISH")
+                    or (is_long(signal)  and _htf_regime_ref._weekly_bias == "BULLISH")
                 )
                 try:
                     adj_conf, regime_blocked, regime_reason = apply_regime_filter(
-                        signal.confidence, getattr(signal.direction, 'value', str(signal.direction)),
+                        signal.confidence, direction_str(signal),
                         signal.strategy, regime_name,
                         chop_strength=chop_str,
                         htf_aligned=_htf_aligned,
@@ -2142,7 +2142,7 @@ class Engine:
 
                 # R7-B2: Enforce counter_long_max in bear trends.
                 # regime_thresholds defines counter_long_max=2 but it was never enforced.
-                _dir_str = getattr(signal.direction, 'value', str(signal.direction))
+                _dir_str = direction_str(signal)
                 try:
                     from signals.regime_thresholds import get_regime_threshold
                     _rt = get_regime_threshold(regime_name)
@@ -2204,7 +2204,7 @@ class Engine:
 
                 # ── Sector rotation weight ─────────────────────────
                 sector_weight, sector_reason = rotation_tracker.get_sector_weight(
-                    symbol, getattr(signal.direction, 'value', str(signal.direction))
+                    symbol, direction_str(signal)
                 )
                 if sector_weight != 1.0:
                     signal.confidence *= sector_weight
@@ -2222,7 +2222,7 @@ class Engine:
                 _sym_range_low  = float(min(b[3] for b in _sym_bars[-50:])) if len(_sym_bars) >= 20 else 0.0
                 eq_result = eq_analyzer.assess(
                     entry_mid,
-                    getattr(signal.direction, 'value', str(signal.direction)),
+                    direction_str(signal),
                     symbol_range_high=_sym_range_high,
                     symbol_range_low=_sym_range_low,
                 )
@@ -2230,7 +2230,7 @@ class Engine:
                 if eq_result.should_block:
                     # Fix W3: hard block when in wrong zone — LONG at premium, SHORT at discount
                     logger.info(
-                        f"⚖️  Signal died | {symbol} {getattr(signal.direction, 'value', str(signal.direction))} "
+                        f"⚖️  Signal died | {symbol} {direction_str(signal)} "
                         f"| reason=EQ_ZONE_BLOCK | {eq_result.reason}"
                     )
                     return
@@ -2255,7 +2255,7 @@ class Engine:
                 # is not assigned until signal_aggregator.process() ~400 lines later.
                 # Use regime_name which is set at the top of _scan_symbol.
                 try:
-                    ai_analyst.record_regime_signal(regime_name, getattr(signal.direction, 'value', str(signal.direction)))
+                    ai_analyst.record_regime_signal(regime_name, direction_str(signal))
                 except Exception:
                     pass
                 # BUG-16 FIX: Use public get_recent_events() instead of accessing
@@ -2265,16 +2265,16 @@ class Engine:
                 if recent_whales:
                     aligned = sum(
                         1 for w in recent_whales
-                        if (w.side == 'buy' and getattr(signal.direction, 'value', str(signal.direction)) == 'LONG') or
-                           (w.side == 'sell' and getattr(signal.direction, 'value', str(signal.direction)) == 'SHORT')
+                        if (w.side == 'buy' and direction_str(signal) == 'LONG') or
+                           (w.side == 'sell' and direction_str(signal) == 'SHORT')
                     )
                     opposed = len(recent_whales) - aligned
                     if aligned > opposed:
                         whale_boost = min(1.12, 1.0 + 0.04 * aligned)
                         signal.confidence *= whale_boost
                         total_usd = sum(w.order_usd for w in recent_whales if 
-                            (w.side == 'buy' and getattr(signal.direction, 'value', str(signal.direction)) == 'LONG') or
-                            (w.side == 'sell' and getattr(signal.direction, 'value', str(signal.direction)) == 'SHORT'))
+                            (w.side == 'buy' and direction_str(signal) == 'LONG') or
+                            (w.side == 'sell' and direction_str(signal) == 'SHORT'))
                         signal.confluence.append(
                             f"🐋 Whale flow aligned: {aligned} orders (${total_usd/1000:.0f}k)"
                         )
@@ -2296,7 +2296,7 @@ class Engine:
                 try:
                     _entry_mid_liq = (signal.entry_low + signal.entry_high) / 2
                     _liq_delta, _liq_note, _liq_tp = liquidation_analyzer.get_signal_intel(
-                        symbol, getattr(signal.direction, 'value', str(signal.direction)), _entry_mid_liq
+                        symbol, direction_str(signal), _entry_mid_liq
                     )
                     if _liq_delta != 0:
                         signal.confidence = max(10, signal.confidence + _liq_delta)
@@ -2305,7 +2305,7 @@ class Engine:
                     # Use liq cluster as TP — update signal.tp1 if cluster is
                     # a more precise target between entry and existing TP
                     if _liq_tp and _liq_tp > 0:
-                        if getattr(signal.direction, 'value', str(signal.direction)) == "LONG":
+                        if is_long(signal):
                             # Cluster must be above entry, below or near current tp1
                             if _entry_mid_liq < _liq_tp < signal.tp1 * 1.3:
                                 old_tp1 = signal.tp1
@@ -2343,7 +2343,7 @@ class Engine:
                 # Layer 1: Hyperliquid top trader wallet positions
                 try:
                     _sm_delta, _sm_note = smart_money.get_signal_intel(
-                        symbol, getattr(signal.direction, 'value', str(signal.direction))
+                        symbol, direction_str(signal)
                     )
                     if _sm_delta != 0:
                         signal.confidence = max(10, signal.confidence + _sm_delta)
@@ -2356,7 +2356,7 @@ class Engine:
                 try:
                     from analyzers.institutional_flow import institutional_flow
                     _if_delta, _if_note = institutional_flow.get_signal_intel(
-                        symbol, getattr(signal.direction, 'value', str(signal.direction))
+                        symbol, direction_str(signal)
                     )
                     if _if_delta != 0:
                         signal.confidence = max(10, signal.confidence + _if_delta)
@@ -2365,7 +2365,7 @@ class Engine:
 
                     # Macro score check: strong risk-off suppresses LONGs
                     _macro_score = institutional_flow.get_macro_score()
-                    _is_long = getattr(signal.direction, 'value', str(signal.direction)) == "LONG"
+                    _is_long = is_long(signal)
                     if _macro_score < -40 and _is_long:
                         signal.confidence = max(10, signal.confidence - 8)
                         signal.confluence.append(
@@ -2386,7 +2386,7 @@ class Engine:
                 try:
                     _entry_ms = (signal.entry_low + signal.entry_high) / 2
                     _ms_delta, _ms_note = microstructure.get_signal_intel(
-                        symbol, getattr(signal.direction, 'value', str(signal.direction)), _entry_ms
+                        symbol, direction_str(signal), _entry_ms
                     )
                     if _ms_delta != 0:
                         signal.confidence = max(10, signal.confidence + _ms_delta)
@@ -2405,7 +2405,7 @@ class Engine:
                 # previously stacked to ±75 unbounded.  Now capped at ±25.
                 from config.constants import Enrichment as _EC
 
-                _sig_dir = getattr(signal.direction, 'value', str(signal.direction))
+                _sig_dir = direction_str(signal)
                 _is_long_enrich = _sig_dir == "LONG"
 
                 # ── Step 1: Valuation pre-gate ──────────────────────────
@@ -2679,7 +2679,7 @@ class Engine:
                     _if_note: str = ""
                     try:
                         from analyzers.institutional_flow import institutional_flow as _if_eng
-                        _if_aligned, _if_note = _if_eng.get_ensemble_vote(symbol, getattr(signal.direction, 'value', str(signal.direction)))
+                        _if_aligned, _if_note = _if_eng.get_ensemble_vote(symbol, direction_str(signal))
                         _macro_regime = _if_eng.get_macro_regime()
                     except Exception:
                         _if_aligned = None
@@ -2695,25 +2695,25 @@ class Engine:
                     _whale_aligned_val = None
                     if _recent_whales:
                         _wa_support = sum(1 for w in _recent_whales
-                                         if (w.side=='buy'  and getattr(signal.direction, 'value', str(signal.direction))=='LONG') or
-                                            (w.side=='sell' and getattr(signal.direction, 'value', str(signal.direction))=='SHORT'))
+                                         if (w.side=='buy'  and direction_str(signal)=='LONG') or
+                                            (w.side=='sell' and direction_str(signal)=='SHORT'))
                         _wa_oppose  = sum(1 for w in _recent_whales
-                                         if (w.side=='sell' and getattr(signal.direction, 'value', str(signal.direction))=='LONG') or
-                                            (w.side=='buy'  and getattr(signal.direction, 'value', str(signal.direction))=='SHORT'))
+                                         if (w.side=='sell' and direction_str(signal)=='LONG') or
+                                            (w.side=='buy'  and direction_str(signal)=='SHORT'))
                         if _wa_support + _wa_oppose > 0:
                             _whale_aligned_val = _wa_support > _wa_oppose
 
                     _ev_verdict = ensemble_voter.evaluate(
                         symbol      = symbol,
-                        direction   = getattr(signal.direction, 'value', str(signal.direction)),
+                        direction   = direction_str(signal),
                         entry_price = (signal.entry_low + signal.entry_high) / 2,
 
                         cvd_signal  = _cvd.signal   if _cvd and not _cvd.is_stale  else None,
                         # Smart money: use institutional flow lean (CME+Coinbase+Binance+Bybit)
                         # if available, fall back to Hyperliquid wallet-level signal
                         sm_direction= (
-                            getattr(signal.direction, 'value', str(signal.direction)) if _if_aligned else
-                            (getattr(signal.direction, 'value', str(signal.direction)) if _smb and not _smb.is_stale and _smb.direction == getattr(signal.direction, 'value', str(signal.direction)) else
+                            direction_str(signal) if _if_aligned else
+                            (direction_str(signal) if _smb and not _smb.is_stale and _smb.direction == direction_str(signal) else
                              ("SHORT" if _smb and not _smb.is_stale and _smb.direction == "LONG" else
                               ("LONG" if _smb and not _smb.is_stale and _smb.direction == "SHORT" else None)))
                         ) if (_if_aligned is not None or (_smb and not _smb.is_stale)) else None,
@@ -2747,7 +2747,7 @@ class Engine:
                         )
                         try:
                             ai_analyst.buffer_dead_signal(
-                                symbol, getattr(signal.direction, 'value', str(signal.direction)), signal.strategy,
+                                symbol, direction_str(signal), signal.strategy,
                                 "ENSEMBLE_SUPPRESS", signal.rr_ratio or 0,
                                 signal.confidence, regime_name
                             )
@@ -2780,7 +2780,7 @@ class Engine:
                 # ⭐ R8 ADAPTIVE LAYER — Whale/News/BTC.D/Rotation
                 # Applied after ensemble but before institutional layer.
                 # ══════════════════════════════════════════════════
-                _dir_val = getattr(signal.direction, 'value', str(signal.direction))
+                _dir_val = direction_str(signal)
                 _pump_dump_raw_adj = 0.0
 
                 # ── R8-F2: Whale deposit confidence penalty ──────────
@@ -3057,7 +3057,7 @@ class Engine:
                         )
                         if signal.confidence < Penalties.MARKET_STATE_DEATH_THRESHOLD:
                             logger.info(
-                                f"🧠 Signal died | {symbol} {getattr(signal.direction, 'value', str(signal.direction))} "
+                                f"🧠 Signal died | {symbol} {direction_str(signal)} "
                                 f"| reason=MARKET_STATE_BLOCK (conf={signal.confidence}<{Penalties.MARKET_STATE_DEATH_THRESHOLD}) "
                                 f"| state={mkt_state.state.value} "
                                 f"| strategy={signal.strategy} "
@@ -3087,7 +3087,7 @@ class Engine:
                     try:
                         from signals.proactive_alerts import proactive_alerts as _pa
                         if (_pa.is_macro_pressure_active()
-                                and getattr(signal.direction, 'value', str(signal.direction)) == "LONG"
+                                and is_long(signal)
                                 and "BTC" not in symbol):
                             _macro_penalty = 8
                             signal.confidence = max(0, signal.confidence - _macro_penalty)
@@ -3198,7 +3198,7 @@ class Engine:
                     ntze_result = no_trade_engine.evaluate(
                         symbol=symbol,
                         strategy=signal.strategy,
-                        direction=getattr(signal.direction, 'value', str(signal.direction)),
+                        direction=direction_str(signal),
                         vol_ratio=_vol_ratio,
                         btc_momentum_fast=_btc_mom,
                         btc_momentum_1h=_btc_mom_1h,  # Fix S1: use genuine slow momentum
@@ -3213,7 +3213,7 @@ class Engine:
                     if ntze_result.hard_block and ntze_result.blocks(signal.strategy):
                         reason_str = ntze_result.reasons[0] if ntze_result.reasons else "no_trade_zone"
                         logger.info(
-                            f"⛔ Signal died | {symbol} {getattr(signal.direction, 'value', str(signal.direction))} "
+                            f"⛔ Signal died | {symbol} {direction_str(signal)} "
                             f"| reason=NO_TRADE_ZONE | {reason_str}"
                         )
                         return
@@ -3248,7 +3248,7 @@ class Engine:
                     _is_counter_trend_strat = signal.strategy in _COUNTER_TREND_STRATEGIES
 
                     htf_result = await htf_guardrail.check(
-                        signal_direction=getattr(signal.direction, 'value', str(signal.direction)),
+                        signal_direction=direction_str(signal),
                         signal_confidence=_raw_confidence,
                     )
 
@@ -3298,7 +3298,7 @@ class Engine:
 
                     if clarity.grade == "REJECT":
                         logger.info(
-                            f"🔍 Signal died | {symbol} {getattr(signal.direction, 'value', str(signal.direction))} "
+                            f"🔍 Signal died | {symbol} {direction_str(signal)} "
                             f"| reason=CLARITY_REJECT | score={clarity.score} "
                             f"| {'; '.join(clarity.reasons[:3])}"
                         )
@@ -3359,7 +3359,7 @@ class Engine:
                         tp1=signal.tp1,
                         tp2=signal.tp2,
                         tp3=signal.tp3,
-                        direction=getattr(signal.direction, 'value', str(signal.direction)),
+                        direction=direction_str(signal),
                         setup_class=getattr(signal, 'setup_class', 'intraday'),
                         regime=regime_name,
                         chop_strength=chop_str,
@@ -3601,7 +3601,7 @@ class Engine:
                     # For now, only check circuit breaker and daily loss — not trade count.
                     if risk_manager.circuit_breaker.is_active:
                         logger.info(
-                            f"❌ Signal died | {symbol} {getattr(signal.direction, 'value', str(signal.direction))} "
+                            f"❌ Signal died | {symbol} {direction_str(signal)} "
                             f"| reason=CIRCUIT_BREAKER"
                         )
                         return
@@ -3629,7 +3629,7 @@ class Engine:
                     recent_wr = ll_stats.get('win_rate', -1)
                     adaptive_min = regime_analyzer.get_adaptive_min_confidence(
                         base_min, recent_wr,
-                        direction=getattr(signal.direction, 'value', str(signal.direction)),  # FIX #15
+                        direction=direction_str(signal),  # FIX #15
                     )
 
                     # BUG-8/10 FIX: HTF-aligned signals get the fear/greed bonus reversed.
@@ -3645,7 +3645,7 @@ class Engine:
                         if _fear_adj > 0:
                             adaptive_min = max(60, adaptive_min - _fear_adj)
                             logger.debug(
-                                f"HTF-aligned {getattr(signal.direction, 'value', str(signal.direction))}: adaptive_min reduced "
+                                f"HTF-aligned {direction_str(signal)}: adaptive_min reduced "
                                 f"by fear/greed bonus ({_fear_adj}) → {adaptive_min} "
                                 f"(F&G={_fg})"
                             )
@@ -3677,7 +3677,7 @@ class Engine:
                         if _btc_ctx_pregate.is_active:
                             from config.constants import NewsIntelligence as _NI_net
                             _net_bias, _net_score = btc_news_intelligence.get_net_news_bias()
-                            _sig_dir_pre = getattr(signal.direction, 'value', str(signal.direction)) if hasattr(signal, 'direction') else ""
+                            _sig_dir_pre = direction_str(signal) if hasattr(signal, 'direction') else ""
                             if _net_bias == "BULLISH" and _sig_dir_pre == "LONG":
                                 scored.final_confidence = min(
                                     100, scored.final_confidence * _NI_net.NET_SCORE_BULLISH_CONF_BOOST
@@ -3706,7 +3706,7 @@ class Engine:
                         # Mandatory death reason — never lose track of why
                         all_reasons = ", ".join(death_reasons) if death_reasons else "base_confidence_too_low"
                         logger.info(
-                            f"❌ Signal died | {symbol} {getattr(signal.direction, 'value', str(signal.direction))} "
+                            f"❌ Signal died | {symbol} {direction_str(signal)} "
                             f"| conf={scored.final_confidence:.0f}/{adaptive_min} "
                             f"| strategy={signal.strategy} "
                             f"| death={all_reasons}"
@@ -3830,8 +3830,8 @@ class Engine:
 
                     # V17: Populate negative evidence keys so Bayesian engine can penalize
                     evidence['counter_regime'] = (
-                        (getattr(signal.direction, 'value', str(signal.direction)) == "LONG" and "BEAR" in regime_name.upper()) or
-                        (getattr(signal.direction, 'value', str(signal.direction)) == "SHORT" and "BULL" in regime_name.upper())
+                        (is_long(signal) and "BEAR" in regime_name.upper()) or
+                        (is_short(signal) and "BULL" in regime_name.upper())
                     )
                     evidence['low_volume'] = scored.volume_score < 35
                     evidence['dead_zone_time'] = any('dead zone' in c.lower() for c in signal.confluence)
@@ -3865,7 +3865,7 @@ class Engine:
                     prob_estimate = probability_engine.estimate(
                         strategy=signal.strategy,
                         regime=regime_name,
-                        direction=getattr(signal.direction, 'value', str(signal.direction)),
+                        direction=direction_str(signal),
                         confidence=scored.final_confidence,
                         rr_ratio=signal.rr_ratio,
                         evidence=evidence,
@@ -3885,7 +3885,7 @@ class Engine:
                         p_win=prob_estimate.p_win,
                         rr_ratio=signal.rr_ratio,
                         regime=regime_name,
-                        direction=getattr(signal.direction, 'value', str(signal.direction)),
+                        direction=direction_str(signal),
                         is_killzone=is_killzone,
                         confluence_count=len(confluence.agreeing_strategies),
                         regime_alignment=_regime_alignment_real,  # FIX P2-C: real computed value
@@ -3900,7 +3900,7 @@ class Engine:
                     try:
                         _btc_ctx = btc_news_intelligence.get_event_context()
                         if _btc_ctx.is_active:
-                            _sig_dir = getattr(signal.direction, 'value', str(signal.direction))  # "LONG" or "SHORT"
+                            _sig_dir = direction_str(signal)  # "LONG" or "SHORT"
 
                             # Hard block check
                             if _btc_ctx.block_longs and _sig_dir == "LONG":
@@ -3969,7 +3969,7 @@ class Engine:
                         approved, reject_reason = await risk_manager.validate_signal(scored)
                         if not approved:
                             logger.info(
-                                f"❌ Signal died | {symbol} {getattr(signal.direction, 'value', str(signal.direction))} "
+                                f"❌ Signal died | {symbol} {direction_str(signal)} "
                                 f"| reason=RISK_LIMIT | {reject_reason}"
                             )
                             return
@@ -3981,10 +3981,10 @@ class Engine:
                     # not a hard block. Hard blocks are HTF guardrail's job.
                     # PHASE 2 AUDIT FIX: was modifying signal.confidence (never read
                     # again); now correctly modifies scored.final_confidence.
-                    if _macro_regime == "VOLATILE" and getattr(signal.direction, 'value', str(signal.direction)) == "LONG":
+                    if _macro_regime == "VOLATILE" and is_long(signal):
                         scored.final_confidence = max(0, scored.final_confidence - 5)
                         logger.debug(f"   🌍 {symbol}: macro VOLATILE — LONG final_confidence -5")
-                    elif _macro_regime == "RISK_ON" and getattr(signal.direction, 'value', str(signal.direction)) == "SHORT":
+                    elif _macro_regime == "RISK_ON" and is_short(signal):
                         scored.final_confidence = max(0, scored.final_confidence - 3)
                         logger.debug(f"   🌍 {symbol}: macro RISK_ON — SHORT final_confidence -3")
 
@@ -4029,7 +4029,7 @@ class Engine:
                             build_execution_context,
                             enrich_setup_context_with_eq,
                         )
-                        _dir_exec = getattr(signal.direction, 'value', str(signal.direction))
+                        _dir_exec = direction_str(signal)
                         if getattr(signal, 'raw_data', None) is None:
                             signal.raw_data = {}
                         _raw_exec = signal.raw_data
@@ -4265,7 +4265,7 @@ class Engine:
                     else:
                         sizing = await portfolio_engine.size_position(
                         symbol=symbol,
-                        direction=getattr(signal.direction, 'value', str(signal.direction)),
+                        direction=direction_str(signal),
                         strategy=signal.strategy,
                         entry_price=entry_mid,
                         stop_loss=signal.stop_loss,
@@ -4370,7 +4370,7 @@ class Engine:
 
                     sig_data = {
                         'symbol': signal.symbol,
-                        'direction': getattr(signal.direction, 'value', str(signal.direction)),
+                        'direction': direction_str(signal),
                         'strategy': signal.strategy,
                         'confidence': scored.final_confidence,
                         'entry_low': signal.entry_low,
@@ -4395,16 +4395,16 @@ class Engine:
                             'orderflow':   scored.orderflow_score,
                             'sentiment':   scored.sentiment_score,
                             # Raw signal data for logic panel
-                            'has_ob':      getattr(signal, 'raw_data', {}).get('has_ob', False) if hasattr(signal, 'raw_data') and signal.raw_data else False,
-                            'has_fvg':     getattr(signal, 'raw_data', {}).get('has_fvg', False) if hasattr(signal, 'raw_data') and signal.raw_data else False,
-                            'has_sweep':   getattr(signal, 'raw_data', {}).get('has_sweep', False) if hasattr(signal, 'raw_data') and signal.raw_data else False,
-                            'wave_type':   getattr(signal, 'raw_data', {}).get('wave_type', '') if hasattr(signal, 'raw_data') and signal.raw_data else '',
-                            'wyckoff_event': getattr(signal, 'raw_data', {}).get('wyckoff_event', '') if hasattr(signal, 'raw_data') and signal.raw_data else '',
-                            'htf_structure': getattr(signal, 'raw_data', {}).get('htf_structure', '') if hasattr(signal, 'raw_data') and signal.raw_data else '',
-                            'adx':         getattr(signal, 'raw_data', {}).get('adx', 0) if hasattr(signal, 'raw_data') and signal.raw_data else 0,
-                            'rsi':         getattr(signal, 'raw_data', {}).get('rsi', 0) if hasattr(signal, 'raw_data') and signal.raw_data else 0,
-                            'funding_rate': getattr(signal, 'raw_data', {}).get('funding_rate', 0) if hasattr(signal, 'raw_data') and signal.raw_data else 0,
-                            'vol_ratio':   getattr(signal, 'raw_data', {}).get('vol_ratio', 0) if hasattr(signal, 'raw_data') and signal.raw_data else 0,
+                            'has_ob':      signal.get_raw('has_ob', False),
+                            'has_fvg':     signal.get_raw('has_fvg', False),
+                            'has_sweep':   signal.get_raw('has_sweep', False),
+                            'wave_type':   signal.get_raw('wave_type', ''),
+                            'wyckoff_event': signal.get_raw('wyckoff_event', ''),
+                            'htf_structure': signal.get_raw('htf_structure', ''),
+                            'adx':         signal.get_raw('adx', 0),
+                            'rsi':         signal.get_raw('rsi', 0),
+                            'funding_rate': signal.get_raw('funding_rate', 0),
+                            'vol_ratio':   signal.get_raw('vol_ratio', 0),
                         },
                         # Fix L1+L2+A1: quant fields stored at top level for easy retrieval at outcome time
                         'p_win': prob_estimate.p_win,
@@ -4461,7 +4461,7 @@ class Engine:
                     # leaving phantom "WATCHING / NOT SENT" rows in Signal History.
 
                     # Helper: direction string needed by dedup unmark on gate-kill
-                    _dir_str = getattr(signal.direction, 'value', str(signal.direction))
+                    _dir_str = direction_str(signal)
 
                     # Gate 1: Circuit breaker — check again in case breaker
                     # tripped during the scan/scoring pipeline
@@ -5694,7 +5694,7 @@ class Engine:
 
                         # Check SL breach (mirrors outcome_monitor._check_signal logic)
                         _active_sl = _sig.be_stop if _sig.be_stop is not None else _sig.stop_loss
-                        _is_long = getattr(_sig.direction, 'value', str(_sig.direction)) == "LONG"
+                        _is_long = is_long(_sig)
                         _sl_breached = (
                             (_is_long and _fresh_price <= _active_sl) or
                             (not _is_long and _fresh_price >= _active_sl)

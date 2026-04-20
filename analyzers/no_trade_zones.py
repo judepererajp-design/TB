@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+from strategies.base import direction_str
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +58,7 @@ class NoTradeZoneEngine:
         decision = no_trade_engine.evaluate(
             symbol=signal.symbol,
             strategy=signal.strategy,
-            direction=getattr(signal.direction, 'value', str(signal.direction)),
+            direction=direction_str(signal),
             vol_ratio=vol_ratio,
             btc_momentum_fast=btc_mom,
             funding_rate=funding,
