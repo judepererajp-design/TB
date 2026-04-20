@@ -65,6 +65,7 @@ from core.alpha_model import alpha_model
 from core.portfolio_engine import portfolio_engine
 from core.learning_loop import learning_loop
 from core.feature_store import feature_store
+from core.counter_trend_guard import should_hard_reject_counter_trend_signal
 from utils.formatting import fmt_price
 
 # ── AI + Diagnostic modules ───────────────────────────────────
@@ -109,27 +110,6 @@ class PreparedPublishCandidate:
     @property
     def direction(self) -> str:
         return getattr(self.signal.direction, 'value', str(self.signal.direction))
-
-
-_COUNTER_TREND_HARD_REJECT_STRATEGIES = {
-    "SmartMoneyConcepts",
-    "InstitutionalBreakout",
-    "Ichimoku",
-    "ElliottWave",
-    "WyckoffAccDist",
-    "GeometricPattern",
-}
-
-
-def _should_hard_reject_counter_trend_signal(strategy_name: str, direction: str, regime_name: str) -> bool:
-    """Early hard reject for known trend-regime offenders before downstream logging/filtering."""
-    if strategy_name not in _COUNTER_TREND_HARD_REJECT_STRATEGIES:
-        return False
-    if regime_name == "BULL_TREND":
-        return direction == "SHORT"
-    if regime_name == "BEAR_TREND":
-        return direction == "LONG"
-    return False
 
 
 async def _bootstrap_oi_history():
@@ -1907,7 +1887,7 @@ class Engine:
                         signal = await strategy.analyze(symbol, ohlcv_dict)
                         if signal:
                             _signal_dir = getattr(signal.direction, 'value', str(signal.direction))
-                            if _should_hard_reject_counter_trend_signal(signal.strategy, _signal_dir, regime_name):
+                            if should_hard_reject_counter_trend_signal(signal.strategy, _signal_dir, regime_name):
                                 logger.info(
                                     f"   ⛔ {symbol}: hard-rejected counter-trend {_signal_dir} "
                                     f"[{signal.strategy}] in {regime_name}"
