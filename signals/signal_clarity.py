@@ -21,10 +21,30 @@ Usage:
 """
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import List
 
 logger = logging.getLogger(__name__)
+
+
+# FIX B10: precompile conflict-detection patterns once at module scope so
+# SignalClarityScorer.score() doesn't recompile per call.  Anti-pattern
+# markers are literal substrings checked separately.
+_CONFLICT_KW_LONG  = ('bearish', 'resistance', 'rejection', 'bear trap', 'bear_div')
+_CONFLICT_KW_SHORT = ('bullish', 'support', 'bounce',       'bull trap', 'bull_div')
+_CONFLICT_PAT_LONG  = re.compile(
+    r'(?i)\b(' + '|'.join(re.escape(k) for k in _CONFLICT_KW_LONG) + r')\b'
+)
+_CONFLICT_PAT_SHORT = re.compile(
+    r'(?i)\b(' + '|'.join(re.escape(k) for k in _CONFLICT_KW_SHORT) + r')\b'
+)
+_SHORT_TOKEN_PAT = re.compile(r'(?i)\b(short[-\s]signal|going\s+short)\b')
+_LONG_TOKEN_PAT  = re.compile(r'(?i)\b(long[-\s]signal|going\s+long)\b')
+_ANTI_PATTERNS = (
+    'invalidated', 'failed', 'rejected', 'false', 'trap',
+    'broken', 'disproven', 'cancelled', 'canceled',
+)
 
 
 @dataclass
@@ -157,37 +177,16 @@ class SignalClarityScorer:
         # previous substring match on 'bear'/'bull' flagged legitimately
         # supportive notes like "bearish divergence failed" or "bear trap
         # confirmed" as conflicts, causing spurious −8 penalties per note.
-        # Switch to a regex with \b word boundaries and skip notes that are
-        # explicitly-affirming ('✅') or contain anti-pattern markers.
-        import re as _re
-        conflict_kw_long  = ('bearish', 'resistance', 'rejection', 'bear trap', 'bear_div')
-        conflict_kw_short = ('bullish', 'support', 'bounce',       'bull trap', 'bull_div')
-        # Treat ambiguous single-word directional tokens conservatively:
-        # require either an explicit directional marker or a qualifier word
-        # so 'short-term' doesn't flag a LONG signal.
-        _SHORT_TOKEN_PAT = _re.compile(r'(?i)\b(short[-\s]signal|going\s+short)\b')
-        _LONG_TOKEN_PAT  = _re.compile(r'(?i)\b(long[-\s]signal|going\s+long)\b')
-
-        # Anti-pattern markers: these phrases contain a conflict keyword but
-        # mean the opposite — e.g. "bearish divergence invalidated" is NOT a
-        # bearish signal, it's a bullish one.  Exclude notes that contain any.
-        _ANTI_PATTERNS = (
-            'invalidated', 'failed', 'rejected', 'false', 'trap',
-            'broken', 'disproven', 'cancelled', 'canceled',
-        )
-
+        # Patterns are precompiled at module scope.
         direction = getattr(signal, 'direction', None)
         direction_val = direction.value if hasattr(direction, 'value') else str(direction)
 
         if direction_val == "LONG":
-            kw_list = conflict_kw_long
+            kw_pat = _CONFLICT_PAT_LONG
             opposite_token = _SHORT_TOKEN_PAT
         else:
-            kw_list = conflict_kw_short
+            kw_pat = _CONFLICT_PAT_SHORT
             opposite_token = _LONG_TOKEN_PAT
-        kw_pat = _re.compile(
-            r'(?i)\b(' + '|'.join(_re.escape(k) for k in kw_list) + r')\b'
-        )
 
         conflicts = []
         for note in confluence:
