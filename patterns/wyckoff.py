@@ -86,6 +86,13 @@ class WyckoffAnalyzer:
     Used by patterns module and can enhance SMC signals.
     """
 
+    # Phase-3 audit: recovery/rejection bars see slightly lower volume than the
+    # stop-hunt bar itself (climax is most common on the reversal bar).  Require
+    # 0.8× the spring/UTAD-bar sensitivity so a clean absorption print still
+    # qualifies.  Shared constant so _detect_spring and _detect_utad use the
+    # same textbook threshold.
+    _RECOVERY_VOL_FACTOR = 0.8
+
     def __init__(self):
         self._cfg = cfg.patterns.wyckoff
         self._min_range_bars = getattr(self._cfg, 'min_range_bars', 20)
@@ -550,10 +557,11 @@ class WyckoffAnalyzer:
                     recovery_bar = i if recovered_same else (i + 1)
                     recovery_vol_spike = False
                     if 0 <= recovery_bar < len(volumes):
-                        # Require a slightly lower bar (0.8×) on the recovery —
+                        # Require a slightly lower bar on the recovery —
                         # climax is most common on the stop-hunt itself.
                         recovery_vol_spike = (
-                            volumes[recovery_bar] > avg_volume * self._vol_sensitivity * 0.8
+                            volumes[recovery_bar] > avg_volume * self._vol_sensitivity
+                            * self._RECOVERY_VOL_FACTOR
                         )
                     return {
                         'bar': i,
@@ -588,7 +596,8 @@ class WyckoffAnalyzer:
                     rejection_vol_spike = False
                     if 0 <= rejection_bar < len(volumes):
                         rejection_vol_spike = (
-                            volumes[rejection_bar] > avg_volume * self._vol_sensitivity * 0.8
+                            volumes[rejection_bar] > avg_volume * self._vol_sensitivity
+                            * self._RECOVERY_VOL_FACTOR
                         )
                     return {
                         'bar': i,

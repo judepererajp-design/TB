@@ -201,7 +201,8 @@ class FundingRateArb(BaseStrategy):
         _basis_bonus: float = 0.0
         try:
             from analyzers.market_microstructure import microstructure  # type: ignore
-            _coin = symbol.split("/")[0] if "/" in symbol else symbol.replace("USDT", "").replace("USDC", "")
+            from strategies.base import _symbol_base  # reuse canonical base extractor
+            _coin = _symbol_base(symbol)
             _bas = microstructure._basis.get(_coin) if hasattr(microstructure, "_basis") else None
             if _bas is not None and not _bas.is_stale:
                 _basis_pct = float(_bas.basis_pct)

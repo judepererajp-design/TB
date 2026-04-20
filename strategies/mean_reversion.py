@@ -228,11 +228,14 @@ class MeanReversion(BaseStrategy):
         # not a correlation-risk alt trade).  Additive and capped at −4 so it
         # does not double-count with the MA-based penalty for the LONG case.
         _btc_reg_delta, _btc_reg_note = btc_regime_penalty(symbol, direction)
-        if _btc_reg_delta != 0:
-            # Avoid double-counting when MA-based penalty already fired on the
-            # same direction (overlap only when BTC is BEAR_TREND and LONG).
-            if _btc_dir_penalty == 0:
-                confidence += _btc_reg_delta
+        # Explicit mutual-exclusion flag: the MA-based _btc_dir_penalty only
+        # fires for (BTC bearish ∧ LONG), which overlaps with the regime-based
+        # helper's BEAR_TREND+LONG branch.  Skipping the regime delta whenever
+        # the MA penalty has already been applied guarantees no double-count,
+        # regardless of how the two signals evolve in future.
+        _btc_regime_already_applied = _btc_dir_penalty != 0
+        if _btc_reg_delta != 0 and not _btc_regime_already_applied:
+            confidence += _btc_reg_delta
 
         # ── Entry zone ────────────────────────────────────────────────────
         buf = atr * rp.entry_zone_tight
@@ -300,7 +303,7 @@ class MeanReversion(BaseStrategy):
             confluence.append(f"⚠️ BTC trending (ADX {_btc_adx:.0f}) — macro risk ({_btc_trend_penalty})")
         if _btc_dir_penalty != 0:
             confluence.append(f"⚠️ BTC bearish — LONG alt correlation risk ({_btc_dir_penalty})")
-        if _btc_reg_delta != 0 and _btc_dir_penalty == 0:
+        if _btc_reg_delta != 0 and not _btc_regime_already_applied:
             confluence.append(_btc_reg_note)
         confluence.append(f"📊 Regime: {regime} | TF: {tf}")
         confluence.append(f"🎯 R:R {rr_ratio:.2f} | ATR: {fmt_price(atr)}")
