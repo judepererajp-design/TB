@@ -32,8 +32,6 @@ from __future__ import annotations
 import math
 from typing import Iterable, List, Optional, Sequence
 
-_TWO: float = 2.0
-
 
 # ──────────────────────────────────────────────────────────────────
 # Primitives
