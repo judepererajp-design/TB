@@ -347,20 +347,20 @@ class RangeScalperStrategy(BaseStrategy):
             stop_loss  = range_low_abs - sl_buffer
             tp1        = current + (equilibrium - current) * 0.50    # Halfway to EQ
             tp2        = equilibrium                                   # Full EQ
-            # TP3-FIX: Old TP3 targeted 30% into the supply zone (above EQ toward
-            # range_high), which is the area the strategy itself considers a sell zone.
-            # Placing a LONG TP inside the sell zone is architecturally contradictory.
-            # New TP3 = 10% past EQ — a modest overshoot capturing momentum without
-            # reaching into the supply zone where institutional selling is expected.
-            tp3        = equilibrium + (range_high - equilibrium) * 0.10
+            # Phase-2 RS-Q4: TP3 = EQ + min(0.5·ATR, 10% past-EQ).  The 10%
+            # cap prevents a large ATR on a tight range from pushing TP3 near
+            # the opposite edge (sell zone for LONG).  The ATR floor gives
+            # a structurally meaningful target on ranges that are EQ-dominated
+            # (where 10% of the upper half would be trivially small).
+            tp3        = equilibrium + min(atr * 0.5, (range_high - equilibrium) * 0.10)
         else:
             entry_high = current + atr * rp.entry_zone_atr * 0.75
             entry_low  = current - atr * rp.entry_zone_tight
             stop_loss  = range_high_abs + sl_buffer
             tp1        = current - (current - equilibrium) * 0.50
             tp2        = equilibrium
-            # TP3-FIX: Mirror fix — 10% past EQ into demand zone, not 30%.
-            tp3        = equilibrium - (equilibrium - range_low) * 0.10
+            # Mirror: TP3 = EQ − min(0.5·ATR, 10% past-EQ).
+            tp3        = equilibrium - min(atr * 0.5, (equilibrium - range_low) * 0.10)
 
         # ── 8. Risk/Reward check ──────────────────────────────────
         risk = abs(current - stop_loss)
@@ -422,15 +422,25 @@ class RangeScalperStrategy(BaseStrategy):
     ) -> int:
         """Count how many times price bounced off this zone in recent history"""
         count = 0
+        # Audit P1: clamp lookback to array length so a misconfigured large
+        # lookback (or short OHLCV window) cannot wrap Python negative indices
+        # back into stale data at the start of the array.  We also need at
+        # least 3 bars so the `i=-lookback → closes[i+1]` check is meaningful.
+        _n = min(len(highs), len(lows), len(closes))
+        if _n < 3:
+            return 0
+        effective_lookback = min(int(lookback), _n - 1)
+        if effective_lookback < 2:
+            return 0
         if direction == "LONG":
             zone_top = range_low + edge_band
-            for i in range(-lookback, -2):
+            for i in range(-effective_lookback, -2):
                 # Price entered demand zone then bounced up
                 if lows[i] <= zone_top and closes[i + 1] > zone_top:
                     count += 1
         else:
             zone_bottom = range_high - edge_band
-            for i in range(-lookback, -2):
+            for i in range(-effective_lookback, -2):
                 # Price entered supply zone then bounced down
                 if highs[i] >= zone_bottom and closes[i + 1] < zone_bottom:
                     count += 1

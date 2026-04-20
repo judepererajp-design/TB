@@ -13,7 +13,7 @@ Combined with OI spike for confirmation of overcrowding.
 
 import logging
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -50,7 +50,32 @@ class FundingRateArb(BaseStrategy):
         super().__init__()
         self._cfg = cfg.strategies.funding_arb
         # Per-symbol cache of the previous funding delta for flip detection (B).
-        self._prev_funding_delta: Dict[str, float] = {}
+        # Audit P1: pair the delta with its last-seen wallclock time so a
+        # long-running bot can prune symbols that have not been scanned for a
+        # while (bounded by _PREV_DELTA_TTL_SEC / _PREV_DELTA_MAX_SIZE).
+        self._prev_funding_delta: Dict[str, Tuple[float, float]] = {}
+
+    # Prune stale entries more than 24 h old.  Also bound total size as a
+    # defence against pathological symbol explosions.
+    _PREV_DELTA_TTL_SEC: float = 24 * 60 * 60
+    _PREV_DELTA_MAX_SIZE: int = 512
+
+    def _prune_prev_delta(self, now: float) -> None:
+        """Drop stale / overflow entries from the funding delta cache."""
+        _ttl = self._PREV_DELTA_TTL_SEC
+        if len(self._prev_funding_delta) > self._PREV_DELTA_MAX_SIZE:
+            # Keep the most recent half when the cache overflows.
+            _sorted = sorted(
+                self._prev_funding_delta.items(),
+                key=lambda kv: kv[1][1],
+                reverse=True,
+            )
+            keep = _sorted[: self._PREV_DELTA_MAX_SIZE // 2]
+            self._prev_funding_delta = {k: v for k, v in keep}
+        # TTL sweep
+        _stale = [k for k, (_, ts) in self._prev_funding_delta.items() if now - ts > _ttl]
+        for k in _stale:
+            self._prev_funding_delta.pop(k, None)
 
     async def analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:
         try:
@@ -131,8 +156,11 @@ class FundingRateArb(BaseStrategy):
             # Try raw_data fallback
             funding_rate_pct = 0.0
             oi_change    = 0.0
-        # Sanity guard against obvious unit/corruption errors.
-        if abs(funding_rate_pct) > 5.0:
+        # Sanity guard against obvious unit/corruption errors.  Even 1% funding
+        # per 8h cycle would be historically extreme on any major exchange;
+        # anything above that is almost certainly a unit-conversion bug
+        # (fractional rate treated as percentage or similar).
+        if abs(funding_rate_pct) > 1.0:
             logger.warning(
                 "FundingRateArb: abnormal funding value for %s: %s%% (skipping)",
                 symbol,
@@ -155,6 +183,60 @@ class FundingRateArb(BaseStrategy):
             direction = "LONG"    # Fade the overcrowded shorts
         else:
             return None  # Funding not extreme enough
+
+        # ── Perp–spot basis cross-check (Phase-3 audit) ───────────────────
+        # Funding tells us *who is paying*; basis tells us *where price is
+        # vs fair value*.  A true overcrowded-long setup should show BOTH
+        # positive funding AND a perp premium over spot.  When they disagree
+        # the fade is weaker (funding may reflect carry-trade positioning
+        # rather than directional crowding) — apply a soft penalty.  When
+        # they agree strongly, apply a bonus, capped by the existing
+        # positive-adjustment cap.
+        #
+        # Skipped silently when the microstructure feed is unavailable or
+        # the basis snapshot is stale — strategy must degrade gracefully.
+        _basis_pct: Optional[float] = None
+        _basis_note: Optional[str] = None
+        _basis_penalty: float = 0.0
+        _basis_bonus: float = 0.0
+        try:
+            from analyzers.market_microstructure import microstructure  # type: ignore
+            from strategies.base import _symbol_base  # reuse canonical base extractor
+            _coin = _symbol_base(symbol)
+            _bas = microstructure._basis.get(_coin) if hasattr(microstructure, "_basis") else None
+            if _bas is not None and not _bas.is_stale:
+                _basis_pct = float(_bas.basis_pct)
+                if direction == "SHORT":
+                    # Fading crowded longs: perp premium confirms, discount contradicts.
+                    if _basis_pct <= -0.3:
+                        # Funding says longs crowded but perp trades at spot discount.
+                        # This is often a funding-carry setup, not a directional crowd.
+                        _basis_penalty = 6.0
+                        _basis_note = (
+                            f"⚠️ Perp discount {_basis_pct:+.2f}% contradicts "
+                            f"positive funding — fade thesis weakened (-6)"
+                        )
+                    elif _basis_pct >= 0.3:
+                        _basis_bonus = 4.0
+                        _basis_note = (
+                            f"✅ Perp premium {_basis_pct:+.2f}% confirms "
+                            f"crowded-long fade (+4)"
+                        )
+                else:  # LONG — fading crowded shorts
+                    if _basis_pct >= 0.3:
+                        _basis_penalty = 6.0
+                        _basis_note = (
+                            f"⚠️ Perp premium {_basis_pct:+.2f}% contradicts "
+                            f"negative funding — fade thesis weakened (-6)"
+                        )
+                    elif _basis_pct <= -0.3:
+                        _basis_bonus = 4.0
+                        _basis_note = (
+                            f"✅ Perp discount {_basis_pct:+.2f}% confirms "
+                            f"crowded-short fade (+4)"
+                        )
+        except Exception as _basis_err:
+            logger.debug(f"FundingRateArb: basis lookup failed for {symbol}: {_basis_err}")
 
         # ── OI change confirmation (FA-Q3: scale threshold by ATR% so it is
         #    self-calibrating — a 8% OI move on BTC is a major event, but
@@ -183,7 +265,8 @@ class FundingRateArb(BaseStrategy):
         #   SHORT fade: prev_delta > 0 (funding rising) → now < 0 (falling)
         #   LONG  fade: prev_delta < 0 (funding falling) → now > 0 (rising)
         _flip_bonus = 0.0
-        _prev_delta = self._prev_funding_delta.get(symbol)
+        _prev_entry = self._prev_funding_delta.get(symbol)
+        _prev_delta = _prev_entry[0] if _prev_entry is not None else None
         if (
             _prev_delta is not None
             and funding_delta_pct != 0.0
@@ -197,7 +280,11 @@ class FundingRateArb(BaseStrategy):
                 )
                 if _fade_aligned:
                     _flip_bonus = 4.0
-        self._prev_funding_delta[symbol] = funding_delta_pct
+        _now_ts = time.time()
+        self._prev_funding_delta[symbol] = (funding_delta_pct, _now_ts)
+        # Audit P1: bound cache size / TTL so long-running bots do not leak
+        # memory as new symbols rotate into the scan pool.
+        self._prune_prev_delta(_now_ts)
 
         # ── Confidence ────────────────────────────────────────────────────
         confidence = float(confidence_base)
@@ -225,6 +312,9 @@ class FundingRateArb(BaseStrategy):
         # Fix #3: scale the regime penalty with ADX so a weak trend applies a
         # lighter penalty and a strong trend applies a heavier one.
         adx = self.calculate_adx(highs, lows, closes, period=14)
+        # Audit P1: clamp ADX to the mathematical [0, 100] range so
+        # upstream computation bugs don't inflate _adx_factor.
+        adx = max(0.0, min(100.0, float(adx)))
         # 40 is a conventional "strong trend" threshold on the 0-100 ADX scale;
         # at ADX=40 the full −10 applies, at ADX=20 only −5 applies.
         _adx_factor = min(1.5, adx / 40.0) if adx > 0 else 1.0
@@ -288,12 +378,27 @@ class FundingRateArb(BaseStrategy):
                 elif squeeze_risk == "MEDIUM":
                     _pos_adj += 3  # Moderate short covering
 
+        # Phase-2 FA-Q6: Payment-window freshness bonus.  The first 15 minutes
+        # after a funding payment have the highest information value — the
+        # just-paid cash flow is actively re-positioning leveraged books.
+        # Reward fresh entries; do not apply a symmetric penalty (staleness
+        # already handled by FA-Q5 above).
+        if funding_age_sec is not None and funding_age_sec <= 900:
+            _pos_adj += 3
+
         # Apply capped positive adjustment (C: prevents correlated bonuses from
         # inflating confidence — max combined derivative signal reward = +12).
+        _pos_adj += _basis_bonus
         confidence += min(_pos_adj, 12.0)
+        # Basis-contradiction penalty (Phase-3) — applied outside the
+        # positive-adjustment cap because it is a negative adjustment.
+        confidence -= _basis_penalty
 
         # ── Recent swing levels for SL ────────────────────────────────────
-        lookback_sl = min(20, len(highs) - 1)
+        # Audit P1: clamp to [1, 20] so the slice is never empty (len==1)
+        # nor inverted — `highs[-0:]` returns the entire array, which silently
+        # falls back to the global max/min rather than the recent swing.
+        lookback_sl = max(1, min(20, len(highs) - 1))
         recent_high = float(np.max(highs[-lookback_sl:]))
         recent_low  = float(np.min(lows[-lookback_sl:]))
 
@@ -385,6 +490,8 @@ class FundingRateArb(BaseStrategy):
         )
         if _tp2_unwinding_note:
             confluence.append(_tp2_unwinding_note)
+        if _basis_note:
+            confluence.append(_basis_note)
         if regime in ("BULL_TREND", "BEAR_TREND"):
             confluence.append(
                 f"⚠️ Counter-trend in {regime} — requires ≥2× threshold"
@@ -432,6 +539,9 @@ class FundingRateArb(BaseStrategy):
                 "tp2_scale": _tp2_scale,
                 "pos_adj_capped": min(_pos_adj, 12.0),
                 "flip_bonus": _flip_bonus,
+                "basis_pct": _basis_pct,
+                "basis_penalty": _basis_penalty,
+                "basis_bonus": _basis_bonus,
             },
             regime=regime,
         )
@@ -439,3 +549,8 @@ class FundingRateArb(BaseStrategy):
             return None
         return candidate
 FundingArbStrategy = FundingRateArb
+# Phase-3: preferred semantic alias.  The strategy *fades* crowded funding
+# extremes — it is not a pure arbitrage.  External references (config,
+# regime_thresholds, tests) continue to use the original class name for
+# back-compatibility; new call sites should prefer ``FundingRateFade``.
+FundingRateFade = FundingRateArb

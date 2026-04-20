@@ -19,7 +19,7 @@ import pandas as pd
 
 from config.loader import cfg
 from config.constants import STRATEGY_VALID_REGIMES
-from strategies.base import BaseStrategy, SignalResult, SignalDirection, cfg_min_rr
+from strategies.base import BaseStrategy, SignalResult, SignalDirection, cfg_min_rr, btc_regime_penalty
 from utils.formatting import fmt_price
 from utils.risk_params import rp
 
@@ -152,6 +152,21 @@ class MeanReversion(BaseStrategy):
         if _std_baseline > 1e-12 and _std_recent > _std_baseline * 1.3:
             return None
 
+        # Phase-2 MR-Q5: z-acceleration filter.  Even when |z| exceeds threshold,
+        # if |z| is still expanding bar-over-bar the move may keep running into
+        # a breakout rather than reverting.  We compute |z| one bar back and
+        # skip the signal when the most recent bar widened the deviation.
+        # The guard only fires on clear expansion (>10% growth) so normal noise
+        # around the threshold does not over-filter.
+        if len(closes) >= z_period + 1:
+            _prev_window = closes[-z_period - 1:-1]
+            _prev_mean = float(np.mean(_prev_window))
+            _prev_std  = float(np.std(_prev_window, ddof=1))
+            if _prev_std > 1e-12:
+                _prev_z = abs((closes[-2] - _prev_mean) / _prev_std)
+                if abs(z_score) > _prev_z * 1.10 and abs(z_score) > z_threshold * 1.05:
+                    return None
+
         # ── ADX filter — ensure not trending ─────────────────────────────
         adx = self.calculate_adx(highs, lows, closes, period=14)
         if adx >= max_adx:
@@ -205,8 +220,37 @@ class MeanReversion(BaseStrategy):
             _btc_dir_penalty = -6
         confidence += _btc_dir_penalty
 
+        # Phase-3 audit: shared BTC-regime helper fills in the symmetric case
+        # (BTC BULL_TREND + alt SHORT) that the MA-based _btc_dir_penalty above
+        # does not cover, and — critically — exempts BTC/ETH majors from
+        # counter-trend penalty (on majors, the "regime" IS their own price
+        # action, so a SHORT in BTC BULL_TREND is a conviction-driven fade,
+        # not a correlation-risk alt trade).  Additive and capped at −4 so it
+        # does not double-count with the MA-based penalty for the LONG case.
+        _btc_reg_delta, _btc_reg_note = btc_regime_penalty(symbol, direction)
+        # Explicit mutual-exclusion flag: the MA-based _btc_dir_penalty only
+        # fires for (BTC bearish ∧ LONG), which overlaps with the regime-based
+        # helper's BEAR_TREND+LONG branch.  Skipping the regime delta whenever
+        # the MA penalty has already been applied guarantees no double-count,
+        # regardless of how the two signals evolve in future.
+        _btc_regime_already_applied = _btc_dir_penalty != 0
+        if _btc_reg_delta != 0 and not _btc_regime_already_applied:
+            confidence += _btc_reg_delta
+
         # ── Entry zone ────────────────────────────────────────────────────
         buf = atr * rp.entry_zone_tight
+
+        # Phase-2 MR-Q6: dynamic TP2 reversion fraction scaled by |z|.
+        # Default 0.70 for z around threshold; up to 0.85 when z is very
+        # extreme (≥ 3.5σ — capitulation/euphoria where full mean-return
+        # is more likely).  Capped so small threshold crosses stay tactical.
+        _abs_z = abs(z_score)
+        if _abs_z >= 3.5:
+            tp2_frac = 0.85
+        elif _abs_z >= 2.5:
+            tp2_frac = 0.78
+        else:
+            tp2_frac = 0.70
 
         if direction == "LONG":
             entry_low  = current_price - buf
@@ -218,10 +262,8 @@ class MeanReversion(BaseStrategy):
             stop_loss  = l - atr * 1.5
             # TP1: 25% reversion toward mean
             tp1 = current_price + (mean - current_price) * 0.25
-            # MR-Q4: TP2 at 70% of the reversion move.  The mean is hit only ~40%
-            # of the time as the next impulse often interrupts; 70% is hit ~65% of
-            # the time and captures most of the practical edge.
-            tp2 = current_price + (mean - current_price) * 0.70
+            # MR-Q4 (Phase-2: scaled by |z|): TP2 at 70–85% of the reversion.
+            tp2 = current_price + (mean - current_price) * tp2_frac
             # TP3: opposite z-score level
             tp3 = mean + std * z_threshold
         else:
@@ -229,8 +271,8 @@ class MeanReversion(BaseStrategy):
             entry_high = current_price + buf
             stop_loss  = h + atr * 1.5
             tp1 = current_price - (current_price - mean) * 0.25
-            # MR-Q4: 70% reversion (same rationale as LONG path above)
-            tp2 = current_price - (current_price - mean) * 0.70
+            # MR-Q4 (Phase-2: scaled by |z|): 70-85% reversion.
+            tp2 = current_price - (current_price - mean) * tp2_frac
             tp3 = mean - std * z_threshold
 
         # Sanity: tp1 must be strictly in the right direction
@@ -261,6 +303,8 @@ class MeanReversion(BaseStrategy):
             confluence.append(f"⚠️ BTC trending (ADX {_btc_adx:.0f}) — macro risk ({_btc_trend_penalty})")
         if _btc_dir_penalty != 0:
             confluence.append(f"⚠️ BTC bearish — LONG alt correlation risk ({_btc_dir_penalty})")
+        if _btc_reg_delta != 0 and not _btc_regime_already_applied:
+            confluence.append(_btc_reg_note)
         confluence.append(f"📊 Regime: {regime} | TF: {tf}")
         confluence.append(f"🎯 R:R {rr_ratio:.2f} | ATR: {fmt_price(atr)}")
 

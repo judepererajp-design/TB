@@ -113,6 +113,59 @@ def is_short(obj: Any) -> bool:
     return direction_str(obj) == "SHORT"
 
 
+# ── Phase 3 audit: shared cross-strategy helpers ──────────────────────────
+
+# Majors that drive regime rather than follow it — they are exempt from the
+# BTC-regime counter-trend alt penalty below (a BTC BEAR_TREND does not make a
+# BTC LONG counter-trend; the regime IS BTC price action).
+_BTC_REGIME_MAJOR_BASES = frozenset({"BTC", "ETH", "BTCUSDT", "ETHUSDT"})
+
+
+def _symbol_base(symbol: str) -> str:
+    """Return the base currency upper-cased, tolerating both ``BTCUSDT`` and ``BTC/USDT``."""
+    s = str(symbol or "").upper()
+    if "/" in s:
+        s = s.split("/", 1)[0]
+    else:
+        # Strip common quote suffixes (USDT, USDC, BUSD, USD, FDUSD).
+        for q in ("USDT", "USDC", "BUSD", "FDUSD", "USD"):
+            if s.endswith(q) and len(s) > len(q):
+                s = s[: -len(q)]
+                break
+    return s
+
+
+def btc_regime_penalty(symbol: str, direction: str) -> Tuple[int, str]:
+    """Return ``(confidence_delta, note)`` when BTC regime contradicts an alt signal.
+
+    Phase 3 shared helper.  Opt-in — strategies import and apply as a soft
+    confidence adjustment.  Zero effect on BTC/ETH majors (they define the
+    regime, not follow it) and zero effect when the regime analyzer is not
+    available or the regime is neutral/choppy/volatile.
+
+    The penalty is deliberately small (−4) so it nudges rather than blocks;
+    the regime gate upstream already provides the hard block for clearly
+    unsuitable regimes per strategy.
+    """
+    try:
+        base = _symbol_base(symbol)
+        if base in _BTC_REGIME_MAJOR_BASES:
+            return 0, ""
+        # Local import keeps the helper dependency-light and test-safe under
+        # the tests/conftest.py module mocks.
+        from analyzers.regime import regime_analyzer  # type: ignore
+        regime = getattr(getattr(regime_analyzer, "regime", None), "value", None) \
+            or str(getattr(regime_analyzer, "regime", ""))
+        d = direction_str(direction) if not isinstance(direction, str) else direction.upper()
+        if regime == "BULL_TREND" and d == "SHORT":
+            return -4, "⚠️ BTC BULL_TREND — alt SHORT counter-trend (-4)"
+        if regime == "BEAR_TREND" and d == "LONG":
+            return -4, "⚠️ BTC BEAR_TREND — alt LONG counter-trend (-4)"
+    except Exception:
+        return 0, ""
+    return 0, ""
+
+
 # ── Signal Result ─────────────────────────────────────────────────────────
 @dataclass
 class SignalResult:
@@ -564,6 +617,30 @@ class BaseStrategy(ABC):
         cls._class_indicator_cache[cache_key] = result
         return result
 
+    @staticmethod
+    def adx_period_for_tf(tf: str) -> int:
+        """Timeframe-adaptive Wilder ADX period (Phase-3 audit helper).
+
+        Short timeframes benefit from a faster-responding ADX so trend
+        confirmation is not lagging several bars behind price.  Daily+ uses a
+        longer period to reduce noise.  Callers that don't care can keep
+        passing ``period=14`` directly — this helper is opt-in.
+
+        Mapping:
+          * intraday (≤30m)     → 10 bars
+          * mid (1h / 2h)       → 14 bars (Wilder classic)
+          * swing (4h–12h)      → 14 bars
+          * position (1d+/1w)   → 20 bars
+          * unknown / blank     → 14 bars (safe default)
+        """
+        t = str(tf or "").strip().lower()
+        if t in ("1m", "3m", "5m", "15m", "30m"):
+            return 10
+        if t in ("1d", "3d", "1w", "1mo", "1M"):
+            return 20
+        # 1h / 2h / 4h / 6h / 8h / 12h and unknown → Wilder default
+        return 14
+
     @classmethod
     def calculate_adx(cls, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray,
                       period: int = 14) -> float:
@@ -674,6 +751,50 @@ class BaseStrategy(ABC):
             risk = stop_loss - fill
             reward = fill - tp2
 
+        if risk <= 0 or reward <= 0:
+            return 0.0
+        return round(reward / risk, 2)
+
+    @staticmethod
+    def slippage_adjusted_rr(
+        direction: SignalDirection | str,
+        entry_low: float,
+        entry_high: float,
+        stop_loss: float,
+        tp: float,
+        fee_bps: float = 5.0,
+        slippage_bps: float = 5.0,
+    ) -> float:
+        """
+        Phase-2 helper — fee + slippage aware R:R.
+
+        Strategies can opt in to this when they want a realistic
+        after-cost R:R for min-RR gating.  The default fees (5 bps taker
+        + 5 bps slippage) are conservative for institutional-grade execution
+        on the major venues and can be tightened in the future once
+        we have per-exchange/per-symbol spread data.
+
+        Unlike ``calculate_effective_rr`` this does NOT use worst-case fill
+        (that is already a slippage proxy).  Use the entry midpoint but
+        charge a fee/slippage haircut on BOTH the SL and TP legs so the
+        measured reward and risk are both realistic.
+
+        Returns 0.0 on invalid geometry.
+        """
+        direction_str = direction.value if hasattr(direction, "value") else str(direction)
+        if entry_low <= 0 or entry_high <= 0 or entry_high < entry_low:
+            return 0.0
+        mid = (entry_low + entry_high) / 2.0
+        # Convert bps → fractional cost.  Fees + slippage bite twice on a round trip
+        # but we only charge once per leg here (entry & exit) for simplicity.
+        _cost_frac = max(0.0, float(fee_bps) + float(slippage_bps)) / 10000.0
+        _cost_per_leg = mid * _cost_frac
+        if direction_str == SignalDirection.LONG.value:
+            risk   = (mid - stop_loss) + _cost_per_leg
+            reward = (tp - mid) - _cost_per_leg
+        else:
+            risk   = (stop_loss - mid) + _cost_per_leg
+            reward = (mid - tp) - _cost_per_leg
         if risk <= 0 or reward <= 0:
             return 0.0
         return round(reward / risk, 2)

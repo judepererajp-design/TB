@@ -150,9 +150,18 @@ class BreakoutStrategy(BaseStrategy):
         # BR-Q2: lower ADX threshold (28→20) to catch accumulation breakouts on alts
         # where ADX starts rising from ~15-22.  Pair with a slope check so we
         # accept *either* "ADX already strong" OR "ADX clearly rising".
-        adx = self.calculate_adx(highs, lows, closes, period=14)
-        # Slope: compare current ADX against the value 3 bars ago.
-        _adx_prev = self.calculate_adx(highs[:-3], lows[:-3], closes[:-3], period=14) if len(closes) > 17 else adx
+        # Phase-3: ADX period is now TF-adaptive (10 on intraday, 14 default,
+        # 20 on daily+) so trend confirmation is not lagging on fast TFs.
+        _adx_period = self.adx_period_for_tf(tf)
+        adx = self.calculate_adx(highs, lows, closes, period=_adx_period)
+        # Slope: compare current ADX against the value 3 bars ago.  Require
+        # at least 50 bars so the trailing ADX has completed its Wilder warm-up
+        # — 17 bars (the old floor) leaves the smoothing still ramping and
+        # produces noisy "rising" flags.
+        if len(closes) >= 50:
+            _adx_prev = self.calculate_adx(highs[:-3], lows[:-3], closes[:-3], period=_adx_period)
+        else:
+            _adx_prev = adx
         _adx_rising = (adx - _adx_prev) >= 1.5   # Rising at least 1.5 pts over 3 bars
         # BR-Q2b: require adx > 15 when using the rising-slope bypass.  Without the
         # floor, ADX crawling from 10 → 12 passes as "rising" — that's directionless
@@ -303,9 +312,14 @@ class BreakoutStrategy(BaseStrategy):
             # while still preventing an unreasonably wide stop on volatile assets.
             stop_loss  = max(current_low - atr * 0.2,
                              channel_high - atr * sl_mult * 2)
+            # Phase-2 BR-Q6: extend TP3 to 140% of measured move.  Back-tests
+            # show winning breakouts rarely stop at the 100% projection in
+            # trending regimes — 120–160% extensions are common once momentum
+            # catches.  140% gives the runner some upside without forcing the
+            # scale-out beyond what the market typically delivers.
             tp1        = channel_high + range_size * 0.50  # 50% measured move
-            tp2        = channel_high + range_size * 0.80  # 80% measured move (main target)
-            tp3        = channel_high + range_size * 1.00  # 100% measured move (extension)
+            tp2        = channel_high + range_size * 1.00  # 100% — main target (was 80%)
+            tp3        = channel_high + range_size * 1.40  # 140% — runner
         else:
             entry_high = channel_low
             entry_low  = channel_low - atr * rp.entry_zone_atr
@@ -313,9 +327,9 @@ class BreakoutStrategy(BaseStrategy):
             stop_loss  = min(current_high + atr * 0.2,
                              channel_low + atr * sl_mult * 2)
             tp1        = channel_low - range_size * 0.50
-            tp2        = channel_low - range_size * 0.80
+            tp2        = channel_low - range_size * 1.00
             # Floor at a minimum positive price to prevent physically impossible targets.
-            tp3        = max(channel_low * 0.01, channel_low - range_size * 1.00)
+            tp3        = max(channel_low * 0.01, channel_low - range_size * 1.40)
 
         risk = abs(channel_high - stop_loss) if direction == "LONG" else abs(channel_low - stop_loss)
         rr   = abs(tp2 - (channel_high if direction == "LONG" else channel_low)) / risk if risk > 0 else 0

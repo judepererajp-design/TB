@@ -50,7 +50,15 @@ class ReversalStrategy(BaseStrategy):
         try:
             from analyzers.regime import regime_analyzer
             regime = getattr(regime_analyzer.regime, 'value', 'UNKNOWN')
-            allow_volatile = bool(getattr(self._cfg, 'allow_volatile', False))
+            # Audit P1: robust str→bool coercion.  bool("false") is True because
+            # the string is non-empty, so a YAML "false" leaked as string would
+            # silently enable VOLATILE regime.  Accept either native bool or
+            # common string truth values.
+            _av_raw = getattr(self._cfg, 'allow_volatile', False)
+            if isinstance(_av_raw, str):
+                allow_volatile = _av_raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+            else:
+                allow_volatile = bool(_av_raw)
             _valid = set(self.VALID_REGIMES)
             if allow_volatile:
                 _valid = _valid | {"VOLATILE"}
@@ -99,18 +107,27 @@ class ReversalStrategy(BaseStrategy):
         confidence = conf_base
 
         # ── Bullish reversal: RSI oversold + price at lower BB ──
-        if rsi < rsi_os and current <= bb_lo * 1.005:
+        # Phase-2 RV-Q3: tighten BB-touch tolerance from 0.5% to 0.2%.  On a
+        # 2.5σ BB, a 0.5% margin regularly admits candles that are nearly a
+        # full ATR inside the band — those are not true extremes.  0.2% keeps
+        # the trigger at the genuine band touch / slight pierce.
+        if rsi < rsi_os and current <= bb_lo * 1.002:
             direction = "LONG"
             confluence.append(f"✅ RSI oversold: {rsi:.1f} (< {rsi_os})")
             confluence.append(f"✅ Price at lower BB (2.5σ): {fmt_price(bb_lo)}")
-            confidence += (rsi_os - rsi) * 0.5  # more oversold = more confident
+            # Phase-2 RV-Q4: cap RSI strength bonus at +12 — previously a very
+            # oversold RSI (e.g. 10 vs 28 threshold) contributed +9, but in a
+            # stack with divergence (+18), volume climax (+4), and rejection
+            # candle (+8) this could push confidence over the effective 95
+            # ceiling without additional structural confirmation.
+            confidence += min(12.0, (rsi_os - rsi) * 0.5)
 
         # ── Bearish reversal: RSI overbought + price at upper BB ──
-        elif rsi > rsi_ob and current >= bb_up * 0.995:
+        elif rsi > rsi_ob and current >= bb_up * 0.998:
             direction = "SHORT"
             confluence.append(f"✅ RSI overbought: {rsi:.1f} (> {rsi_ob})")
             confluence.append(f"✅ Price at upper BB (2.5σ): {fmt_price(bb_up)}")
-            confidence += (rsi - rsi_ob) * 0.5
+            confidence += min(12.0, (rsi - rsi_ob) * 0.5)
         else:
             return None
 
