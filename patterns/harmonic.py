@@ -338,7 +338,7 @@ class HarmonicDetector(BaseStrategy):
         # ATR-based SL. For shallow patterns (Gartley/Bat) X is just barely
         # past D, so SL = D ± k*ATR is sufficient. For extension patterns
         # (Crab/Butterfly) X is further away and SL should sit beyond X.
-        _atr_val = atr if atr and atr > 0 else 0.0
+        _atr_val = atr if (atr is not None and atr > 0) else 0.0
         is_extension = name in ('Crab', 'Butterfly')
         if is_extension:
             # Place SL beyond X with a 0.2*ATR buffer (or 0.5% of price fallback).

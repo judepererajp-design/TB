@@ -40,7 +40,8 @@ def _prep(arrays: Sequence[Sequence[float]]) -> Optional[Tuple[np.ndarray, ...]]
             return None
         if arr.ndim != 1 or arr.size == 0:
             return None
-        # Only the tail (last 3 bars) is read by any detector.
+        # Detectors read up to the last 3 bars; three-bar patterns read all
+        # three. Validate the same window for finiteness.
         tail = arr[-3:] if arr.size >= 3 else arr
         if not np.all(np.isfinite(tail)):
             return None
