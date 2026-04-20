@@ -46,6 +46,7 @@ def _regime_recently_changed(within_secs: int = 600) -> bool:
         return False
 
 logger = logging.getLogger(__name__)
+PERMA_EXCLUDE_OHLCV_CYCLES = 2
 
 
 class Tier(int, Enum):
@@ -372,7 +373,7 @@ class Scanner:
             self._ohlcv_fail_counts.pop(symbol, None)  # reset the per-cycle counter before cooldown/exclusion
             cycles = self._ohlcv_fail_cycles.get(symbol, 0) + 1
             self._ohlcv_fail_cycles[symbol] = cycles
-            if cycles >= 2:
+            if cycles >= PERMA_EXCLUDE_OHLCV_CYCLES:
                 logger.warning(
                     f"📊 OHLCV perma-exclusion: {symbol} hit {cycles} cooldown cycles "
                     f"without recovery — removing from universe"

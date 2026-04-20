@@ -59,6 +59,7 @@ from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+SUPPRESS_STREAK_WARNING_THRESHOLD = 20
 
 
 class VoteValue(int, Enum):
@@ -598,7 +599,7 @@ class EnsembleVoter:
         # Log at appropriate levels: normal SUPPRESS=info, anomalous streaks=warning,
         # BOOST/REDUCE=info, PASS=debug.
         _log_fn = (
-            logger.warning if action == "SUPPRESS" and _suppress_streak >= 20
+            logger.warning if action == "SUPPRESS" and _suppress_streak >= SUPPRESS_STREAK_WARNING_THRESHOLD
             else logger.info if action in ("BOOST", "REDUCE")
             else logger.info if action == "SUPPRESS"
             else logger.debug

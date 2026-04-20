@@ -115,6 +115,7 @@ TP1_MIN_R = {
 MIN_TP_GAP_R = 0.3
 MAX_TARGET_RR = 8.0
 MIN_POSITIVE_PRICE_FRAC = 0.01
+MIN_POSITIVE_PRICE_ABS = 1e-8
 STRUCTURE_LOOKBACK_BARS = 30  # Bars inspected for local structure and VWAP context.
 STRUCTURE_MIN_BARS = 14  # Minimum bars needed to evaluate 13-bar BOS plus the trigger bar.
 STRUCTURE_FALLBACK_BARS = 5  # Consecutive bars used when pivots are too sparse to form swings.
@@ -663,7 +664,7 @@ def adjust_levels(
     # ── 5c. Hard-cap target ladder to sane R multiples / positive prices ──
     _max_target_dist = sl_dist * MAX_TARGET_RR
     if not is_long:
-        _min_positive_price = max(entry_mid * MIN_POSITIVE_PRICE_FRAC, 1e-8)
+        _min_positive_price = max(entry_mid * MIN_POSITIVE_PRICE_FRAC, MIN_POSITIVE_PRICE_ABS)
         _max_target_dist = min(_max_target_dist, max(0.0, entry_mid - _min_positive_price))
     if _max_target_dist > 0:
         _has_tp3 = tp3_dist > 0

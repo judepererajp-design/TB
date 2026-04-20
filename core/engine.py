@@ -89,6 +89,7 @@ from analyzers.wallet_behavior import wallet_profiler
 from analyzers.leverage_mapper import leverage_mapper
 
 logger = logging.getLogger(__name__)
+MAX_ADJUSTED_TP_ENTRY_MULTIPLE = 10.0
 
 
 @dataclass
@@ -3361,7 +3362,7 @@ class Engine:
                 # range structure, and setup class. This is where CHOPPY tightens
                 # targets to range boundaries and TRENDING widens them.
                 try:
-                    from signals.regime_levels import STRUCTURE_MAX_SCORE, adjust_levels
+                    from signals.regime_levels import STRUCTURE_MAX_SCORE, MAX_TARGET_RR, adjust_levels
                     # FIX TP-CORRUPTION: pass the SYMBOL's own range, not BTC's global range.
                     # regime_analyzer.range_high/low is BTC's weekly range (~$70k/$60k).
                     # Passing that to an altcoin at $0.71 caused SL distances of ~$59,000
@@ -3399,8 +3400,8 @@ class Engine:
                         and _adj.tp2 > 0
                         and (_adj.tp3 is None or _adj.tp3 > 0)
                     )
-                    _rr_sane = 0 < float(getattr(_adj, "rr_ratio", 0.0)) <= 8.0
-                    _tp1_sane = abs(_adj.tp1 - _entry_mid_check) < abs(_entry_mid_check) * 10.0
+                    _rr_sane = 0 < float(getattr(_adj, "rr_ratio", 0.0)) <= MAX_TARGET_RR
+                    _tp1_sane = abs(_adj.tp1 - _entry_mid_check) < abs(_entry_mid_check) * MAX_ADJUSTED_TP_ENTRY_MULTIPLE
                     if _targets_positive and _rr_sane and _tp1_sane:
                         signal.stop_loss = _adj.stop_loss
                         signal.tp1 = _adj.tp1
