@@ -586,16 +586,27 @@ class EnsembleVoter:
                             f"but conf={signal_confidence} rr={signal_rr:.1f} "
                             f"→ downgraded from SUPPRESS")
 
-        # Log at appropriate levels: SUPPRESS=warning, BOOST/REDUCE=info, PASS=debug
+        if not hasattr(self, "_suppress_streaks"):
+            self._suppress_streaks = {}
+        if action == "SUPPRESS":
+            _suppress_streak = self._suppress_streaks.get(symbol, 0) + 1
+            self._suppress_streaks[symbol] = _suppress_streak
+        else:
+            _suppress_streak = 0
+            self._suppress_streaks.pop(symbol, None)
+
+        # Log at appropriate levels: normal SUPPRESS=info, anomalous streaks=warning,
+        # BOOST/REDUCE=info, PASS=debug.
         _log_fn = (
-            logger.warning if action == "SUPPRESS"
+            logger.warning if action == "SUPPRESS" and _suppress_streak >= 20
             else logger.info if action in ("BOOST", "REDUCE")
+            else logger.info if action == "SUPPRESS"
             else logger.debug
         )
         _log_fn(
-            "Ensemble %s %s: score=%.1f sup=%d opp=%d adj=%+d | %s",
+            "Ensemble %s %s: score=%.1f sup=%d opp=%d adj=%+d streak=%d | %s",
             symbol, action, weighted_score, support_count, oppose_count,
-            conf_adj, reason,
+            conf_adj, _suppress_streak, reason,
         )
 
         return EnsembleVerdict(

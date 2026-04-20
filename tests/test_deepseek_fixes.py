@@ -137,6 +137,26 @@ class TestOHLCVCooldownScanner:
         # Counter should be reset (popped) after entering cooldown
         assert s._ohlcv_fail_counts.get("BZ/USDT", 0) == 0
 
+    def test_second_cooldown_cycle_permanently_excludes_symbol(self):
+        s = self._make_scanner()
+        s._symbols["GENIUS/USDT"] = s._symbols.get("GENIUS/USDT") or type("State", (), {"tier": None})()
+        for _ in range(3):
+            s.record_ohlcv_fail("GENIUS/USDT")
+        s._ohlcv_cooldown_until["GENIUS/USDT"] = time.time() - 1
+        assert s.is_ohlcv_cooled_down("GENIUS/USDT") is False
+        for _ in range(3):
+            s.record_ohlcv_fail("GENIUS/USDT")
+        assert "GENIUS/USDT" in s._perma_excluded_symbols
+        assert "GENIUS/USDT" not in s._symbols
+
+    def test_success_clears_ohlcv_failure_cycle_history(self):
+        s = self._make_scanner()
+        for _ in range(3):
+            s.record_ohlcv_fail("BZ/USDT")
+        assert s._ohlcv_fail_cycles.get("BZ/USDT") == 1
+        s.record_ohlcv_success("BZ/USDT")
+        assert "BZ/USDT" not in s._ohlcv_fail_cycles
+
 
 # ════════════════════════════════════════════════════════════════════
 # FIX 2: DYNAMIC R:R FLOOR BY CONFIDENCE

@@ -110,6 +110,27 @@ class PreparedPublishCandidate:
         return getattr(self.signal.direction, 'value', str(self.signal.direction))
 
 
+_COUNTER_TREND_HARD_REJECT_STRATEGIES = {
+    "SmartMoneyConcepts",
+    "InstitutionalBreakout",
+    "Ichimoku",
+    "ElliottWave",
+    "WyckoffAccDist",
+    "GeometricPattern",
+}
+
+
+def _should_hard_reject_counter_trend_signal(strategy_name: str, direction: str, regime_name: str) -> bool:
+    """Early hard reject for known trend-regime offenders before downstream logging/filtering."""
+    if strategy_name not in _COUNTER_TREND_HARD_REJECT_STRATEGIES:
+        return False
+    if regime_name == "BULL_TREND":
+        return direction == "SHORT"
+    if regime_name == "BEAR_TREND":
+        return direction == "LONG"
+    return False
+
+
 async def _bootstrap_oi_history():
     """Background task: bootstrap historical OI data on startup."""
     try:
@@ -1875,6 +1896,7 @@ class Engine:
                     try:
                         if not telegram_bot.is_strategy_enabled(self._strat_key_map.get(strategy.name, strategy.name.lower())):
                             continue
+                        performance_tracker.ensure_strategy(strategy.name)
                         if performance_tracker.is_strategy_disabled(strategy.name):
                             continue
                         # VOLATILE whitelist gate: only permitted strategies run
@@ -1883,6 +1905,13 @@ class Engine:
 
                         signal = await strategy.analyze(symbol, ohlcv_dict)
                         if signal:
+                            _signal_dir = getattr(signal.direction, 'value', str(signal.direction))
+                            if _should_hard_reject_counter_trend_signal(signal.strategy, _signal_dir, regime_name):
+                                logger.info(
+                                    f"   ⛔ {symbol}: hard-rejected counter-trend {_signal_dir} "
+                                    f"[{signal.strategy}] in {regime_name}"
+                                )
+                                continue
                             state = scanner._symbols.get(symbol)
                             signal.tier = state.tier.value if state else 2
                             if getattr(signal, 'raw_data', None) is None:
@@ -1900,7 +1929,7 @@ class Engine:
                             self._strategy_last_signal[_strat_key] = time.time()
                             # V2.09: Track per-strategy direction counts for structural audit
                             try:
-                                ai_analyst.record_strategy_signal(signal.strategy, getattr(signal.direction, 'value', str(signal.direction)))
+                                ai_analyst.record_strategy_signal(signal.strategy, _signal_dir)
                             except Exception:
                                 pass
                     except Exception as e:
@@ -3365,8 +3394,14 @@ class Engine:
                     # Safety check: reject adjustments that produce absurd TPs
                     # (e.g. if range data was still wrong for any reason)
                     _entry_mid_check = (signal.entry_low + signal.entry_high) / 2
-                    _max_sane_tp = _entry_mid_check * 10.0  # TP can't be more than 10x entry
-                    if _adj.tp1 > 0 and abs(_adj.tp1 - _entry_mid_check) < abs(_entry_mid_check) * 10.0:
+                    _targets_positive = (
+                        _adj.tp1 > 0
+                        and _adj.tp2 > 0
+                        and (_adj.tp3 is None or _adj.tp3 > 0)
+                    )
+                    _rr_sane = 0 < float(getattr(_adj, "rr_ratio", 0.0)) <= 8.0
+                    _tp1_sane = abs(_adj.tp1 - _entry_mid_check) < abs(_entry_mid_check) * 10.0
+                    if _targets_positive and _rr_sane and _tp1_sane:
                         signal.stop_loss = _adj.stop_loss
                         signal.tp1 = _adj.tp1
                         signal.tp2 = _adj.tp2
@@ -3374,7 +3409,8 @@ class Engine:
                         signal.rr_ratio = _adj.rr_ratio
                     else:
                         logger.warning(
-                            f"   ⚠️  {symbol}: adjust_levels produced absurd TP1={_adj.tp1:.4f} "
+                            f"   ⚠️  {symbol}: adjust_levels produced absurd levels "
+                            f"(tp1={_adj.tp1:.4f}, tp2={_adj.tp2:.4f}, rr={getattr(_adj, 'rr_ratio', 0.0):.2f}) "
                             f"for entry={_entry_mid_check:.4f} — keeping original levels"
                         )
                     if _adj.adjustments:

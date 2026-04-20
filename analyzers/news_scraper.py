@@ -1281,7 +1281,8 @@ class NewsScraper:
         _storm_key = f"{severity}:{current_regime}"
         _now_ts = time.time()
         if _storm_key != self._last_storm_key or _now_ts - self._last_storm_log_ts > 300:
-            logger.warning(
+            _storm_log = logger.warning if _storm_key != self._last_storm_key else logger.info
+            _storm_log(
                 f"📰🔴 NEWS STORM {severity}: {negative_count}/{total_count} negative "
                 f"items in {window_minutes}min — LONG penalty {long_penalty}, "
                 f"SHORT penalty {short_penalty} (regime={current_regime or 'UNKNOWN'})"
