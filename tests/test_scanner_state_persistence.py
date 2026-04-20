@@ -26,7 +26,7 @@ async def test_check_whale_activity_resets_missing_snapshot_sides_and_persists(m
     }
     db.save_learning_state = AsyncMock()
 
-    monkeypatch.setattr("scanner.scanner.time.time", lambda: 1_000.0)
+    monkeypatch.setattr("scanner.scanner.time.time", lambda: 10_000.0)
 
     result = await scanner.check_whale_activity(
         "BTC/USDT",
@@ -63,10 +63,10 @@ async def test_check_promotions_persists_temp_exclusion_state(monkeypatch):
     )
     db.save_learning_state = AsyncMock()
 
-    monkeypatch.setattr("scanner.scanner.time.time", lambda: 1_000.0)
+    monkeypatch.setattr("scanner.scanner.time.time", lambda: 10_000.0)
 
     state = scanner._symbols["ETH/USDT"]
-    state.tier3_underfloor_since = 1_000.0 - (181 * 60.0)
+    state.tier3_underfloor_since = 10_000.0 - (181 * 60.0)
 
     result = await scanner.check_promotions("ETH/USDT", current_volume=100_000.0)
 
