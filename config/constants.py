@@ -1853,6 +1853,365 @@ class ExecutionGate:
     COUNTERTREND_FUNDING_NEGATIVE_EXTREME: float = -0.01
 
 
+# ════════════════════════════════════════════════════════════════
+# X7. ANALYZER INFRASTRUCTURE (PR-1 of analyzer remediation plan)
+# ════════════════════════════════════════════════════════════════
+# The classes below extract magic numbers from individual analyzer
+# modules into a single auditable place. They intentionally only hold
+# *defaults* — each analyzer may still accept an explicit override from
+# settings.yaml. The goal is that no new magic numbers enter the
+# analyzers/ folder; everything routes through here.
+#
+# Each class is documented with the analyzer(s) that consume it and a
+# citation to the current call-site so auditors can track drift.
+
+
+class EnergyModel:
+    """Defaults for analyzers/energy_model.py (entry-energy scoring).
+
+    The energy model scores how much directional "fuel" a candidate
+    trade has left, combining momentum, participation, and positioning.
+    All weights sum to 1.0 and are normalised before use.
+    """
+
+    # Weights assigned to the four energy components. Must sum to 1.0.
+    WEIGHT_MOMENTUM: float = 0.35
+    WEIGHT_PARTICIPATION: float = 0.25
+    WEIGHT_POSITIONING: float = 0.25
+    WEIGHT_FLOW: float = 0.15
+
+    # Energy thresholds (0–100 scale).
+    HIGH_ENERGY: float = 70.0        # Above → strong entry
+    LOW_ENERGY: float = 35.0         # Below → de-prioritise
+    EXHAUSTED: float = 15.0          # Below → block (no fuel left)
+
+    # Half-life in bars for the EWMA used to smooth the raw component scores.
+    EWMA_HALFLIFE_BARS: int = 8
+
+    # Minimum number of bars before the energy score is considered valid.
+    MIN_BARS_FOR_SCORE: int = 30
+
+
+class MarketBrain:
+    """Defaults for analyzers/market_brain.py (regime + confluence orchestrator)."""
+
+    # Confluence buckets and the confidence boosts they grant.
+    CONFLUENCE_STRONG_MIN: int = 4    # ≥4 confirming analyzers → strong boost
+    CONFLUENCE_MODERATE_MIN: int = 2  # ≥2 → moderate boost
+    CONFLUENCE_STRONG_PTS: int = 6    # Confidence points added at STRONG
+    CONFLUENCE_MODERATE_PTS: int = 3  # Confidence points added at MODERATE
+
+    # Conflict detection: if N analyzers disagree directionally with the
+    # proposed trade, penalise confidence.
+    CONFLICT_THRESHOLD: int = 3       # ≥3 disagreeing → penalty
+    CONFLICT_PENALTY_PTS: int = 10
+
+    # Regime stability gate — don't boost confluence when regime just flipped.
+    REGIME_STABILITY_MIN_SECS: int = 900   # 15 min
+    REGIME_FLIP_COOLDOWN_PENALTY: int = 5
+
+    # Cache TTL for the aggregate market-brain score.
+    CACHE_TTL_SECS: int = 60
+
+
+class NoTradeZones:
+    """Defaults for analyzers/no_trade_zones.py (hard-block regions)."""
+
+    # ATR-ratio gate: if current ATR > (ATR_20d * ratio), block — the
+    # market has entered an atypical volatility regime. Overridable
+    # per-regime downstream (PR-3).
+    ATR_BLOCK_RATIO_CHOPPY: float = 2.5
+    ATR_BLOCK_RATIO_TREND: float = 3.5
+    ATR_BLOCK_RATIO_VOLATILE: float = 5.0
+
+    # Multi-bar confirmation: how many consecutive bars must the ATR
+    # ratio be out-of-band before the block fires. Prevents single-tick
+    # flash-spikes from freezing the scanner.
+    CONFIRMATION_BARS: int = 3
+
+    # Minimum ATR% below which markets are too illiquid to trade.
+    MIN_ATR_PCT: float = 0.10   # 0.10 % of price
+
+    # BTC hard-block window around macro events (seconds either side).
+    BTC_EVENT_WINDOW_SECS: int = 1800   # ±30 min
+
+    # Price-level no-trade band (round-number magnet). Block trades
+    # within this fraction of ATR from a major round number.
+    ROUND_NUMBER_ATR_DISTANCE: float = 0.25
+
+
+class Correlation:
+    """Defaults for analyzers/correlation.py (cross-asset correlation / beta)."""
+
+    # Cache TTL (seconds) — cited at analyzers/correlation.py:39
+    CACHE_TTL_SECS: int = 1800
+
+    # Lookback window (bars) for rolling correlation / beta.
+    LOOKBACK_BARS: int = 168            # 7 days of 1h bars
+
+    # Correlation regime classifications (absolute value).
+    STRONG_THRESHOLD: float = 0.70
+    MODERATE_THRESHOLD: float = 0.40
+
+    # Beta sanity clamp: prevents a single-sample or mis-aligned series
+    # from producing β=42. Anything outside is replaced with the
+    # clamped value and flagged. (Wired in PR-3.)
+    BETA_CLAMP_MIN: float = -5.0
+    BETA_CLAMP_MAX: float = 5.0
+
+    # Minimum sample count before a beta is considered trustworthy.
+    MIN_SAMPLES: int = 50
+
+
+class ParabolicDetector:
+    """Defaults for analyzers/parabolic_detector.py (exhaustion detection)."""
+
+    # Cache TTL — cited at analyzers/parabolic_detector.py:47
+    CACHE_TTL_SECS: int = 120
+
+    # ROC / acceleration defaults (cited at analyzers/parabolic_detector.py:53-54).
+    ROC_PERIOD_BARS: int = 10
+    ACCEL_THRESHOLD: float = 0.005
+
+    # Directional threshold for classifying ROC as UP vs DOWN vs FLAT.
+    DIR_ROC_THRESHOLD: float = 0.01
+
+    # Exhaustion sub-scores (must sum ≤ 1.0 after PR-2 normalisation).
+    EXHAUST_RSI_OVERBOUGHT: float = 0.30
+    EXHAUST_RANGE_EXPANSION: float = 0.25
+    EXHAUST_RANGE_COMPRESSION: float = 0.15
+    EXHAUST_VOLUME_CLIMAX: float = 0.35
+    EXHAUST_VOLUME_DRYUP: float = 0.15
+
+    # Number of exhaustion signals that must fire for is_exhausted=True.
+    EXHAUSTION_MIN_SIGNALS: int = 2
+
+    # Near-zero price guard — below this, abort (penny-token instability).
+    MIN_PRICE_USD: float = 1e-8
+
+
+class Sentiment:
+    """Defaults for analyzers/sentiment.py (Fear & Greed + news sentiment).
+
+    The canonical Fear & Greed extreme thresholds live in
+    ``FearGreedThresholds`` (see above) — do not duplicate them.
+    """
+
+    # API response bounds; enforced at ingest to clamp upstream errors.
+    API_MIN: int = 0
+    API_MAX: int = 100
+
+    # EWMA decay for the rolling sentiment series.
+    EWMA_DECAY: float = 0.2          # heavier weight on fresh reads
+
+    # Sentiment velocity → confidence adjustment.
+    # cap = min(VELOCITY_CAP_PTS, abs(vel) * VELOCITY_PTS_PER_UNIT).
+    # Sign is applied by caller based on direction/alignment.
+    VELOCITY_CAP_PTS: float = 8.0
+    VELOCITY_PTS_PER_UNIT: float = 4.0
+
+    # Refresh cadence for the external Fear & Greed API.
+    REFRESH_SECS: int = 900          # 15 min (matches provider SLA)
+
+    # Percentile-history depth used for contextualising current reading.
+    HISTORY_MAX_DAYS: int = 365
+
+
+class BTCDominance:
+    """Defaults for analyzers/btc_dominance.py (altcoin rotation gate).
+
+    Mirror of the module-level constants at analyzers/btc_dominance.py:34-46
+    so future consumers have a single import path. The analyzer
+    definitions are kept for backward compatibility during PR-6 migration.
+    """
+
+    CHECK_INTERVAL_SECS: int = 600
+    SHARP_RISE_PCT: float = 2.0
+    SHARP_FALL_PCT: float = -2.0
+    MODERATE_RISE_PCT: float = 1.0
+    MODERATE_FALL_PCT: float = -1.0
+
+    ALT_LONG_PENALTY_SHARP: int = -15
+    ALT_LONG_PENALTY_MODERATE: int = -8
+    ALT_LONG_BOOST_SHARP: int = 10
+    ALT_LONG_BOOST_MODERATE: int = 5
+    BTC_SHORT_BOOST: int = 10
+    BTC_SHORT_PENALTY: int = -5
+
+    # 24h off-by-one window for the rolling change calculation
+    # (PR-2 bug-fix target): the sampler should return the reading at
+    # now - 86400 ± WINDOW_TOLERANCE_SECS.
+    WINDOW_TARGET_SECS: int = 86400
+    WINDOW_TOLERANCE_SECS: int = 300   # ±5 min
+
+    # Bounded-history cap (PR-6 bounded-state target).
+    HISTORY_MAX_POINTS: int = 2048
+
+
+class Equilibrium:
+    """Defaults for analyzers/equilibrium.py (value-area equilibrium)."""
+
+    # Mirrors analyzers/equilibrium.py:57-58.
+    DEAD_ZONE_PCT_DEFAULT: float = 0.10
+    DEAD_ZONE_PCT_CHOPPY: float = 0.07
+
+    # PR-4 MAD fallback: when σ of the distribution is below this, use
+    # MAD instead so a single outlier doesn't collapse the bands.
+    SIGMA_MAD_FALLBACK_THRESHOLD: float = 1e-6
+
+    # Minimum chop regime score before equilibrium rules bind.
+    MIN_CHOP_FOR_RULES: float = 0.40
+
+    # Lookback (bars) for the value-area calculation.
+    VALUE_AREA_LOOKBACK_BARS: int = 100
+
+    # Value-area width in standard deviations from the POC.
+    VALUE_AREA_SIGMA: float = 0.7        # ~70 % VA on Gaussian
+
+
+class OrderFlow:
+    """Defaults for analyzers/orderflow.py (CVD / absorption / block-trade)."""
+
+    # Daily CVD reset (PR-4 target): UTC hour at which cumulative delta
+    # is zeroed. 0 (UTC midnight) matches Binance settlement boundaries.
+    CVD_RESET_UTC_HOUR: int = 0
+
+    # Absorption flag: bar marked as absorption when |delta/volume|
+    # exceeds this ratio *and* price doesn't move in the direction of
+    # the delta (i.e. big buying, no higher price → hidden seller).
+    ABSORPTION_DELTA_RATIO: float = 0.7
+    ABSORPTION_PRICE_TOL_ATR: float = 0.1
+
+    # Block-trade filter: single prints above this USD notional are
+    # tagged as block trades and surfaced separately from retail flow.
+    BLOCK_TRADE_USD_MIN: float = 250_000.0
+
+    # Delta smoothing — EWMA span (bars) for the CVD slope calculation.
+    DELTA_EWMA_SPAN: int = 20
+
+    # Minimum bars of history before orderflow signals are emitted.
+    MIN_BARS: int = 30
+
+
+class LeverageMapper:
+    """Defaults for analyzers/leverage_mapper.py (cascade / effective-leverage).
+
+    Mirrors analyzers/leverage_mapper.py:33-35.
+    """
+
+    EFFECTIVE_LEVERAGE_EXTREME: float = 0.40
+    EFFECTIVE_LEVERAGE_HIGH: float = 0.30
+    CASCADE_MIN_USD: float = 5_000_000.0
+
+    # Cluster dwell time (seconds) before a cascade cluster is
+    # promoted from "forming" to "confirmed". Prevents single-tick
+    # mis-classification.
+    CLUSTER_DWELL_SECS: int = 120
+
+    # Cap on leverage penalty (points).
+    MAX_PENALTY_PTS: float = 15.0
+
+    # Cache TTL for the mapped output.
+    CACHE_TTL_SECS: int = 30
+
+
+class Liquidation:
+    """Defaults for analyzers/liquidation_analyzer.py.
+
+    Mirrors analyzers/liquidation_analyzer.py:48-51 and extends with the
+    PR-4 dedup / reconnect-replay targets.
+    """
+
+    OI_REFRESH_SECS: int = 300
+    LIQ_REFRESH_SECS: int = 600
+    EXCHANGE_STAGGER_SECS: float = 1.5
+    WALL_MIN_USD: float = 1_000_000.0
+
+    # ATR-scaled bin size for the liquidation heatmap. Bin = ATR / N.
+    HEATMAP_BIN_ATR_DIV: float = 4.0
+
+    # Bounded dedup buffer ((exchange, id) → timestamp).
+    DEDUP_BUFFER_SIZE: int = 10_000
+    DEDUP_TTL_SECS: int = 3600
+
+    # Reconnect-replay window: on WS reconnect, re-fetch the last N
+    # seconds of liquidations via REST to avoid gaps.
+    REPLAY_WINDOW_SECS: int = 120
+
+
+class InstitutionalFlow:
+    """Defaults for analyzers/institutional_flow.py.
+
+    Mirrors analyzers/institutional_flow.py:56-61.
+    """
+
+    FAST_INTERVAL_SECS: int = 300
+    SLOW_INTERVAL_SECS: int = 3600
+    COT_INTERVAL_SECS: int = 86400
+    HISTORY_DAYS: int = 90
+
+    # Percentile window defaults.  30d is currently copied from 90d
+    # in the analyzer — PR-4 fixes this. Defining separately here so the
+    # fix can reference a named constant.
+    PCTILE_30D_WINDOW: int = 30
+    PCTILE_90D_WINDOW: int = 90
+
+    # Holiday-aware lookback: when N holidays fall in the last
+    # HISTORY_DAYS, extend the window by HOLIDAY_EXTEND_DAYS so the
+    # percentile isn't biased by missing prints.
+    HOLIDAY_EXTEND_DAYS: int = 3
+
+
+class Volume:
+    """Defaults for analyzers/volume.py (volume / participation scoring).
+
+    Additional thresholds live in ``VolumeQuality`` above — this class
+    holds the infrastructure-level defaults (not signal-grading).
+    """
+
+    # Log-z-score floor (PR-4): small-floor replacement for zero volume
+    # before taking log. Prevents ``log(0) = -inf`` from poisoning the
+    # distribution.
+    LOG_FLOOR: float = 1.0      # 1 contract / $1 notional
+
+    # Session-of-day detrending: bucket trading hours into N slices and
+    # compute z-score within the slice.  24 = hourly buckets.
+    SESSION_BUCKETS: int = 24
+
+    # Lookback for computing the z-score baseline.
+    BASELINE_BARS: int = 240      # 10 days of 1h bars
+
+    # Minimum samples before a z-score is considered reliable.
+    MIN_SAMPLES: int = 30
+
+
+class VolatilityStructure:
+    """Defaults for analyzers/volatility_structure.py.
+
+    Mirrors analyzers/volatility_structure.py:41-48.
+    """
+
+    RV_REFRESH_SECS: int = 300
+    IV_REFRESH_SECS: int = 1800
+
+    VOL_EXTREME_HIGH_PCTILE: int = 90
+    VOL_HIGH_PCTILE: int = 75
+    VOL_LOW_PCTILE: int = 25
+    VOL_EXTREME_LOW_PCTILE: int = 10
+
+    # ATR-timeframe alignment: RV is computed on 1h bars; if the caller
+    # asks about a different TF, scale by sqrt(ratio).
+    RV_BASE_TF_MINUTES: int = 60
+
+    # GARCH(1,1) fallback coefficients (PR-4 adds the real estimator).
+    # Used as a graceful degradation when the arch library is missing
+    # or has too few samples to fit.
+    GARCH_OMEGA: float = 0.00001
+    GARCH_ALPHA: float = 0.08
+    GARCH_BETA: float = 0.90
+    GARCH_MIN_SAMPLES: int = 200
+
+
 STRATEGY_KEY_MAP: dict[str, str] = {
     'SmartMoneyConcepts': 'smc',
     'InstitutionalBreakout': 'breakout',
