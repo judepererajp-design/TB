@@ -1,0 +1,1111 @@
+2026-04-19 15:44:44 | INFO | === AI Analyst initialised | fast=openai | deep=openai ===
+2026-04-19 15:45:15 | DEBUG | [CALL:dead_signal_batch] model=openai
+--- PROMPT ---
+Analysing why a crypto bot's signals fail quality filters.
+Period: 2h | Regime: BULL_TREND | Total dead: 2
+Kill reasons: {"RR_FLOOR": 1, "AGG_THRESHOLD": 1}
+Strategy fires: {"ElliottWave": 1, "PriceAction": 1}
+Per-strategy direction (LONG/SHORT counts): {"ElliottWave": {"LONG": 1, "SHORT": 0}, "PriceAction": {"LONG": 0, "SHORT": 1}}
+Strategies with >85% single-direction bias: {}
+Avg R:R: 2.46 | Avg confidence: 70.6
+HTF blocks: LONG=0 SHORT=0
+Whale flow: BUY=0($0k) SELL=0($0k)
+Signals vs whale flow conflict: 0
+Ensemble voter suppressions: 0/2 (0%) — multi-source voting killed these
+
+Analysis rules:
+- If whale_buy_usd > whale_sell_usd × 3 and LONG signals are being killed, note whale tailwind is wasted
+- If whale_sell_usd > whale_buy_usd × 3 and SHORT signals are killed, note whale tailwind is wasted
+- If HTF blocks one direction 3x more than other, that is the real filter not a bug
+- If rr < 1.3 across most signals, set rr_issue=true
+- If dominant_kill_reason is AGG_THRESHOLD and avg confidence is near floor, threshold may be misconfigured
+
+Return ONLY valid JSON:
+{"dominant_kill_reason":"<str>","regime_mismatch":<bool>,"strategy_to_suppress":"<str|null>","rr_issue":<bool>,"direction_bias_detected":<bool>,"ensemble_over_suppressing":<bool>,"whale_alignment_note":"<brief note on whale flow vs signal direction or empty string>","recommendation":"<150 chars>"}
+--- END PROMPT ---
+2026-04-19 15:45:38 | DEBUG | [CALL:structural_audit_fast] model=openai
+--- PROMPT ---
+You are a senior quant engineer auditing a crypto trading bot for structural bugs.
+Find systematic direction biases, broken strategy logic, and filter asymmetries.
+
+TOTAL RAW SIGNALS (pre-filter): 18
+
+STRATEGY DIRECTION BREAKDOWN (raw signals, before HTF or aggregator filtering):
+{}
+
+HTF GUARDRAIL BLOCKS (signals killed by higher-timeframe filter, after raw generation):
+LONG blocked=0 | SHORT blocked=0 | Asymmetric=False
+(If one direction is blocked 3x+ more, the guardrail is a one-sided factory)
+
+WHALE FLOW vs SIGNALS:
+Whale BUY: 0 events ($0k)
+Whale SELL: 0 events ($0k)
+Dominant whale: NEUTRAL | Signals sent AGAINST whale flow: 0
+
+REGIME vs SIGNAL DIRECTION (signals that survived HTF, before aggregator):
+{
+  "BULL_TREND": {
+    "LONG": 7,
+    "SHORT": 3
+  }
+}
+
+Find: (1) strategies with >80% single-direction bias, (2) HTF one-sided factory ONLY when it is blocking signals that SHOULD go through, (3) systematic trading against whale flow, (4) signals opposite to regime.
+
+STRICT RULES — violation means invalid output:
+- biased_strategies: ONLY include strategies with >80% bias AND at least 10 signals. Below 10, directional skew is statistically expected noise. 75% bias is NOT a bug.
+- htf_asymmetry: ONLY flag true if HTF is blocking the direction that ALIGNS with the weekly trend (e.g. blocking LONGs when weekly is BULLISH, or blocking SHORTs when weekly is BEARISH). Blocking LONGs in a BEARISH weekly trend is CORRECT behavior — do NOT flag it. Note: weekly trend context is not available in this data — if you cannot determine weekly trend from the regime data, set htf_asymmetry=false.
+- If fewer than 20 total raw signals exist, set severity=LOW and root_causes=["Insufficient data — need 20+ signals for meaningful analysis"]
+- Every recommendation must cite a SPECIFIC number from the data above
+
+Return ONLY valid JSON:
+{"biased_strategies":["<name>",...],"htf_asymmetry":<bool>,"whale_signal_conflict":<bool>,"regime_signal_conflict":<bool>,"root_causes":["<cause1>","<cause2>"],"recommendations":["<fix1>","<fix2>"],"severity":"<LOW|MEDIUM|HIGH|CRITICAL>"}
+--- END PROMPT ---
+2026-04-19 15:45:58 | DEBUG | [RESP:structural_audit_fast] latency=19615ms
+--- RESPONSE ---
+{"biased_strategies":[],"htf_asymmetry":false,"whale_signal_conflict":false,"regime_signal_conflict":true,"root_causes":["Insufficient data — need 20+ signals for meaningful analysis"],"recommendations":[],"severity":"LOW"}
+--- END RESPONSE ---
+2026-04-19 15:45:58 | INFO | [STRUCTURAL_AUDIT] severity=LOW {"biased_strategies": [], "htf_asymmetry": false, "whale_signal_conflict": false, "regime_signal_conflict": true, "root_causes": ["Insufficient data \u2014 need 20+ signals for meaningful analysis"], "recommendations": [], "severity": "LOW"}
+2026-04-19 17:46:06 | DEBUG | [CALL:dead_signal_batch] model=openai
+--- PROMPT ---
+Analysing why a crypto bot's signals fail quality filters.
+Period: 2h | Regime: BULL_TREND | Total dead: 500
+Kill reasons: {"AGG_THRESHOLD": 273, "ENSEMBLE_SUPPRESS": 168, "RR_FLOOR": 59}
+Strategy fires: {"PriceAction": 206, "SmartMoneyConcepts": 169, "ElliottWave": 81, "FundingRateArb": 21, "WyckoffAccDist": 18, "GeometricPattern:InverseHS": 5}
+Per-strategy direction (LONG/SHORT counts): {"SmartMoneyConcepts": {"LONG": 139, "SHORT": 30}, "ElliottWave": {"LONG": 81, "SHORT": 0}, "PriceAction": {"LONG": 70, "SHORT": 136}, "FundingRateArb": {"LONG": 21, "SHORT": 0}, "WyckoffAccDist": {"LONG": 0, "SHORT": 18}, "GeometricPattern:InverseHS": {"LONG": 5, "SHORT": 0}}
+Strategies with >85% single-direction bias: {"ElliottWave": {"LONG": 81, "SHORT": 0}, "FundingRateArb": {"LONG": 21, "SHORT": 0}, "WyckoffAccDist": {"LONG": 0, "SHORT": 18}, "GeometricPattern:InverseHS": {"LONG": 5, "SHORT": 0}}
+Avg R:R: 4.11 | Avg confidence: 62.6
+HTF blocks: LONG=0 SHORT=100
+Whale flow: BUY=124($28020k) SELL=14($1833k)
+Signals vs whale flow conflict: 0
+Ensemble voter suppressions: 168/500 (34%) — multi-source voting killed these
+
+Analysis rules:
+- If whale_buy_usd > whale_sell_usd × 3 and LONG signals are being killed, note whale tailwind is wasted
+- If whale_sell_usd > whale_buy_usd × 3 and SHORT signals are killed, note whale tailwind is wasted
+- If HTF blocks one direction 3x more than other, that is the real filter not a bug
+- If rr < 1.3 across most signals, set rr_issue=true
+- If dominant_kill_reason is AGG_THRESHOLD and avg confidence is near floor, threshold may be misconfigured
+
+Return ONLY valid JSON:
+{"dominant_kill_reason":"<str>","regime_mismatch":<bool>,"strategy_to_suppress":"<str|null>","rr_issue":<bool>,"direction_bias_detected":<bool>,"ensemble_over_suppressing":<bool>,"whale_alignment_note":"<brief note on whale flow vs signal direction or empty string>","recommendation":"<150 chars>"}
+--- END PROMPT ---
+2026-04-19 17:46:25 | DEBUG | [RESP:dead_signal_batch] latency=19208ms
+--- RESPONSE ---
+{"dominant_kill_reason":"AGG_THRESHOLD","regime_mismatch":true,"strategy_to_suppress":"PriceAction","rr_issue":false,"direction_bias_detected":true,"ensemble_over_suppressing":true,"whale_alignment_note":"Whale buy tailwind wasted due to LONG block","recommendation":"Adjust AGG_THRESHOLD, reduce bias in single-direction strategies, enable LONG signals, align regime, tune ensemble voting."}
+--- END RESPONSE ---
+2026-04-19 17:46:25 | INFO | [DEAD_SIGNAL_AUDIT] {"dominant_kill_reason": "AGG_THRESHOLD", "regime_mismatch": true, "strategy_to_suppress": "PriceAction", "rr_issue": false, "direction_bias_detected": true, "ensemble_over_suppressing": true, "whale_alignment_note": "Whale buy tailwind wasted due to LONG block", "recommendation": "Adjust AGG_THRESHOLD, reduce bias in single-direction strategies, enable LONG signals, align regime, tune ensemble voting."}
+2026-04-19 17:46:26 | DEBUG | [CALL:structural_audit_fast] model=openai
+--- PROMPT ---
+You are a senior quant engineer auditing a crypto trading bot for structural bugs.
+Find systematic direction biases, broken strategy logic, and filter asymmetries.
+
+TOTAL RAW SIGNALS (pre-filter): 2129
+
+STRATEGY DIRECTION BREAKDOWN (raw signals, before HTF or aggregator filtering):
+{
+  "SmartMoneyConcepts": {
+    "total": 613,
+    "SHORT": 33,
+    "LONG": 580,
+    "SHORT%": 5.4,
+    "LONG%": 94.6,
+    "biased": true
+  },
+  "PriceAction": {
+    "total": 685,
+    "SHORT": 436,
+    "LONG": 249,
+    "SHORT%": 63.6,
+    "LONG%": 36.4,
+    "biased": false
+  },
+  "ElliottWave": {
+    "total": 510,
+    "SHORT": 0,
+    "LONG": 510,
+    "SHORT%": 0.0,
+    "LONG%": 100.0,
+    "biased": true
+  },
+  "FundingRateArb": {
+    "total": 200,
+    "SHORT": 87,
+    "LONG": 113,
+    "SHORT%": 43.5,
+    "LONG%": 56.5,
+    "biased": false
+  },
+  "WyckoffAccDist": {
+    "total": 45,
+    "SHORT": 42,
+    "LONG": 3,
+    "SHORT%": 93.3,
+    "LONG%": 6.7,
+    "biased": true
+  },
+  "InstitutionalBreakout": {
+    "total": 26,
+    "SHORT": 0,
+    "LONG": 26,
+    "SHORT%": 0.0,
+    "LONG%": 100.0,
+    "biased": true
+  },
+  "GeometricPattern:InverseHS": {
+    "total": 29,
+    "SHORT": 0,
+    "LONG": 29,
+    "SHORT%": 0.0,
+    "LONG%": 100.0,
+    "biased": true
+  },
+  "Ichimoku": {
+    "total": 21,
+    "SHORT": 21,
+    "LONG": 0,
+    "SHORT%": 100.0,
+    "LONG%": 0.0,
+    "biased": true
+  }
+}
+
+HTF GUARDRAIL BLOCKS (signals killed by higher-timeframe filter, after raw generation):
+LONG blocked=0 | SHORT blocked=100 | Asymmetric=True
+(If one direction is blocked 3x+ more, the guardrail is a one-sided factory)
+
+WHALE FLOW vs SIGNALS:
+Whale BUY: 125 events ($28597k)
+Whale SELL: 14 events ($1833k)
+Dominant whale: BUY | Signals sent AGAINST whale flow: 0
+
+REGIME vs SIGNAL DIRECTION (signals that survived HTF, before aggregator):
+{
+  "BULL_TREND": {
+    "LONG": 910,
+    "SHORT": 266
+  }
+}
+
+Find: (1) strategies with >80% single-direction bias, (2) HTF one-sided factory ONLY when it is blocking signals that SHOULD go through, (3) systematic trading against whale flow, (4) signals opposite to regime.
+
+STRICT RULES — violation means invalid output:
+- biased_strategies: ONLY include strategies with >80% bias AND at least 10 signals. Below 10, directional skew is statistically expected noise. 75% bias is NOT a bug.
+- htf_asymmetry: ONLY flag true if HTF is blocking the direction that ALIGNS with the weekly trend (e.g. blocking LONGs when weekly is BULLISH, or blocking SHORTs when weekly is BEARISH). Blocking LONGs in a BEARISH weekly trend is CORRECT behavior — do NOT flag it. Note: weekly trend context is not available in this data — if you cannot determine weekly trend from the regime data, set htf_asymmetry=false.
+- If fewer than 20 total raw signals exist, set severity=LOW and root_causes=["Insufficient data — need 20+ signals for meaningful analysis"]
+- Every recommendation must cite a SPECIFIC number from the data above
+
+Return ONLY valid JSON:
+{"biased_strategies":["<name>",...],"htf_asymmetry":<bool>,"whale_signal_conflict":<bool>,"regime_signal_conflict":<bool>,"root_causes":["<cause1>","<cause2>"],"recommendations":["<fix1>","<fix2>"],"severity":"<LOW|MEDIUM|HIGH|CRITICAL>"}
+--- END PROMPT ---
+2026-04-19 17:46:55 | DEBUG | [CALL:execution_funnel_audit] model=openai
+--- PROMPT ---
+You are auditing a crypto trading bot's signal EXECUTION quality — not signal generation.
+The pipeline_diag already covers pre-publication kills. This audit covers what happens AFTER publication.
+
+REGIME: BULL_TREND
+SIGNALS THIS PERIOD: 19 total | fill_rate=0/19 | zone_reached=12
+
+FILLED SIGNALS (0):
+  None
+
+EXPIRED UNFILLED (0):
+  None
+
+ACTIVE/PENDING (19): ['TAO/USDT', 'FARTCOIN/USDT', 'FIL/USDT', 'DASH/USDT', 'IP/USDT', 'SOON/USDT', 'AAVE/USDT', 'CRV/USDT', '1000BONK/USDT', '1000PEPE/USDT', 'BCH/USDT', 'SOL/USDT', 'TAO/USDT', 'AVAX/USDT', 'MOVE/USDT', 'API3/USDT', 'NEAR/USDT', 'WLD/USDT', 'ARKM/USDT']
+
+IMPORTANT CONTEXT:
+- "ACTIVE/PENDING" signals have not yet had time to fill — DO NOT count them as failed fills
+- Only judge fill rate based on EXPIRED UNFILLED signals
+- If EXPIRED UNFILLED is 0, fill_rate verdict is INSUFFICIENT_DATA, severity=LOW
+- If ACTIVE/PENDING > EXPIRED UNFILLED × 2, it is too early to draw conclusions
+- zone_placement_verdict should be "balanced" unless you have clear evidence from filled vs expired patterns
+
+KEY QUESTIONS (only for expired signals, not active):
+1. What is the fill rate pattern among EXPIRED signals?
+2. Were expired signals directionally correct vs price action?
+3. What is causing low fills — entry zone depth, market conditions, or regime?
+4. What specific fixes would improve fill rate?
+
+Return ONLY valid JSON:
+{
+  "fill_rate_pct": <0-100>,
+  "zone_placement_verdict": "<too deep|immediate|balanced>",
+  "direction_accuracy_on_expired": "<X/Y (Z%)>",
+  "root_cause": "<primary reason signals are not filling>",
+  "execution_issues": ["<issue 1>", "<issue 2>"],
+  "recommendations": [
+    {"change": "<what>", "expected": "<impact>", "priority": "<HIGH|MEDIUM|LOW>"}
+  ],
+  "severity": "<CRITICAL|HIGH|MEDIUM|LOW>"
+}
+--- END PROMPT ---
+2026-04-19 17:47:14 | DEBUG | [RESP:execution_funnel_audit] latency=18941ms
+--- RESPONSE ---
+```json
+{
+  "fill_rate_pct": 0,
+  "zone_placement_verdict": "balanced",
+  "direction_accuracy_on_expired": "0/0 (0%)",
+  "root_cause": "Insufficient data – no expired unfilled signals to analyze",
+  "execution_issues": [
+    "No expired signals to assess entry zone depth or slippage",
+    "Potentially high market volatility or liquidity constraints not captured"
+  ],
+  "recommendations": [
+    {
+      "change": "Track and log expired unfilled signals over a longer period",
+      "expected": "Provide concrete data for fill‑rate and direction analysis",
+      "priority": "HIGH"
+    },
+    {
+      "change": "Adjust entry zone depth to be closer to current price levels",
+      "expected": "Increase likelihood of order execution before expiration",
+      "priority": "MEDIUM"
+    },
+    {
+      "change": "Implement dynamic slippage tolerance based on real‑time volatility",
+      "expected": "Reduce missed fills due to sudden price swings",
+      "priority": "MEDIUM"
+    }
+  ],
+  "severity": "LOW"
+}
+```
+
+
+
+---
+
+**Support Pollinations.AI:**
+
+---
+
+🌸 **Ad** 🌸
+Powered by Pollinations.AI free text APIs. [Support our mission](https://pollinations.ai/redirect/kofi) to keep AI accessible for everyone.
+--- END RESPONSE ---
+2026-04-19 17:47:14 | INFO | [EXECUTION_FUNNEL] fill=0% zone=balanced root_cause=Insufficient data – no expired unfilled signals to analyze
+2026-04-19 19:46:28 | DEBUG | [CALL:dead_signal_batch] model=openai
+--- PROMPT ---
+Analysing why a crypto bot's signals fail quality filters.
+Period: 2h | Regime: BULL_TREND | Total dead: 500
+Kill reasons: {"AGG_THRESHOLD": 308, "RR_FLOOR": 121, "ENSEMBLE_SUPPRESS": 71}
+Strategy fires: {"PriceAction": 204, "SmartMoneyConcepts": 187, "ElliottWave": 71, "WyckoffAccDist": 21, "FundingRateArb": 14, "GeometricPattern:InverseHS": 3}
+Per-strategy direction (LONG/SHORT counts): {"FundingRateArb": {"LONG": 14, "SHORT": 0}, "PriceAction": {"LONG": 59, "SHORT": 145}, "SmartMoneyConcepts": {"LONG": 163, "SHORT": 24}, "ElliottWave": {"LONG": 71, "SHORT": 0}, "WyckoffAccDist": {"LONG": 0, "SHORT": 21}, "GeometricPattern:InverseHS": {"LONG": 3, "SHORT": 0}}
+Strategies with >85% single-direction bias: {"FundingRateArb": {"LONG": 14, "SHORT": 0}, "SmartMoneyConcepts": {"LONG": 163, "SHORT": 24}, "ElliottWave": {"LONG": 71, "SHORT": 0}, "WyckoffAccDist": {"LONG": 0, "SHORT": 21}}
+Avg R:R: 3.65 | Avg confidence: 59.1
+HTF blocks: LONG=0 SHORT=190
+Whale flow: BUY=219($47633k) SELL=24($2767k)
+Signals vs whale flow conflict: 0
+Ensemble voter suppressions: 71/500 (14%) — multi-source voting killed these
+
+Analysis rules:
+- If whale_buy_usd > whale_sell_usd × 3 and LONG signals are being killed, note whale tailwind is wasted
+- If whale_sell_usd > whale_buy_usd × 3 and SHORT signals are killed, note whale tailwind is wasted
+- If HTF blocks one direction 3x more than other, that is the real filter not a bug
+- If rr < 1.3 across most signals, set rr_issue=true
+- If dominant_kill_reason is AGG_THRESHOLD and avg confidence is near floor, threshold may be misconfigured
+
+Return ONLY valid JSON:
+{"dominant_kill_reason":"<str>","regime_mismatch":<bool>,"strategy_to_suppress":"<str|null>","rr_issue":<bool>,"direction_bias_detected":<bool>,"ensemble_over_suppressing":<bool>,"whale_alignment_note":"<brief note on whale flow vs signal direction or empty string>","recommendation":"<150 chars>"}
+--- END PROMPT ---
+2026-04-19 19:46:47 | DEBUG | [RESP:dead_signal_batch] latency=19206ms
+--- RESPONSE ---
+{"dominant_kill_reason":"AGG_THRESHOLD","regime_mismatch":true,"strategy_to_suppress":"ElliottWave","rr_issue":false,"direction_bias_detected":true,"ensemble_over_suppressing":true,"whale_alignment_note":"Whale tailwind wasted on LONG signals.","recommendation":"Lower AGG_THRESHOLD, correct direction bias, reduce ensemble suppression, align LONG signals with whale tailwind, review confidence floor."}
+--- END RESPONSE ---
+2026-04-19 19:46:47 | INFO | [DEAD_SIGNAL_AUDIT] {"dominant_kill_reason": "AGG_THRESHOLD", "regime_mismatch": true, "strategy_to_suppress": "ElliottWave", "rr_issue": false, "direction_bias_detected": true, "ensemble_over_suppressing": true, "whale_alignment_note": "Whale tailwind wasted on LONG signals.", "recommendation": "Lower AGG_THRESHOLD, correct direction bias, reduce ensemble suppression, align LONG signals with whale tailwind, review confidence floor."}
+2026-04-19 19:46:48 | DEBUG | [CALL:strategy_regime_audit] model=openai
+--- PROMPT ---
+Audit of a crypto trading bot's strategy performance broken down by strategy × regime × direction.
+Current regime: BULL_TREND
+
+STRATEGY × REGIME × DIRECTION MATRIX:
+  PriceAction|BULL_TREND|LONG: 10 signals | fill=80% (8/10) | win=0% (0/8) | expired=5
+  SmartMoneyConcepts|BULL_TREND|LONG: 5 signals | fill=60% (3/5) | win=0% (0/3) | expired=2
+  ElliottWave|BULL_TREND|LONG: 5 signals | fill=40% (2/5) | win=0% (0/2) | expired=0
+  FundingRateArb|BULL_TREND|LONG: 2 signals | fill=100% (2/2) | win=0% (0/2) | expired=1
+
+Find:
+1. Combinations with 0% fill rate (entry zones always missed)
+2. Combinations with high fill but low win rate (bad signal quality in that context)
+3. Combinations that should be suppressed in the current regime
+4. Combinations that are outperforming and should get higher allocation
+
+Return ONLY valid JSON:
+{
+  "suppress_immediately": ["<strategy|regime|direction combos with 0% fill for 5+ signals>"],
+  "investigate": ["<combos with fill but poor win rate>"],
+  "promote": ["<best performing combos>"],
+  "regime_recommendation": "<what should bot do differently in BULL_TREND>",
+  "key_finding": "<single most important finding in one sentence>"
+}
+--- END PROMPT ---
+2026-04-19 19:47:08 | DEBUG | [RESP:strategy_regime_audit] latency=20037ms
+--- RESPONSE ---
+```json
+{
+  "suppress_immediately": [],
+  "investigate": [
+    "PriceAction|BULL_TREND|LONG",
+    "SmartMoneyConcepts|BULL_TREND|LONG",
+    "ElliottWave|BULL_TREND|LONG",
+    "FundingRateArb|BULL_TREND|LONG"
+  ],
+  "promote": [],
+  "regime_recommendation": "Pause all LONG strategies in BULL_TREND until win rates improve; consider testing SHORT positions or alternative regimes, and re‑evaluate entry filters for each strategy.",
+  "key_finding": "All LONG strategies in BULL_TREND are currently yielding zero wins despite varying fill rates."
+}
+```
+--- END RESPONSE ---
+2026-04-19 19:47:08 | INFO | [STRATEGY_REGIME_AUDIT] regime=BULL_TREND suppress=[] finding=All LONG strategies in BULL_TREND are currently yielding zer
+2026-04-19 19:48:08 | DEBUG | [CALL:structural_audit_fast] model=openai
+--- PROMPT ---
+You are a senior quant engineer auditing a crypto trading bot for structural bugs.
+Find systematic direction biases, broken strategy logic, and filter asymmetries.
+
+TOTAL RAW SIGNALS (pre-filter): 4938
+
+STRATEGY DIRECTION BREAKDOWN (raw signals, before HTF or aggregator filtering):
+{
+  "SmartMoneyConcepts": {
+    "total": 1349,
+    "SHORT": 116,
+    "LONG": 1233,
+    "SHORT%": 8.6,
+    "LONG%": 91.4,
+    "biased": true
+  },
+  "PriceAction": {
+    "total": 1843,
+    "SHORT": 1384,
+    "LONG": 459,
+    "SHORT%": 75.1,
+    "LONG%": 24.9,
+    "biased": false
+  },
+  "ElliottWave": {
+    "total": 1114,
+    "SHORT": 0,
+    "LONG": 1114,
+    "SHORT%": 0.0,
+    "LONG%": 100.0,
+    "biased": true
+  },
+  "FundingRateArb": {
+    "total": 383,
+    "SHORT": 204,
+    "LONG": 179,
+    "SHORT%": 53.3,
+    "LONG%": 46.7,
+    "biased": false
+  },
+  "WyckoffAccDist": {
+    "total": 102,
+    "SHORT": 99,
+    "LONG": 3,
+    "SHORT%": 97.1,
+    "LONG%": 2.9,
+    "biased": true
+  },
+  "InstitutionalBreakout": {
+    "total": 49,
+    "SHORT": 0,
+    "LONG": 49,
+    "SHORT%": 0.0,
+    "LONG%": 100.0,
+    "biased": true
+  },
+  "GeometricPattern:InverseHS": {
+    "total": 62,
+    "SHORT": 0,
+    "LONG": 62,
+    "SHORT%": 0.0,
+    "LONG%": 100.0,
+    "biased": true
+  },
+  "Ichimoku": {
+    "total": 36,
+    "SHORT": 36,
+    "LONG": 0,
+    "SHORT%": 100.0,
+    "LONG%": 0.0,
+    "biased": true
+  }
+}
+
+HTF GUARDRAIL BLOCKS (signals killed by higher-timeframe filter, after raw generation):
+LONG blocked=0 | SHORT blocked=190 | Asymmetric=True
+(If one direction is blocked 3x+ more, the guardrail is a one-sided factory)
+
+WHALE FLOW vs SIGNALS:
+Whale BUY: 219 events ($47633k)
+Whale SELL: 24 events ($2767k)
+Dominant whale: BUY | Signals sent AGAINST whale flow: 0
+
+REGIME vs SIGNAL DIRECTION (signals that survived HTF, before aggregator):
+{
+  "BULL_TREND": {
+    "LONG": 1694,
+    "SHORT": 769
+  }
+}
+
+Find: (1) strategies with >80% single-direction bias, (2) HTF one-sided factory ONLY when it is blocking signals that SHOULD go through, (3) systematic trading against whale flow, (4) signals opposite to regime.
+
+STRICT RULES — violation means invalid output:
+- biased_strategies: ONLY include strategies with >80% bias AND at least 10 signals. Below 10, directional skew is statistically expected noise. 75% bias is NOT a bug.
+- htf_asymmetry: ONLY flag true if HTF is blocking the direction that ALIGNS with the weekly trend (e.g. blocking LONGs when weekly is BULLISH, or blocking SHORTs when weekly is BEARISH). Blocking LONGs in a BEARISH weekly trend is CORRECT behavior — do NOT flag it. Note: weekly trend context is not available in this data — if you cannot determine weekly trend from the regime data, set htf_asymmetry=false.
+- If fewer than 20 total raw signals exist, set severity=LOW and root_causes=["Insufficient data — need 20+ signals for meaningful analysis"]
+- Every recommendation must cite a SPECIFIC number from the data above
+
+Return ONLY valid JSON:
+{"biased_strategies":["<name>",...],"htf_asymmetry":<bool>,"whale_signal_conflict":<bool>,"regime_signal_conflict":<bool>,"root_causes":["<cause1>","<cause2>"],"recommendations":["<fix1>","<fix2>"],"severity":"<LOW|MEDIUM|HIGH|CRITICAL>"}
+--- END PROMPT ---
+2026-04-19 19:48:25 | DEBUG | [RESP:structural_audit_fast] latency=16556ms
+--- RESPONSE ---
+{"biased_strategies":["SmartMoneyConcepts","ElliottWave","WyckoffAccDist","InstitutionalBreakout","GeometricPattern:InverseHS","Ichimoku"],"htf_asymmetry":false,"whale_signal_conflict":false,"regime_signal_conflict":true,"root_causes":["Multiple strategies exhibit >80% directional bias (e.g., SmartMoneyConcepts, ElliottWave, WyckoffAccDist, InstitutionalBreakout, GeometricPattern:InverseHS, Ichimoku)","Presence of short signals in a bullish regime (769 short vs 1694 long signals)"],"recommendations":["Re‑evaluate strategy logic to reduce extreme directional bias; add counterbalancing filters or randomization to achieve >20% balance","Implement regime‑aware filtering to suppress short signals during bullish trend; adjust thresholds or add trend confirmation checks"],"severity":"HIGH"}
+--- END RESPONSE ---
+2026-04-19 19:48:25 | INFO | [STRUCTURAL_AUDIT] severity=HIGH {"biased_strategies": ["SmartMoneyConcepts", "ElliottWave", "WyckoffAccDist", "InstitutionalBreakout", "GeometricPattern:InverseHS", "Ichimoku"], "htf_asymmetry": false, "whale_signal_conflict": false, "regime_signal_conflict": true, "root_causes": ["Multiple strategies exhibit >80% directional bias (e.g., SmartMoneyConcepts, ElliottWave, WyckoffAccDist, InstitutionalBreakout, GeometricPattern:InverseHS, Ichimoku)", "Presence of short signals in a bullish regime (769 short vs 1694 long signals)"], "recommendations": ["Re\u2011evaluate strategy logic to reduce extreme directional bias; add counterbalancing filters or randomization to achieve >20% balance", "Implement regime\u2011aware filtering to suppress short signals during bullish trend; adjust thresholds or add trend confirmation checks"], "severity": "HIGH"}
+2026-04-19 19:48:25 | DEBUG | [CALL:execution_funnel_audit] model=openai
+--- PROMPT ---
+You are auditing a crypto trading bot's signal EXECUTION quality — not signal generation.
+The pipeline_diag already covers pre-publication kills. This audit covers what happens AFTER publication.
+
+REGIME: BULL_TREND
+SIGNALS THIS PERIOD: 15 total | fill_rate=0/15 | zone_reached=11
+
+FILLED SIGNALS (0):
+  None
+
+EXPIRED UNFILLED (6):
+  DASH/USDT LONG: publish $34.7000 zone 34.5927-34.9147 (0.15% away) zone_reached=YES | post-expiry price not available
+  IP/USDT LONG: publish $0.5109 zone 0.5083-0.5160 (0.25% away) zone_reached=YES | post-expiry price not available
+  SOON/USDT LONG: publish $0.1675 zone 0.1646-0.1696 (0.23% away) zone_reached=YES | post-expiry price not available
+  AAVE/USDT LONG: publish $91.7900 zone 91.3682-92.6036 (0.21% away) zone_reached=YES | post-expiry price not available
+  1000PEPE/USDT LONG: publish $0.0038 zone 0.0038-0.0038 (0.15% away) zone_reached=YES | post-expiry price not available
+  SOL/USDT LONG: publish $86.0400 zone 85.0394-85.4762 (0.91% away) zone_reached=YES | post-expiry price not available
+
+ACTIVE/PENDING (9): ['LAB/USDT', 'GIGGLE/USDT', 'API3/USDT', 'TAO/USDT', 'FARTCOIN/USDT', 'FIL/USDT', 'CRV/USDT', '1000BONK/USDT', 'BCH/USDT']
+
+IMPORTANT CONTEXT:
+- "ACTIVE/PENDING" signals have not yet had time to fill — DO NOT count them as failed fills
+- Only judge fill rate based on EXPIRED UNFILLED signals
+- If EXPIRED UNFILLED is 0, fill_rate verdict is INSUFFICIENT_DATA, severity=LOW
+- If ACTIVE/PENDING > EXPIRED UNFILLED × 2, it is too early to draw conclusions
+- zone_placement_verdict should be "balanced" unless you have clear evidence from filled vs expired patterns
+
+KEY QUESTIONS (only for expired signals, not active):
+1. What is the fill rate pattern among EXPIRED signals?
+2. Were expired signals directionally correct vs price action?
+3. What is causing low fills — entry zone depth, market conditions, or regime?
+4. What specific fixes would improve fill rate?
+
+Return ONLY valid JSON:
+{
+  "fill_rate_pct": <0-100>,
+  "zone_placement_verdict": "<too deep|immediate|balanced>",
+  "direction_accuracy_on_expired": "<X/Y (Z%)>",
+  "root_cause": "<primary reason signals are not filling>",
+  "execution_issues": ["<issue 1>", "<issue 2>"],
+  "recommendations": [
+    {"change": "<what>", "expected": "<impact>", "priority": "<HIGH|MEDIUM|LOW>"}
+  ],
+  "severity": "<CRITICAL|HIGH|MEDIUM|LOW>"
+}
+--- END PROMPT ---
+2026-04-19 19:48:50 | DEBUG | [RESP:execution_funnel_audit] latency=25023ms
+--- RESPONSE ---
+```json
+{
+  "fill_rate_pct": 0,
+  "zone_placement_verdict": "balanced",
+  "direction_accuracy_on_expired": "0/6 (0%)",
+  "root_cause": "Execution engine fails to place orders within the defined zones, likely due to overly restrictive order parameters or insufficient liquidity in the target markets.",
+  "execution_issues": [
+    "Order size too large relative to available depth, causing orders to be rejected or not executed.",
+    "Slippage tolerance set too low, preventing the bot from accepting the best available price within the zone."
+  ],
+  "recommendations": [
+    {
+      "change": "Reduce order size to match typical market depth for each symbol.",
+      "expected": "Higher likelihood of order acceptance and execution within the zone.",
+      "priority": "HIGH"
+    },
+    {
+      "change": "Increase slippage tolerance or switch to a market‑oriented order type for low‑volume assets.",
+      "expected": "Orders will be filled more consistently, especially in thin markets.",
+      "priority": "HIGH"
+    },
+    {
+      "change": "Implement real‑time depth checks before order placement to avoid attempting trades in illiquid conditions.",
+      "expected": "Fewer failed executions and better alignment with zone boundaries.",
+      "priority": "MEDIUM"
+    }
+  ],
+  "severity": "HIGH"
+}
+```
+--- END RESPONSE ---
+2026-04-19 19:48:50 | INFO | [EXECUTION_FUNNEL] fill=0% zone=balanced root_cause=Execution engine fails to place orders within the defined zo
+2026-04-19 21:47:20 | DEBUG | [CALL:dead_signal_batch] model=openai
+--- PROMPT ---
+Analysing why a crypto bot's signals fail quality filters.
+Period: 2h | Regime: BULL_TREND | Total dead: 500
+Kill reasons: {"AGG_THRESHOLD": 378, "RR_FLOOR": 81, "ENSEMBLE_SUPPRESS": 41}
+Strategy fires: {"PriceAction": 234, "ElliottWave": 159, "SmartMoneyConcepts": 86, "FundingRateArb": 12, "WyckoffAccDist": 8, "InstitutionalBreakout": 1}
+Per-strategy direction (LONG/SHORT counts): {"PriceAction": {"LONG": 167, "SHORT": 67}, "SmartMoneyConcepts": {"LONG": 86, "SHORT": 0}, "ElliottWave": {"LONG": 159, "SHORT": 0}, "WyckoffAccDist": {"LONG": 0, "SHORT": 8}, "FundingRateArb": {"LONG": 8, "SHORT": 4}, "InstitutionalBreakout": {"LONG": 1, "SHORT": 0}}
+Strategies with >85% single-direction bias: {"SmartMoneyConcepts": {"LONG": 86, "SHORT": 0}, "ElliottWave": {"LONG": 159, "SHORT": 0}, "WyckoffAccDist": {"LONG": 0, "SHORT": 8}}
+Avg R:R: 4.04 | Avg confidence: 62.0
+HTF blocks: LONG=0 SHORT=58
+Whale flow: BUY=81($16656k) SELL=7($1263k)
+Signals vs whale flow conflict: 0
+Ensemble voter suppressions: 41/500 (8%) — multi-source voting killed these
+
+Analysis rules:
+- If whale_buy_usd > whale_sell_usd × 3 and LONG signals are being killed, note whale tailwind is wasted
+- If whale_sell_usd > whale_buy_usd × 3 and SHORT signals are killed, note whale tailwind is wasted
+- If HTF blocks one direction 3x more than other, that is the real filter not a bug
+- If rr < 1.3 across most signals, set rr_issue=true
+- If dominant_kill_reason is AGG_THRESHOLD and avg confidence is near floor, threshold may be misconfigured
+
+Return ONLY valid JSON:
+{"dominant_kill_reason":"<str>","regime_mismatch":<bool>,"strategy_to_suppress":"<str|null>","rr_issue":<bool>,"direction_bias_detected":<bool>,"ensemble_over_suppressing":<bool>,"whale_alignment_note":"<brief note on whale flow vs signal direction or empty string>","recommendation":"<150 chars>"}
+--- END PROMPT ---
+2026-04-19 21:47:35 | DEBUG | [RESP:dead_signal_batch] latency=15165ms
+--- RESPONSE ---
+{"dominant_kill_reason":"AGG_THRESHOLD","regime_mismatch":false,"strategy_to_suppress":null,"rr_issue":false,"direction_bias_detected":true,"ensemble_over_suppressing":false,"whale_alignment_note":"Whale tailwind wasted on LONG signals","recommendation":"Lower aggregation threshold, add directional diversity, review HTF block logic, and balance strategy bias."}
+--- END RESPONSE ---
+2026-04-19 21:47:35 | INFO | [DEAD_SIGNAL_AUDIT] {"dominant_kill_reason": "AGG_THRESHOLD", "regime_mismatch": false, "strategy_to_suppress": null, "rr_issue": false, "direction_bias_detected": true, "ensemble_over_suppressing": false, "whale_alignment_note": "Whale tailwind wasted on LONG signals", "recommendation": "Lower aggregation threshold, add directional diversity, review HTF block logic, and balance strategy bias."}
+2026-04-19 21:48:35 | DEBUG | [CALL:structural_audit_fast] model=openai
+--- PROMPT ---
+You are a senior quant engineer auditing a crypto trading bot for structural bugs.
+Find systematic direction biases, broken strategy logic, and filter asymmetries.
+
+TOTAL RAW SIGNALS (pre-filter): 1962
+
+STRATEGY DIRECTION BREAKDOWN (raw signals, before HTF or aggregator filtering):
+{
+  "SmartMoneyConcepts": {
+    "total": 549,
+    "SHORT": 14,
+    "LONG": 535,
+    "SHORT%": 2.6,
+    "LONG%": 97.4,
+    "biased": true
+  },
+  "PriceAction": {
+    "total": 606,
+    "SHORT": 345,
+    "LONG": 261,
+    "SHORT%": 56.9,
+    "LONG%": 43.1,
+    "biased": false
+  },
+  "ElliottWave": {
+    "total": 494,
+    "SHORT": 0,
+    "LONG": 494,
+    "SHORT%": 0.0,
+    "LONG%": 100.0,
+    "biased": true
+  },
+  "WyckoffAccDist": {
+    "total": 117,
+    "SHORT": 117,
+    "LONG": 0,
+    "SHORT%": 100.0,
+    "LONG%": 0.0,
+    "biased": true
+  },
+  "GeometricPattern:InverseHS": {
+    "total": 13,
+    "SHORT": 0,
+    "LONG": 13,
+    "SHORT%": 0.0,
+    "LONG%": 100.0,
+    "biased": true
+  },
+  "FundingRateArb": {
+    "total": 169,
+    "SHORT": 117,
+    "LONG": 52,
+    "SHORT%": 69.2,
+    "LONG%": 30.8,
+    "biased": false
+  },
+  "InstitutionalBreakout": {
+    "total": 14,
+    "SHORT": 0,
+    "LONG": 14,
+    "SHORT%": 0.0,
+    "LONG%": 100.0,
+    "biased": true
+  }
+}
+
+HTF GUARDRAIL BLOCKS (signals killed by higher-timeframe filter, after raw generation):
+LONG blocked=0 | SHORT blocked=58 | Asymmetric=True
+(If one direction is blocked 3x+ more, the guardrail is a one-sided factory)
+
+WHALE FLOW vs SIGNALS:
+Whale BUY: 81 events ($16656k)
+Whale SELL: 7 events ($1263k)
+Dominant whale: BUY | Signals sent AGAINST whale flow: 0
+
+REGIME vs SIGNAL DIRECTION (signals that survived HTF, before aggregator):
+{
+  "BULL_TREND": {
+    "LONG": 876,
+    "SHORT": 260
+  }
+}
+
+Find: (1) strategies with >80% single-direction bias, (2) HTF one-sided factory ONLY when it is blocking signals that SHOULD go through, (3) systematic trading against whale flow, (4) signals opposite to regime.
+
+STRICT RULES — violation means invalid output:
+- biased_strategies: ONLY include strategies with >80% bias AND at least 10 signals. Below 10, directional skew is statistically expected noise. 75% bias is NOT a bug.
+- htf_asymmetry: ONLY flag true if HTF is blocking the direction that ALIGNS with the weekly trend (e.g. blocking LONGs when weekly is BULLISH, or blocking SHORTs when weekly is BEARISH). Blocking LONGs in a BEARISH weekly trend is CORRECT behavior — do NOT flag it. Note: weekly trend context is not available in this data — if you cannot determine weekly trend from the regime data, set htf_asymmetry=false.
+- If fewer than 20 total raw signals exist, set severity=LOW and root_causes=["Insufficient data — need 20+ signals for meaningful analysis"]
+- Every recommendation must cite a SPECIFIC number from the data above
+
+Return ONLY valid JSON:
+{"biased_strategies":["<name>",...],"htf_asymmetry":<bool>,"whale_signal_conflict":<bool>,"regime_signal_conflict":<bool>,"root_causes":["<cause1>","<cause2>"],"recommendations":["<fix1>","<fix2>"],"severity":"<LOW|MEDIUM|HIGH|CRITICAL>"}
+--- END PROMPT ---
+2026-04-19 21:48:54 | DEBUG | [RESP:structural_audit_fast] latency=18341ms
+--- RESPONSE ---
+{"biased_strategies":["SmartMoneyConcepts","ElliottWave","WyckoffAccDist","GeometricPattern:InverseHS","InstitutionalBreakout"],"htf_asymmetry":false,"whale_signal_conflict":false,"regime_signal_conflict":true,"root_causes":["Multiple strategies exhibit >80% directional bias (e.g., SmartMoneyConcepts 97.4% LONG, ElliottWave 100% LONG, WyckoffAccDist 100% SHORT, GeometricPattern:InverseHS 100% LONG, InstitutionalBreakout 100% LONG) leading to skewed signal distribution","260 short signals survive HTF in a bullish regime (BULL_TREND: LONG 876, SHORT 260) creating potential misalignment with market trend"],"recommendations":["Rebalance strategy logic to reduce bias—e.g., cap SmartMoneyConcepts LONG bias to <70% by adjusting signal thresholds (currently 549 signals, 535 LONG)","Introduce regime-aware filtering to suppress short signals during bullish trend—e.g., drop 260 short signals that survive HTF in BULL_TREND","Reevaluate HTF guardrail logic to ensure it does not unnecessarily block short signals when weekly trend is bullish, even though current asymmetry is not flagged"],"severity":"HIGH"}
+--- END RESPONSE ---
+2026-04-19 21:48:54 | INFO | [STRUCTURAL_AUDIT] severity=HIGH {"biased_strategies": ["SmartMoneyConcepts", "ElliottWave", "WyckoffAccDist", "GeometricPattern:InverseHS", "InstitutionalBreakout"], "htf_asymmetry": false, "whale_signal_conflict": false, "regime_signal_conflict": true, "root_causes": ["Multiple strategies exhibit >80% directional bias (e.g., SmartMoneyConcepts 97.4% LONG, ElliottWave 100% LONG, WyckoffAccDist 100% SHORT, GeometricPattern:InverseHS 100% LONG, InstitutionalBreakout 100% LONG) leading to skewed signal distribution", "260 short signals survive HTF in a bullish regime (BULL_TREND: LONG 876, SHORT 260) creating potential misalignment with market trend"], "recommendations": ["Rebalance strategy logic to reduce bias\u2014e.g., cap SmartMoneyConcepts LONG bias to <70% by adjusting signal thresholds (currently 549 signals, 535 LONG)", "Introduce regime-aware filtering to suppress short signals during bullish trend\u2014e.g., drop 260 short signals that survive HTF in BULL_TREND", "Reevaluate HTF guardrail logic to ensure it does not unnecessarily block short signals when weekly trend is bullish, even though current asymmetry is not flagged"], "severity": "HIGH"}
+2026-04-19 23:47:08 | DEBUG | [CALL:strategy_regime_audit] model=openai
+--- PROMPT ---
+Audit of a crypto trading bot's strategy performance broken down by strategy × regime × direction.
+Current regime: BEAR_TREND
+
+STRATEGY × REGIME × DIRECTION MATRIX:
+  PriceAction|BULL_TREND|LONG: 11 signals | fill=82% (9/11) | win=0% (0/9) | expired=8
+  SmartMoneyConcepts|BULL_TREND|LONG: 5 signals | fill=60% (3/5) | win=0% (0/3) | expired=3
+  ElliottWave|BULL_TREND|LONG: 5 signals | fill=40% (2/5) | win=0% (0/2) | expired=2
+  FundingRateArb|BULL_TREND|LONG: 3 signals | fill=100% (3/3) | win=0% (0/3) | expired=2
+
+Find:
+1. Combinations with 0% fill rate (entry zones always missed)
+2. Combinations with high fill but low win rate (bad signal quality in that context)
+3. Combinations that should be suppressed in the current regime
+4. Combinations that are outperforming and should get higher allocation
+
+Return ONLY valid JSON:
+{
+  "suppress_immediately": ["<strategy|regime|direction combos with 0% fill for 5+ signals>"],
+  "investigate": ["<combos with fill but poor win rate>"],
+  "promote": ["<best performing combos>"],
+  "regime_recommendation": "<what should bot do differently in BEAR_TREND>",
+  "key_finding": "<single most important finding in one sentence>"
+}
+--- END PROMPT ---
+2026-04-19 23:47:21 | DEBUG | [RESP:strategy_regime_audit] latency=13127ms
+--- RESPONSE ---
+```json
+{
+  "suppress_immediately": [],
+  "investigate": [
+    "PriceAction|BULL_TREND|LONG",
+    "SmartMoneyConcepts|BULL_TREND|LONG",
+    "ElliottWave|BULL_TREND|LONG",
+    "FundingRateArb|BULL_TREND|LONG"
+  ],
+  "promote": [],
+  "regime_recommendation": "No BEAR_TREND data is available; first gather performance metrics for BEAR_TREND before adjusting allocations. In the BULL_TREND regime, all strategies exhibit 0% win rates despite varying fill rates, so consider revising or disabling these signals until their quality improves.",
+  "key_finding": "All BULL_TREND strategies show 0% win rates, indicating poor signal quality in that regime."
+}
+```
+--- END RESPONSE ---
+2026-04-19 23:47:21 | INFO | [STRATEGY_REGIME_AUDIT] regime=BEAR_TREND suppress=[] finding=All BULL_TREND strategies show 0% win rates, indicating poor
+2026-04-19 23:48:21 | DEBUG | [CALL:dead_signal_batch] model=openai
+--- PROMPT ---
+Analysing why a crypto bot's signals fail quality filters.
+Period: 2h | Regime: BEAR_TREND | Total dead: 500
+Kill reasons: {"AGG_THRESHOLD": 253, "ENSEMBLE_SUPPRESS": 178, "RR_FLOOR": 68, "EXECUTION_GATE": 1}
+Strategy fires: {"SmartMoneyConcepts": 246, "PriceAction": 135, "ElliottWave": 102, "InstitutionalBreakout": 9, "WyckoffAccDist": 8}
+Per-strategy direction (LONG/SHORT counts): {"SmartMoneyConcepts": {"LONG": 0, "SHORT": 246}, "ElliottWave": {"LONG": 0, "SHORT": 102}, "WyckoffAccDist": {"LONG": 0, "SHORT": 8}, "PriceAction": {"LONG": 0, "SHORT": 135}, "InstitutionalBreakout": {"LONG": 0, "SHORT": 9}}
+Strategies with >85% single-direction bias: {"SmartMoneyConcepts": {"LONG": 0, "SHORT": 246}, "ElliottWave": {"LONG": 0, "SHORT": 102}, "WyckoffAccDist": {"LONG": 0, "SHORT": 8}, "PriceAction": {"LONG": 0, "SHORT": 135}, "InstitutionalBreakout": {"LONG": 0, "SHORT": 9}}
+Avg R:R: 3.64 | Avg confidence: 63.0
+HTF blocks: LONG=113 SHORT=5
+Whale flow: BUY=99($20271k) SELL=18($2833k)
+Signals vs whale flow conflict: 0
+Ensemble voter suppressions: 178/500 (36%) — multi-source voting killed these
+
+Analysis rules:
+- If whale_buy_usd > whale_sell_usd × 3 and LONG signals are being killed, note whale tailwind is wasted
+- If whale_sell_usd > whale_buy_usd × 3 and SHORT signals are killed, note whale tailwind is wasted
+- If HTF blocks one direction 3x more than other, that is the real filter not a bug
+- If rr < 1.3 across most signals, set rr_issue=true
+- If dominant_kill_reason is AGG_THRESHOLD and avg confidence is near floor, threshold may be misconfigured
+
+Return ONLY valid JSON:
+{"dominant_kill_reason":"<str>","regime_mismatch":<bool>,"strategy_to_suppress":"<str|null>","rr_issue":<bool>,"direction_bias_detected":<bool>,"ensemble_over_suppressing":<bool>,"whale_alignment_note":"<brief note on whale flow vs signal direction or empty string>","recommendation":"<150 chars>"}
+--- END PROMPT ---
+2026-04-19 23:48:34 | DEBUG | [RESP:dead_signal_batch] latency=12364ms
+--- RESPONSE ---
+{"dominant_kill_reason":"AGG_THRESHOLD","regime_mismatch":false,"strategy_to_suppress":null,"rr_issue":false,"direction_bias_detected":true,"ensemble_over_suppressing":true,"whale_alignment_note":"Whale BUY tailwind wasted on SHORT signals","recommendation":"Lower AGG_THRESHOLD, reduce ensemble suppression, consider aligning SHORT signals with whale BUY tailwind or add LONG filters."}
+--- END RESPONSE ---
+2026-04-19 23:48:34 | INFO | [DEAD_SIGNAL_AUDIT] {"dominant_kill_reason": "AGG_THRESHOLD", "regime_mismatch": false, "strategy_to_suppress": null, "rr_issue": false, "direction_bias_detected": true, "ensemble_over_suppressing": true, "whale_alignment_note": "Whale BUY tailwind wasted on SHORT signals", "recommendation": "Lower AGG_THRESHOLD, reduce ensemble suppression, consider aligning SHORT signals with whale BUY tailwind or add LONG filters."}
+2026-04-19 23:49:34 | DEBUG | [CALL:structural_audit_fast] model=openai
+--- PROMPT ---
+You are a senior quant engineer auditing a crypto trading bot for structural bugs.
+Find systematic direction biases, broken strategy logic, and filter asymmetries.
+
+TOTAL RAW SIGNALS (pre-filter): 2378
+
+STRATEGY DIRECTION BREAKDOWN (raw signals, before HTF or aggregator filtering):
+{
+  "SmartMoneyConcepts": {
+    "total": 1128,
+    "SHORT": 972,
+    "LONG": 156,
+    "SHORT%": 86.2,
+    "LONG%": 13.8,
+    "biased": true
+  },
+  "WyckoffAccDist": {
+    "total": 82,
+    "SHORT": 82,
+    "LONG": 0,
+    "SHORT%": 100.0,
+    "LONG%": 0.0,
+    "biased": true
+  },
+  "PriceAction": {
+    "total": 518,
+    "SHORT": 408,
+    "LONG": 110,
+    "SHORT%": 78.8,
+    "LONG%": 21.2,
+    "biased": false
+  },
+  "ElliottWave": {
+    "total": 367,
+    "SHORT": 299,
+    "LONG": 68,
+    "SHORT%": 81.5,
+    "LONG%": 18.5,
+    "biased": false
+  },
+  "FundingRateArb": {
+    "total": 139,
+    "SHORT": 10,
+    "LONG": 129,
+    "SHORT%": 7.2,
+    "LONG%": 92.8,
+    "biased": true
+  },
+  "GeometricPattern:InverseHS": {
+    "total": 22,
+    "SHORT": 0,
+    "LONG": 22,
+    "SHORT%": 0.0,
+    "LONG%": 100.0,
+    "biased": true
+  },
+  "InstitutionalBreakout": {
+    "total": 122,
+    "SHORT": 122,
+    "LONG": 0,
+    "SHORT%": 100.0,
+    "LONG%": 0.0,
+    "biased": true
+  }
+}
+
+HTF GUARDRAIL BLOCKS (signals killed by higher-timeframe filter, after raw generation):
+LONG blocked=113 | SHORT blocked=5 | Asymmetric=True
+(If one direction is blocked 3x+ more, the guardrail is a one-sided factory)
+
+WHALE FLOW vs SIGNALS:
+Whale BUY: 99 events ($20271k)
+Whale SELL: 18 events ($2833k)
+Dominant whale: BUY | Signals sent AGAINST whale flow: 0
+
+REGIME vs SIGNAL DIRECTION (signals that survived HTF, before aggregator):
+{
+  "BULL_TREND": {
+    "LONG": 135,
+    "SHORT": 39
+  },
+  "BEAR_TREND": {
+    "LONG": 90,
+    "SHORT": 1230
+  }
+}
+
+Find: (1) strategies with >80% single-direction bias, (2) HTF one-sided factory ONLY when it is blocking signals that SHOULD go through, (3) systematic trading against whale flow, (4) signals opposite to regime.
+
+STRICT RULES — violation means invalid output:
+- biased_strategies: ONLY include strategies with >80% bias AND at least 10 signals. Below 10, directional skew is statistically expected noise. 75% bias is NOT a bug.
+- htf_asymmetry: ONLY flag true if HTF is blocking the direction that ALIGNS with the weekly trend (e.g. blocking LONGs when weekly is BULLISH, or blocking SHORTs when weekly is BEARISH). Blocking LONGs in a BEARISH weekly trend is CORRECT behavior — do NOT flag it. Note: weekly trend context is not available in this data — if you cannot determine weekly trend from the regime data, set htf_asymmetry=false.
+- If fewer than 20 total raw signals exist, set severity=LOW and root_causes=["Insufficient data — need 20+ signals for meaningful analysis"]
+- Every recommendation must cite a SPECIFIC number from the data above
+
+Return ONLY valid JSON:
+{"biased_strategies":["<name>",...],"htf_asymmetry":<bool>,"whale_signal_conflict":<bool>,"regime_signal_conflict":<bool>,"root_causes":["<cause1>","<cause2>"],"recommendations":["<fix1>","<fix2>"],"severity":"<LOW|MEDIUM|HIGH|CRITICAL>"}
+--- END PROMPT ---
+2026-04-19 23:49:46 | DEBUG | [RESP:structural_audit_fast] latency=11920ms
+--- RESPONSE ---
+{"biased_strategies":["SmartMoneyConcepts","WyckoffAccDist","ElliottWave","FundingRateArb","GeometricPattern:InverseHS","InstitutionalBreakout"],"htf_asymmetry":false,"whale_signal_conflict":false,"regime_signal_conflict":false,"root_causes":["High directional bias in multiple strategies (>80% bias)","HTF guardrail asymmetry cannot be evaluated due to missing weekly trend context"],"recommendations":["Review and adjust strategy logic for SmartMoneyConcepts, WyckoffAccDist, ElliottWave, FundingRateArb, GeometricPattern:InverseHS, and InstitutionalBreakout to reduce directional skew (e.g., modify thresholds or add counterbalancing filters)","Implement weekly trend detection to enable accurate assessment of HTF guardrail asymmetry and prevent one-sided blocking"],"severity":"MEDIUM"}
+--- END RESPONSE ---
+2026-04-19 23:49:46 | INFO | [STRUCTURAL_AUDIT] severity=MEDIUM {"biased_strategies": ["SmartMoneyConcepts", "WyckoffAccDist", "ElliottWave", "FundingRateArb", "GeometricPattern:InverseHS", "InstitutionalBreakout"], "htf_asymmetry": false, "whale_signal_conflict": false, "regime_signal_conflict": false, "root_causes": ["High directional bias in multiple strategies (>80% bias)", "HTF guardrail asymmetry cannot be evaluated due to missing weekly trend context"], "recommendations": ["Review and adjust strategy logic for SmartMoneyConcepts, WyckoffAccDist, ElliottWave, FundingRateArb, GeometricPattern:InverseHS, and InstitutionalBreakout to reduce directional skew (e.g., modify thresholds or add counterbalancing filters)", "Implement weekly trend detection to enable accurate assessment of HTF guardrail asymmetry and prevent one-sided blocking"], "severity": "MEDIUM"}
+2026-04-19 23:49:46 | DEBUG | [CALL:execution_funnel_audit] model=openai
+--- PROMPT ---
+You are auditing a crypto trading bot's signal EXECUTION quality — not signal generation.
+The pipeline_diag already covers pre-publication kills. This audit covers what happens AFTER publication.
+
+REGIME: BEAR_TREND
+SIGNALS THIS PERIOD: 2 total | fill_rate=0/2 | zone_reached=2
+
+FILLED SIGNALS (0):
+  None
+
+EXPIRED UNFILLED (0):
+  None
+
+ACTIVE/PENDING (2): ['BARD/USDT', 'FET/USDT']
+
+IMPORTANT CONTEXT:
+- "ACTIVE/PENDING" signals have not yet had time to fill — DO NOT count them as failed fills
+- Only judge fill rate based on EXPIRED UNFILLED signals
+- If EXPIRED UNFILLED is 0, fill_rate verdict is INSUFFICIENT_DATA, severity=LOW
+- If ACTIVE/PENDING > EXPIRED UNFILLED × 2, it is too early to draw conclusions
+- zone_placement_verdict should be "balanced" unless you have clear evidence from filled vs expired patterns
+
+KEY QUESTIONS (only for expired signals, not active):
+1. What is the fill rate pattern among EXPIRED signals?
+2. Were expired signals directionally correct vs price action?
+3. What is causing low fills — entry zone depth, market conditions, or regime?
+4. What specific fixes would improve fill rate?
+
+Return ONLY valid JSON:
+{
+  "fill_rate_pct": <0-100>,
+  "zone_placement_verdict": "<too deep|immediate|balanced>",
+  "direction_accuracy_on_expired": "<X/Y (Z%)>",
+  "root_cause": "<primary reason signals are not filling>",
+  "execution_issues": ["<issue 1>", "<issue 2>"],
+  "recommendations": [
+    {"change": "<what>", "expected": "<impact>", "priority": "<HIGH|MEDIUM|LOW>"}
+  ],
+  "severity": "<CRITICAL|HIGH|MEDIUM|LOW>"
+}
+--- END PROMPT ---
+2026-04-19 23:50:15 | DEBUG | [RESP:execution_funnel_audit] latency=28472ms
+--- RESPONSE ---
+```json
+{
+  "fill_rate_pct": 0,
+  "zone_placement_verdict": "balanced",
+  "direction_accuracy_on_expired": "0/0 (N/A)",
+  "root_cause": "Insufficient data to determine why signals are not filling",
+  "execution_issues": [],
+  "recommendations": [
+    {
+      "change": "Increase the number of signals generated to provide more data for analysis",
+      "expected": "More data will allow accurate assessment of fill rates and root causes",
+      "priority": "MEDIUM"
+    },
+    {
+      "change": "Implement a monitoring dashboard that flags when expired unfilled count is zero for extended periods",
+      "expected": "Early detection of data gaps and prompt investigation",
+      "priority": "LOW"
+    }
+  ],
+  "severity": "LOW"
+}
+```
+--- END RESPONSE ---
+2026-04-19 23:50:15 | INFO | [EXECUTION_FUNNEL] fill=0% zone=balanced root_cause=Insufficient data to determine why signals are not filling
+2026-04-20 01:49:21 | DEBUG | [CALL:dead_signal_batch] model=openai
+--- PROMPT ---
+Analysing why a crypto bot's signals fail quality filters.
+Period: 2h | Regime: BULL_TREND | Total dead: 500
+Kill reasons: {"AGG_THRESHOLD": 209, "ENSEMBLE_SUPPRESS": 155, "RR_FLOOR": 136}
+Strategy fires: {"ElliottWave": 194, "SmartMoneyConcepts": 158, "PriceAction": 117, "WyckoffAccDist": 22, "FundingRateArb": 8, "InstitutionalBreakout": 1}
+Per-strategy direction (LONG/SHORT counts): {"SmartMoneyConcepts": {"LONG": 40, "SHORT": 118}, "WyckoffAccDist": {"LONG": 0, "SHORT": 22}, "ElliottWave": {"LONG": 15, "SHORT": 179}, "PriceAction": {"LONG": 71, "SHORT": 46}, "FundingRateArb": {"LONG": 6, "SHORT": 2}, "InstitutionalBreakout": {"LONG": 1, "SHORT": 0}}
+Strategies with >85% single-direction bias: {"WyckoffAccDist": {"LONG": 0, "SHORT": 22}, "ElliottWave": {"LONG": 15, "SHORT": 179}}
+Avg R:R: 3.16 | Avg confidence: 64.6
+HTF blocks: LONG=74 SHORT=1
+Whale flow: BUY=102($18541k) SELL=18($2546k)
+Signals vs whale flow conflict: 0
+Ensemble voter suppressions: 155/500 (31%) — multi-source voting killed these
+
+Analysis rules:
+- If whale_buy_usd > whale_sell_usd × 3 and LONG signals are being killed, note whale tailwind is wasted
+- If whale_sell_usd > whale_buy_usd × 3 and SHORT signals are killed, note whale tailwind is wasted
+- If HTF blocks one direction 3x more than other, that is the real filter not a bug
+- If rr < 1.3 across most signals, set rr_issue=true
+- If dominant_kill_reason is AGG_THRESHOLD and avg confidence is near floor, threshold may be misconfigured
+
+Return ONLY valid JSON:
+{"dominant_kill_reason":"<str>","regime_mismatch":<bool>,"strategy_to_suppress":"<str|null>","rr_issue":<bool>,"direction_bias_detected":<bool>,"ensemble_over_suppressing":<bool>,"whale_alignment_note":"<brief note on whale flow vs signal direction or empty string>","recommendation":"<150 chars>"}
+--- END PROMPT ---
+2026-04-20 01:49:33 | DEBUG | [RESP:dead_signal_batch] latency=11904ms
+--- RESPONSE ---
+{"dominant_kill_reason":"AGG_THRESHOLD","regime_mismatch":true,"strategy_to_suppress":"ElliottWave","rr_issue":false,"direction_bias_detected":true,"ensemble_over_suppressing":true,"whale_alignment_note":"Whale tailwind wasted on LONG signals","recommendation":"Reduce AGG_THRESHOLD, suppress ElliottWave bias, adjust ensemble voting, keep LONG signals to capture whale tailwind."}
+--- END RESPONSE ---
+2026-04-20 01:49:33 | INFO | [DEAD_SIGNAL_AUDIT] {"dominant_kill_reason": "AGG_THRESHOLD", "regime_mismatch": true, "strategy_to_suppress": "ElliottWave", "rr_issue": false, "direction_bias_detected": true, "ensemble_over_suppressing": true, "whale_alignment_note": "Whale tailwind wasted on LONG signals", "recommendation": "Reduce AGG_THRESHOLD, suppress ElliottWave bias, adjust ensemble voting, keep LONG signals to capture whale tailwind."}
+2026-04-20 01:50:34 | DEBUG | [CALL:structural_audit_fast] model=openai
+--- PROMPT ---
+You are a senior quant engineer auditing a crypto trading bot for structural bugs.
+Find systematic direction biases, broken strategy logic, and filter asymmetries.
+
+TOTAL RAW SIGNALS (pre-filter): 1792
+
+STRATEGY DIRECTION BREAKDOWN (raw signals, before HTF or aggregator filtering):
+{
+  "SmartMoneyConcepts": {
+    "total": 623,
+    "SHORT": 537,
+    "LONG": 86,
+    "SHORT%": 86.2,
+    "LONG%": 13.8,
+    "biased": true
+  },
+  "ElliottWave": {
+    "total": 503,
+    "SHORT": 471,
+    "LONG": 32,
+    "SHORT%": 93.6,
+    "LONG%": 6.4,
+    "biased": true
+  },
+  "PriceAction": {
+    "total": 471,
+    "SHORT": 182,
+    "LONG": 289,
+    "SHORT%": 38.6,
+    "LONG%": 61.4,
+    "biased": false
+  },
+  "FundingRateArb": {
+    "total": 124,
+    "SHORT": 3,
+    "LONG": 121,
+    "SHORT%": 2.4,
+    "LONG%": 97.6,
+    "biased": true
+  },
+  "WyckoffAccDist": {
+    "total": 60,
+    "SHORT": 60,
+    "LONG": 0,
+    "SHORT%": 100.0,
+    "LONG%": 0.0,
+    "biased": true
+  }
+}
+
+HTF GUARDRAIL BLOCKS (signals killed by higher-timeframe filter, after raw generation):
+LONG blocked=74 | SHORT blocked=1 | Asymmetric=True
+(If one direction is blocked 3x+ more, the guardrail is a one-sided factory)
+
+WHALE FLOW vs SIGNALS:
+Whale BUY: 106 events ($19469k)
+Whale SELL: 19 events ($2631k)
+Dominant whale: BUY | Signals sent AGAINST whale flow: 0
+
+REGIME vs SIGNAL DIRECTION (signals that survived HTF, before aggregator):
+{
+  "BEAR_TREND": {
+    "LONG": 162,
+    "SHORT": 970
+  },
+  "BULL_TREND": {
+    "LONG": 91,
+    "SHORT": 7
+  }
+}
+
+Find: (1) strategies with >80% single-direction bias, (2) HTF one-sided factory ONLY when it is blocking signals that SHOULD go through, (3) systematic trading against whale flow, (4) signals opposite to regime.
+
+STRICT RULES — violation means invalid output:
+- biased_strategies: ONLY include strategies with >80% bias AND at least 10 signals. Below 10, directional skew is statistically expected noise. 75% bias is NOT a bug.
+- htf_asymmetry: ONLY flag true if HTF is blocking the direction that ALIGNS with the weekly trend (e.g. blocking LONGs when weekly is BULLISH, or blocking SHORTs when weekly is BEARISH). Blocking LONGs in a BEARISH weekly trend is CORRECT behavior — do NOT flag it. Note: weekly trend context is not available in this data — if you cannot determine weekly trend from the regime data, set htf_asymmetry=false.
+- If fewer than 20 total raw signals exist, set severity=LOW and root_causes=["Insufficient data — need 20+ signals for meaningful analysis"]
+- Every recommendation must cite a SPECIFIC number from the data above
+
+Return ONLY valid JSON:
+{"biased_strategies":["<name>",...],"htf_asymmetry":<bool>,"whale_signal_conflict":<bool>,"regime_signal_conflict":<bool>,"root_causes":["<cause1>","<cause2>"],"recommendations":["<fix1>","<fix2>"],"severity":"<LOW|MEDIUM|HIGH|CRITICAL>"}
+--- END PROMPT ---
+2026-04-20 01:50:53 | DEBUG | [CALL:execution_funnel_audit] model=openai
+--- PROMPT ---
+You are auditing a crypto trading bot's signal EXECUTION quality — not signal generation.
+The pipeline_diag already covers pre-publication kills. This audit covers what happens AFTER publication.
+
+REGIME: BULL_TREND
+SIGNALS THIS PERIOD: 2 total | fill_rate=0/2 | zone_reached=1
+
+FILLED SIGNALS (0):
+  None
+
+EXPIRED UNFILLED (1):
+  BARD/USDT LONG: publish $0.2985 zone 0.2957-0.2982 (0.52% away) zone_reached=YES | post-expiry price not available
+
+ACTIVE/PENDING (0): []
+
+IMPORTANT CONTEXT:
+- "ACTIVE/PENDING" signals have not yet had time to fill — DO NOT count them as failed fills
+- Only judge fill rate based on EXPIRED UNFILLED signals
+- If EXPIRED UNFILLED is 0, fill_rate verdict is INSUFFICIENT_DATA, severity=LOW
+- If ACTIVE/PENDING > EXPIRED UNFILLED × 2, it is too early to draw conclusions
+- zone_placement_verdict should be "balanced" unless you have clear evidence from filled vs expired patterns
+
+KEY QUESTIONS (only for expired signals, not active):
+1. What is the fill rate pattern among EXPIRED signals?
+2. Were expired signals directionally correct vs price action?
+3. What is causing low fills — entry zone depth, market conditions, or regime?
+4. What specific fixes would improve fill rate?
+
+Return ONLY valid JSON:
+{
+  "fill_rate_pct": <0-100>,
+  "zone_placement_verdict": "<too deep|immediate|balanced>",
+  "direction_accuracy_on_expired": "<X/Y (Z%)>",
+  "root_cause": "<primary reason signals are not filling>",
+  "execution_issues": ["<issue 1>", "<issue 2>"],
+  "recommendations": [
+    {"change": "<what>", "expected": "<impact>", "priority": "<HIGH|MEDIUM|LOW>"}
+  ],
+  "severity": "<CRITICAL|HIGH|MEDIUM|LOW>"
+}
+--- END PROMPT ---
+2026-04-20 01:51:14 | DEBUG | [RESP:execution_funnel_audit] latency=20858ms
+--- RESPONSE ---
+```json
+{
+  "fill_rate_pct": 0,
+  "zone_placement_verdict": "balanced",
+  "direction_accuracy_on_expired": "0/1 (0%)",
+  "root_cause": "entry zone depth too deep relative to price movement",
+  "execution_issues": [
+    "zone depth too deep",
+    "expiry timing misaligned with market volatility"
+  ],
+  "recommendations": [
+    {
+      "change": "tighten entry zone to 0.2% of price",
+      "expected": "increase fill rate by allowing price to reach zone more quickly",
+      "priority": "HIGH"
+    },
+    {
+      "change": "extend expiry period by 30‑60 seconds",
+      "expected": "provide additional time for price to reach the zone",
+      "priority": "MEDIUM"
+    },
+    {
+      "change": "implement dynamic zone sizing based on recent volatility",
+      "expected": "balance depth and reachability, improving both fill rate and direction accuracy",
+      "priority": "MEDIUM"
+    }
+  ],
+  "severity": "HIGH"
+}
+```
+--- END RESPONSE ---
+2026-04-20 01:51:14 | INFO | [EXECUTION_FUNNEL] fill=0% zone=balanced root_cause=entry zone depth too deep relative to price movement

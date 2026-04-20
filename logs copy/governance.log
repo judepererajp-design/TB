@@ -1,0 +1,8 @@
+2026-04-19 15:44:44 | Performance tracker loaded 0 strategy records (0 with persisted adaptive state)
+2026-04-19 15:44:44 | ⚙️  adaptive_params: no persisted state — using defaults
+2026-04-19 15:45:58 | ⚙️  param_tuner: no market-state data yet — skipping
+2026-04-19 15:46:59 | ⚙️  param_tuner: starting tuning cycle
+2026-04-19 15:46:59 | ⚙️  param_tuner: all states in-range — no changes (stable=1)
+2026-04-19 22:12:03 | 🔄 Performance tracker EWMA softened → BEAR_TREND
+2026-04-20 01:41:59 | 🔄 Performance tracker EWMA softened → BULL_TREND
+2026-04-20 01:58:49 | suppress_strategy: 'ElliottWave' is not a tracked strategy — suppression ignored. Known strategies: []
