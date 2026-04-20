@@ -35,7 +35,7 @@ import logging
 import time
 import aiohttp
 import numpy as np
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -744,3 +744,65 @@ class LiquidationHeatmap:
 
 # Singleton
 liquidation_heatmap = LiquidationHeatmap()
+
+
+# ── Module-level helper used by analyzers.market_state_builder ────────────
+# Returns a compact summary of liquidation state around the symbol's current
+# mid price. Callers consume ``cluster_hit`` to flag proximity to a large
+# liquidation cluster; additional keys are informational so downstream code
+# can use them without requiring another round-trip.
+async def get_liquidation_state(symbol: str) -> Dict[str, Any]:
+    """
+    Lightweight snapshot of liquidation clusters near ``symbol`` current price.
+
+    Returns:
+        {
+            "cluster_hit": bool,            # current price inside any cluster's band
+            "clusters": int,                # number of clusters considered
+            "nearest_distance_pct": float | None,  # distance to nearest cluster edge
+        }
+
+    Never raises — on any upstream error falls back to ``cluster_hit=False``
+    so the caller can treat it as "no cluster proximity detected".
+    """
+    try:
+        # Local import to avoid import-time cycles between analyzers ⇄ signals ⇄ data.
+        from data.api_client import api
+        ticker = await api.fetch_ticker(symbol)
+        current_price = 0.0
+        if ticker:
+            current_price = float(
+                ticker.get("last") or ticker.get("close") or ticker.get("price") or 0.0
+            )
+    except Exception:
+        current_price = 0.0
+
+    if current_price <= 0:
+        return {"cluster_hit": False, "clusters": 0, "nearest_distance_pct": None}
+
+    clusters = liquidation_heatmap.get_cached_clusters(symbol)
+    if not clusters:
+        try:
+            clusters = await liquidation_heatmap.get_clusters(symbol, current_price)
+        except Exception:
+            clusters = []
+
+    cluster_hit = False
+    nearest: Optional[float] = None
+    for c in clusters:
+        if c.price_low <= current_price <= c.price_high:
+            cluster_hit = True
+            nearest = 0.0
+            break
+        dist = min(
+            abs(current_price - c.price_low),
+            abs(current_price - c.price_high),
+        ) / current_price
+        if nearest is None or dist < nearest:
+            nearest = dist
+
+    return {
+        "cluster_hit": cluster_hit,
+        "clusters": len(clusters),
+        "nearest_distance_pct": nearest,
+    }
