@@ -613,9 +613,12 @@ patterns:
 
   harmonic:
     enabled: true
-    tolerance: 0.10
+    tolerance: 0.10         # legacy relative tolerance (fallback only)
     pivot_order: 5
     min_swing_pct: 0.03
+    min_pivot_spacing: 3    # P1-H5: minimum bars between consecutive pivots
+    prz_cluster_bonus: 5    # P2-H1: +conf when XAD/BCD projections overlap at D
+    d_reversal_bonus: 4     # P2-H2: +conf when a reversal candle prints at D
     patterns:
       gartley: true
       bat: true
@@ -628,18 +631,25 @@ patterns:
     enabled: true
     pivot_order: 3
     lookback: 50
+    flag_consol_ratio: 0.30    # P1-G15: flag consolidation ≤ 30% of impulse (was 40%)
+    require_volume_confirm: false  # P2-G1: hard-gate flag/triangle on volume expansion
+    volume_confirm_mult: 1.3       # P2-G1: multiple vs trailing 20-bar median
     patterns:
       flags: true
       triangles: true
       head_shoulders: true
       double_top_bottom: true
       wedges: true
+      cup_and_handle: true
     confidence_threshold: 65
 
   wyckoff:
     enabled: true
     min_range_bars: 20
+    max_range_bars: 120        # P1-W15: upper cap on scan window (was hard-coded 80)
     volume_sensitivity: 1.3
+    lps_bonus: 5                    # P2-W1: +conf when LPS/LPSY retest holds
+    emit_cause_effect_target: true  # P2-W2: project markup/markdown target from range
 
 # ============================================================
 # GOVERNANCE
