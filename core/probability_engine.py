@@ -353,11 +353,14 @@ class ProbabilityEngine:
                 if abs(_correction) > 0.01:
                     evidence_details['calibration_correction'] = round(_correction, 4)
 
+        # R6-F3: Log when clipping actually activates — silent bounds hide
+        # calibration issues. Capture the pre-clip value BEFORE the clamp
+        # (post-calibration-correction) so the log reflects what the model
+        # really wanted to emit, not the raw logistic output.
+        _pre_clip = p_win
         p_win = max(0.05, min(0.95, p_win))  # Clip extremes
 
-        # R6-F3: Log when clipping activates — silent bounds hide calibration issues.
-        _pre_clip = 1.0 / (1.0 + math.exp(-log_odds))
-        if _pre_clip < 0.06 or _pre_clip > 0.94:
+        if _pre_clip < 0.05 or _pre_clip > 0.95:
             logger.debug(
                 f"P_win clipped: raw={_pre_clip:.3f} → {p_win:.3f} "
                 f"({strategy}/{regime}/{direction})"
@@ -484,9 +487,14 @@ class ProbabilityEngine:
     def load_posteriors(self, data: Dict[str, dict]):
         """Load posteriors from persistence"""
         for key, vals in data.items():
+            # Use configured defaults (2.6/2.4 → mean 0.52), consistent with
+            # bootstrap_priors(), decay_toward_prior(), and fresh create paths.
+            # Hardcoded 2.0/2.0 here would silently drift records missing
+            # alpha/beta keys to mean 0.50 while the rest of the engine
+            # assumes 0.52.
             self._posteriors[key] = BetaPosterior(
-                alpha=vals.get('alpha', 2.0),
-                beta=vals.get('beta', 2.0),
+                alpha=vals.get('alpha', self._default_prior_alpha),
+                beta=vals.get('beta', self._default_prior_beta),
             )
         logger.info(f"Loaded {len(data)} posteriors from database")
 
