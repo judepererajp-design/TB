@@ -56,13 +56,27 @@ PATTERN_RATIOS = {
         'XAD': (0.886, 1.130),
     },
     # FIX HARMONIC-3: Cypher was enabled in config but missing from PATTERN_RATIOS
-    # Cypher: more relaxed ratios, common in crypto trending markets
+    # FIX AUDIT P1-H1: Prior BCD was (0.786,) which is not a Cypher at all — it
+    # produced false matches on every shallow retracement. Classic Cypher has
+    # BCD in (1.272, 2.000) and XAD ≈ 0.786; keep ABC at (1.130, 1.414).
     'Cypher': {
         'XAB': (0.382, 0.618),
         'ABC': (1.130, 1.414),
-        'BCD': (0.786,),
+        'BCD': (1.272, 2.000),
         'XAD': (0.786,),
     },
+}
+
+# Per-pattern absolute tolerance (in Fib-ratio units). Relative tolerance is
+# asymmetric — ±10% on 0.382 is ±0.038 (tight) but ±10% on 2.618 is ±0.262
+# (huge), which over-accepts deep extensions. Absolute tolerance is uniform.
+_PATTERN_ABS_TOL = {
+    'Gartley':   0.05,
+    'Bat':       0.05,
+    'Crab':      0.08,   # larger extension → slightly looser
+    'Butterfly': 0.06,
+    'Shark':     0.06,
+    'Cypher':    0.06,
 }
 
 
@@ -96,6 +110,10 @@ class HarmonicDetector(BaseStrategy):
         self._tolerance = getattr(self._cfg, 'tolerance', 0.10)
         self._min_swing = getattr(self._cfg, 'min_swing_pct', 0.03)
         self._pivot_ord = getattr(self._cfg, 'pivot_order', 5)
+        # P1-H5: minimum bar spacing between consecutive pivots — prevents
+        # XABCD patterns that are just 3 bars apart from being treated as
+        # equivalent to multi-week structures. Per-TF in analyze().
+        self._min_pivot_spacing = getattr(self._cfg, 'min_pivot_spacing', 3)
 
     async def analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:
         # ── Regime gate ───────────────────────────────────────────────────
@@ -127,41 +145,44 @@ class HarmonicDetector(BaseStrategy):
         if atr == 0:
             return None
 
-        # Find pivot points
+        # Find pivot points (returns list of (bar_idx, price, kind))
         pivots = self._find_pivots(highs, lows, self._pivot_ord)
         if len(pivots) < 5:
             return None
 
         # Scan recent pivots for harmonic patterns
         recent_pivots = pivots[-8:]
+        current_price = float(closes[-1])
+        # P1-H6: D-proximity is ATR-scaled, not a fixed 2%.
+        # On a tight-ATR asset 2% is huge; on a wide-ATR asset 2% is tiny.
+        d_proximity = max(atr * 0.5, current_price * 0.005)
+
         for i in range(len(recent_pivots) - 4):
-            x, a, b, c, d_pivot = recent_pivots[i:i+5]
-            # FIX AUDIT-6: Pass atr to _check_all_patterns so _check_pattern
-            # uses the current symbol's ATR, not a stale value from a previous call.
+            window = recent_pivots[i:i+5]
+            prices = [p[1] for p in window]
+            bars   = [p[0] for p in window]
+            # P1-H5: require minimum bar spacing between each consecutive pivot
+            if any(bars[j+1] - bars[j] < self._min_pivot_spacing
+                   for j in range(len(bars) - 1)):
+                continue
+            x, a, b, c, d_pivot = prices
             result = self._check_all_patterns(x, a, b, c, d_pivot, atr)
             if result:
-                current_price = closes[-1]
-                # D point should be close to current price
-                if abs(current_price - result.d) / max(result.d, 1e-10) < 0.02:
+                # D point should be near current price (ATR-scaled proximity)
+                if abs(current_price - result.d) <= d_proximity:
                     return self._build_signal(symbol, result, atr, tf)
 
         return None
 
-    def _find_pivots(self, highs, lows, order: int) -> List[float]:
+    def _find_pivots(self, highs, lows, order: int) -> List[tuple]:
         """
         Find alternating high/low pivot points.
-        Returns list of pivot prices (strictly alternating H/L).
+        Returns list of (bar_index, price, kind) with kind in {'H', 'L'}.
 
-        FIX HARMONIC-1: Old version appended raw floats with no H/L tag.
-        Non-alternating sequences (e.g. two consecutive highs in a plateau)
-        caused _check_pattern to misidentify direction: is_bullish = a < x
-        assumed X=high,A=low but could get X=high,A=high instead.
-
-        Fix: tag each pivot as ('H', price) or ('L', price), enforce strict
-        alternation by only keeping a new pivot if its type differs from the
-        last appended, then strip tags before returning.
+        FIX HARMONIC-1: enforces strict H/L alternation.
+        P1-H5: returns bar index so min-spacing can be enforced by the caller.
         """
-        tagged = []   # List of ('H'|'L', price)
+        tagged = []   # List of (bar_idx, price, 'H'|'L')
         n = len(highs)
 
         for i in range(order, n - order):
@@ -175,44 +196,61 @@ class HarmonicDetector(BaseStrategy):
             )
 
             if is_swing_high:
-                if not tagged or tagged[-1][0] != 'H':
-                    tagged.append(('H', float(highs[i])))
+                if not tagged or tagged[-1][2] != 'H':
+                    tagged.append((i, float(highs[i]), 'H'))
                 elif highs[i] > tagged[-1][1]:
                     # Replace previous high with the more extreme one (cluster merge)
-                    tagged[-1] = ('H', float(highs[i]))
+                    tagged[-1] = (i, float(highs[i]), 'H')
             elif is_swing_low:
-                if not tagged or tagged[-1][0] != 'L':
-                    tagged.append(('L', float(lows[i])))
+                if not tagged or tagged[-1][2] != 'L':
+                    tagged.append((i, float(lows[i]), 'L'))
                 elif lows[i] < tagged[-1][1]:
-                    tagged[-1] = ('L', float(lows[i]))
+                    tagged[-1] = (i, float(lows[i]), 'L')
 
-        # Return raw prices — alternation is now guaranteed by construction
-        return [price for _, price in tagged]
+        return tagged
 
     def _check_all_patterns(self, x, a, b, c, d, atr: float = 0) -> Optional[HarmonicResult]:
-        """Check all enabled patterns for XABCD points"""
+        """
+        Check all enabled patterns and return the BEST match (lowest ratio error).
+        Previously returned the first match, which biased toward whichever pattern
+        came first in the name list when XAB windows overlapped (Gartley vs Bat).
+        """
         enabled_patterns = []
-        patterns_cfg = getattr(self._cfg, 'patterns', {})
+        patterns_cfg = getattr(self._cfg, 'patterns', None)
 
         for name in ['Gartley', 'Bat', 'Crab', 'Butterfly', 'Shark', 'Cypher']:
             cfg_key = name.lower()
-            if getattr(patterns_cfg, cfg_key, True):
+            # ConfigNode or dict-like; default True if absent
+            if patterns_cfg is None:
                 enabled_patterns.append(name)
+            else:
+                val = getattr(patterns_cfg, cfg_key, None)
+                if val is None and hasattr(patterns_cfg, 'get'):
+                    val = patterns_cfg.get(cfg_key, True)
+                if val is None:
+                    val = True
+                if val:
+                    enabled_patterns.append(name)
 
+        best: Optional[HarmonicResult] = None
+        best_err = float('inf')
         for pattern_name in enabled_patterns:
             result = self._check_pattern(pattern_name, x, a, b, c, d, atr)
-            if result:
-                return result
-
-        return None
+            if result is None:
+                continue
+            # Higher confidence ⇔ lower error (see confidence formula). Use
+            # (100 - confidence) as the error proxy for consistent comparison.
+            err = 100.0 - float(result.confidence)
+            if err < best_err:
+                best_err = err
+                best = result
+        return best
 
     def _check_pattern(self, name, x, a, b, c, d, atr: float = 0) -> Optional[HarmonicResult]:
         """Validate XABCD against pattern ratios"""
         ratios = PATTERN_RATIOS.get(name)
         if not ratios:
             return None
-
-        tol = self._tolerance
 
         # Determine direction from X->A move
         is_bullish = a < x   # X high, A low = bullish (long at D)
@@ -221,12 +259,31 @@ class HarmonicDetector(BaseStrategy):
         if not (is_bullish or is_bearish):
             return None
 
+        # P1-H7: monotonicity sanity check — with strict H/L alternation of
+        # pivots enforced, bullish XABCD must satisfy x>a<b>c<d (highs and
+        # lows alternate); bearish is the mirror. Reject silently otherwise.
+        if is_bullish and not (x > a and a < b and b > c and c < d):
+            return None
+        if is_bearish and not (x < a and a > b and b < c and c > d):
+            return None
+
+        # P1-H4: prefer absolute per-pattern tolerance (relative tol over-accepts
+        # large targets). Fall back to legacy relative tolerance if not listed.
+        abs_tol = _PATTERN_ABS_TOL.get(name)
+        rel_tol = self._tolerance
+
         def in_range(val, targets):
-            # P-3 FIX: guard against t <= 0 before dividing; a zero or negative
-            # target ratio (possible on near-zero price assets or data corruption)
-            # would produce ZeroDivisionError or a negative comparison that always
-            # passes, silently injecting a false harmonic match into trade decisions.
-            return any(t > 0 and abs(val - t) / t < tol for t in targets)
+            # P-3 FIX: guard t <= 0. Absolute tolerance path preferred.
+            for t in targets:
+                if t <= 0:
+                    continue
+                if abs_tol is not None:
+                    if abs(val - t) <= abs_tol:
+                        return True
+                else:
+                    if abs(val - t) / t < rel_tol:
+                        return True
+            return False
 
         # Calculate ratios
         xa = abs(a - x)
@@ -261,46 +318,58 @@ class HarmonicDetector(BaseStrategy):
             (bcd_ratio, ratios['BCD']),
             (xad_ratio, ratios['XAD']),
         ]:
+            positive_targets = [t for t in targets if t > 0]
+            if not positive_targets:
+                errors.append(0.0)
+                continue
             best_target = min(
-                (t for t in targets if t > 0),
+                positive_targets,
                 key=lambda t: abs(ratio - t) / t,
-                default=targets[0] if targets else 1.0,
             )
             errors.append(abs(ratio - best_target) / best_target if best_target > 0 else 0.0)
 
-        avg_error   = np.mean(errors)
-        confidence  = max(55, 85 - avg_error * 200)
+        avg_error   = float(np.mean(errors))
+        # P1-H3: previously capped at 85 via `max(55, ...)` then `min(88, ...)`
+        # at the caller — the 88 cap was dead. Widen the range to 60-92 so
+        # textbook patterns with near-zero error can actually score highly.
+        confidence  = max(60.0, min(92.0, 92.0 - avg_error * 250.0))
 
         direction   = "LONG" if is_bullish else "SHORT"
-        # ATR-based SL instead of flat percentage.
-        # Flat % (3-4%) was too wide on BTC ($2400-3200 on $80k) and
-        # too tight on volatile alts. ATR respects actual volatility.
-        # Gartley/Bat complete at tighter Fib levels → smaller ATR buffer.
-        # Crab/Butterfly/Shark/Cypher extend further → wider buffer needed.
-        # These are set by the caller (_build_signal passes atr).
-        # Fallback to flat % if atr not available (shouldn't happen in practice).
-        _atr_sl_mult = 0.8 if name in ('Gartley', 'Bat') else 1.2
-        # FIX AUDIT-6: Use the atr parameter passed from the caller instead of
-        # stale self._last_atr (which was only set in _build_signal, AFTER this
-        # method returns — meaning _check_pattern always used ATR from the
-        # previous symbol/call, or 0 on the first call).
-        _atr_val = atr
-        if _atr_val > 0:
-            _sl_dist = _atr_val * _atr_sl_mult
+        # ATR-based SL. For shallow patterns (Gartley/Bat) X is just barely
+        # past D, so SL = D ± k*ATR is sufficient. For extension patterns
+        # (Crab/Butterfly) X is further away and SL should sit beyond X.
+        _atr_val = atr if atr and atr > 0 else 0.0
+        is_extension = name in ('Crab', 'Butterfly')
+        if is_extension:
+            # Place SL beyond X with a 0.2*ATR buffer (or 0.5% of price fallback).
+            _buffer = _atr_val * 0.2 if _atr_val > 0 else d * 0.005
+            stop_loss = (x - _buffer) if direction == "LONG" else (x + _buffer)
         else:
-            _stop_pct = 0.03 if name in ('Gartley', 'Bat') else 0.04
-            _sl_dist = d * _stop_pct
+            _atr_sl_mult = 0.8 if name in ('Gartley', 'Bat') else 1.0
+            if _atr_val > 0:
+                _sl_dist = _atr_val * _atr_sl_mult
+            else:
+                _sl_dist = d * (0.03 if name in ('Gartley', 'Bat') else 0.04)
+            stop_loss = (d - _sl_dist) if direction == "LONG" else (d + _sl_dist)
 
+        # Entry zone aligned with D-proximity (ATR-scaled band ≈ 0.3 ATR)
+        _ez_half = (_atr_val * 0.3) if _atr_val > 0 else d * 0.005
+        entry_zone = (d - _ez_half, d + _ez_half)
+        # Targets: classic harmonic uses Fib retracements of AD leg for more
+        # realistic TPs. TP1 = 0.382 of AD retrace, TP2 = 0.618 of AD retrace.
+        ad_leg = abs(d - a)
         if direction == "LONG":
-            entry_zone = (d * (1 - 0.005), d * (1 + 0.005))
-            stop_loss  = d - _sl_dist
-            tp1        = c
-            tp2        = a
+            tp1 = d + ad_leg * 0.382
+            tp2 = d + ad_leg * 0.618
         else:
-            entry_zone = (d * (1 - 0.005), d * (1 + 0.005))
-            stop_loss  = d + _sl_dist
-            tp1        = c
-            tp2        = a
+            tp1 = d - ad_leg * 0.382
+            tp2 = d - ad_leg * 0.618
+
+        # Safety: guarantee TPs stay on the correct side of entry
+        if direction == "LONG" and (tp1 <= d or tp2 <= d):
+            return None
+        if direction == "SHORT" and (tp1 >= d or tp2 >= d):
+            return None
 
         return HarmonicResult(
             pattern=name, direction=direction,
@@ -312,9 +381,6 @@ class HarmonicDetector(BaseStrategy):
         )
 
     def _build_signal(self, symbol, result: HarmonicResult, atr, tf) -> Optional[SignalResult]:
-        # Store ATR so _check_pattern can use it for ATR-based SL.
-        # This is set before the result is used so _last_atr is always fresh.
-        self._last_atr = atr
         current = result.d
         risk    = abs(current - result.stop_loss)
         if risk == 0:
@@ -327,11 +393,12 @@ class HarmonicDetector(BaseStrategy):
         if rr < cfg_min_rr("swing"):
             return None
 
+        # P1-H3: confidence cap removed (was min(88, ...)). Use raw result value.
         return SignalResult(
             symbol=symbol,
             direction=SignalDirection.LONG if result.direction == "LONG" else SignalDirection.SHORT,
             strategy=f"{self.name}:{result.pattern}",
-            confidence=min(88, result.confidence),
+            confidence=float(result.confidence),
             entry_low=result.entry_zone[0], entry_high=result.entry_zone[1],
             stop_loss=result.stop_loss,
             tp1=result.tp1, tp2=result.tp2, tp3=tp3,
@@ -341,6 +408,12 @@ class HarmonicDetector(BaseStrategy):
                 f"✅ All 4 Fibonacci ratios validated",
                 f"📐 XABCD: {result.x:.4f} → {result.a:.4f} → {result.b:.4f} → {result.c:.4f} → {result.d:.4f}",
             ],
-            raw_data={'pattern': result.pattern, 'x': result.x, 'a': result.a,
-                      'b': result.b, 'c': result.c, 'd': result.d}
+            raw_data={
+                'pattern': result.pattern,
+                'harmonic_pattern': result.pattern,   # governance lineage
+                'harmonic_tf': tf,
+                'harmonic_direction': result.direction,
+                'x': result.x, 'a': result.a,
+                'b': result.b, 'c': result.c, 'd': result.d,
+            }
         )
