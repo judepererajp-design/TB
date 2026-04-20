@@ -135,7 +135,15 @@ async def build_market_state(symbol: str, direction: str) -> Dict:
 
         current_price = closes[-1]
 
+        # Pre-compute volumes so the liquidity sweep-confirmation gate
+        # (which requires a 20-bar average volume baseline) sees the
+        # same array the energy model uses.
+        volumes = np.array([float(c[5]) for c in ohlcv])
+
         # --- Liquidity Reaction ---
+        # AUDIT FIX: pass `volumes` so the new `_volume_gate` path in
+        # detect_reaction() actually fires on the production caller.
+        # Without this the sweep volume requirement was dormant here.
         reaction = liq_analyzer.detect_reaction(
             highs=highs,
             lows=lows,
@@ -144,6 +152,7 @@ async def build_market_state(symbol: str, direction: str) -> Dict:
             current_price=current_price,
             direction=direction,
             atr=atr,
+            volumes=volumes,
         )
 
         # --- Orderbook Imbalance ---
@@ -152,7 +161,6 @@ async def build_market_state(symbol: str, direction: str) -> Dict:
         )
 
         # --- Energy Model ---
-        volumes = np.array([float(c[5]) for c in ohlcv])
         energy = compute_energy(highs, lows, closes, volumes)
 
         # --- Liquidation Heatmap (optional) ---

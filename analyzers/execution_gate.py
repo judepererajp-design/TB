@@ -853,7 +853,12 @@ class ExecutionQualityGate:
     # a caller passes the raw fractional form (0.0005) the thresholds
     # below will never fire; if they pass a wildly out-of-range value
     # (± > 5 pp) it's almost certainly a unit error on the upstream.
+    # AUDIT FIX: additionally flag suspected fractional form — a
+    # non-zero funding whose magnitude is below this threshold is
+    # vanishingly rare in pp (would be <0.0001 %); it is the
+    # fingerprint of a fractional (×100 missing) upstream.
     _FUNDING_SUSPECT_ABS_PP = 5.0
+    _FUNDING_FRACTIONAL_SUSPECT_ABS = 1e-4   # |f| below this but > 0 ⇒ likely fractional
     _funding_unit_warned: bool = False
 
     @staticmethod
@@ -879,17 +884,25 @@ class ExecutionQualityGate:
         # derivatives.py contract (percentage points).  We don't raise —
         # a wrong-unit caller shouldn't hard-stop gating — but we warn
         # exactly once per process so the issue is visible.
-        if (
-            abs(funding) > ExecutionQualityGate._FUNDING_SUSPECT_ABS_PP
-            and not ExecutionQualityGate._funding_unit_warned
-        ):
+        # Two failure modes are both flagged:
+        #   1. |f| > 5 pp   — almost certainly a percentage mistake upstream
+        #   2. 0 < |f| < 1e-4 pp — almost certainly a fractional fundingRate
+        #      that never got the ×100 scale applied (derivatives.py
+        #      guarantees pp, so a legitimately microscopic funding is
+        #      exceedingly rare).
+        _abs_funding = abs(funding)
+        _suspect_high = _abs_funding > ExecutionQualityGate._FUNDING_SUSPECT_ABS_PP
+        _suspect_low = (
+            0.0 < _abs_funding < ExecutionQualityGate._FUNDING_FRACTIONAL_SUSPECT_ABS
+        )
+        if (_suspect_high or _suspect_low) and not ExecutionQualityGate._funding_unit_warned:
             ExecutionQualityGate._funding_unit_warned = True
+            _mode = "pp-out-of-range" if _suspect_high else "fractional-not-scaled"
             logger.warning(
-                "ExecutionGate: funding_rate=%s is outside the "
-                "±%.1f percentage-point range expected by "
-                "derivatives.py (0.05 == 0.05%%). Likely unit mismatch "
-                "(fractional vs. pp) at the call site.",
-                funding, ExecutionQualityGate._FUNDING_SUSPECT_ABS_PP,
+                "ExecutionGate: funding_rate=%s appears to violate the "
+                "percentage-point contract expected by derivatives.py "
+                "(0.05 == 0.05%%) — suspected mode: %s",
+                funding, _mode,
             )
         if direction == "LONG":
             if funding <= -0.01:

@@ -197,6 +197,12 @@ class MarketStateEngine:
 
         Returns None when the call times out or the breaker is tripped.
         Callers must treat None as "data unavailable" and abort compute.
+
+        AUDIT FIX: the consecutive-timeout counter is NOT reset on
+        success here.  Otherwise a compute cycle that times out on the
+        1h fetch but succeeds on the 15m fetch would silently clear the
+        counter and never trip the breaker.  ``_compute_state`` calls
+        ``_reset_subcall_breaker()`` once, after all subcalls succeed.
         """
         now = time.time()
         if now < self._cb_tripped_until:
@@ -211,8 +217,6 @@ class MarketStateEngine:
                 api.fetch_ohlcv(symbol, tf, limit=limit),
                 timeout=self._SUBCALL_TIMEOUT,
             )
-            # Success → reset consecutive-timeout counter
-            self._subcall_timeouts = 0
             return data
         except asyncio.TimeoutError:
             self._subcall_timeouts += 1
@@ -238,6 +242,10 @@ class MarketStateEngine:
                 symbol, tf, e,
             )
             return None
+
+    def _reset_subcall_breaker(self) -> None:
+        """Reset the consecutive-timeout counter after a full successful cycle."""
+        self._subcall_timeouts = 0
 
     # ─── Public API ────────────────────────────────────────────────────
 
@@ -343,6 +351,11 @@ class MarketStateEngine:
 
         if not ohlcv_1h or len(ohlcv_1h) < 50:
             return
+
+        # Both subcalls returned real data — only now is it safe to
+        # reset the consecutive-timeout counter.  Resetting per-call
+        # would mask a persistent single-timeframe failure.
+        self._reset_subcall_breaker()
 
         closes_1h = np.array([float(c[4]) for c in ohlcv_1h])
         highs_1h  = np.array([float(c[2]) for c in ohlcv_1h])

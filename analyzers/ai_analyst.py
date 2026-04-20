@@ -464,13 +464,17 @@ class AIAnalyst:
                 f"{_scrubbed_response}\n--- END RESPONSE ---"
             )
             # Record to structured decision history
+            # AUDIT FIX: scrub credential-shaped tokens from the summary
+            # before it lands in the in-memory decision history.  The
+            # history is exposed via get_decision_history() → /ai status
+            # so unscrubbed content could leak a secret downstream.
             self._decision_history.append({
                 "ts": time.time(),
                 "label": call_label,
                 "model": use_model,
                 "latency_ms": int(elapsed * 1000),
                 "outcome": "ok",
-                "summary": (raw or "")[:120],
+                "summary": _scrub_secrets((raw or "")[:120]),
             })
             return raw
 
@@ -501,7 +505,7 @@ class AIAnalyst:
                 "model": use_model,
                 "latency_ms": int((time.time() - t0) * 1000),
                 "outcome": "error",
-                "summary": str(e)[:120],
+                "summary": _scrub_secrets(str(e))[:120],
             })
             return None
 
