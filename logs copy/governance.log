@@ -1,0 +1,16 @@
+2026-04-20 17:28:30 | Performance tracker loaded 0 strategy records (0 with persisted adaptive state)
+2026-04-20 17:28:30 | ⚙️  adaptive_params: no persisted state — using defaults
+2026-04-20 17:28:45 | 📊 Performance tracker registered strategy: SmartMoneyConcepts
+2026-04-20 17:28:45 | 📊 Performance tracker registered strategy: InstitutionalBreakout
+2026-04-20 17:28:45 | 📊 Performance tracker registered strategy: ExtremeReversal
+2026-04-20 17:28:45 | 📊 Performance tracker registered strategy: MeanReversion
+2026-04-20 17:28:45 | 📊 Performance tracker registered strategy: PriceAction
+2026-04-20 17:28:45 | 📊 Performance tracker registered strategy: Momentum
+2026-04-20 17:28:45 | 📊 Performance tracker registered strategy: Ichimoku
+2026-04-20 17:28:45 | 📊 Performance tracker registered strategy: ElliottWave
+2026-04-20 17:28:45 | 📊 Performance tracker registered strategy: FundingRateArb
+2026-04-20 17:28:45 | 📊 Performance tracker registered strategy: RangeScalper
+2026-04-20 17:28:45 | 📊 Performance tracker registered strategy: WyckoffAccDist
+2026-04-20 17:28:45 | 📊 Performance tracker registered strategy: HarmonicPattern
+2026-04-20 17:28:45 | 📊 Performance tracker registered strategy: GeometricPattern
+2026-04-20 17:30:05 | ⚙️  param_tuner: no market-state data yet — skipping
