@@ -28,3 +28,10 @@ def test_engine_counter_trend_hard_reject_requires_bearish_weekly_confirmation(m
 
     monkeypatch.setattr("analyzers.htf_guardrail.htf_guardrail._weekly_bias", "BEARISH")
     assert should_hard_reject_counter_trend_signal("SmartMoneyConcepts", "LONG", "BEAR_TREND") is True
+
+
+def test_engine_counter_trend_hard_reject_skips_strategies_not_in_list(monkeypatch):
+    from core.counter_trend_guard import should_hard_reject_counter_trend_signal
+
+    monkeypatch.setattr("analyzers.htf_guardrail.htf_guardrail._weekly_bias", "BULLISH")
+    assert should_hard_reject_counter_trend_signal("PriceAction", "SHORT", "BULL_TREND") is False
