@@ -209,3 +209,68 @@ def test_phase2_geometric_uses_shared_clamp():
         assert GeometricPatterns._clamp_projection(raw, entry, atr) == \
                clamp_projection(raw, entry, atr)
 
+
+def test_phase3_wyckoff_spring_recovery_volume_counts_as_confirmation():
+    """Phase-3: next-bar recovery volume must feed downstream volume_confirms."""
+    import inspect
+    from patterns.wyckoff import WyckoffAnalyzer
+
+    a = WyckoffAnalyzer()
+    a._vol_sensitivity = 1.1
+    highs = [101.0] * 26
+    lows = [99.5] * 26
+    closes = [100.0] * 26
+    volumes = [100.0] * 26
+
+    lows[24] = 98.0
+    closes[24] = 99.0          # no same-bar recovery
+    closes[25] = 100.4         # next-bar recovery
+    volumes[24] = 110.0        # no event-bar spike
+    volumes[25] = 120.0        # recovery-bar spike at 0.8 × sensitivity
+
+    spring = a._detect_spring(
+        highs, lows, closes, volumes,
+        range_low=99.5, range_size=1.5, avg_volume=100.0, atr=1.0,
+    )
+    assert spring is not None
+    assert spring["volume_spike"] is False
+    assert spring["recovery_volume_spike"] is True
+    assert spring["recovery_bar"] == 25
+    assert spring["recovery_close"] == pytest.approx(100.4)
+    src = inspect.getsource(type(a).analyze)
+    assert "spring['volume_spike'] or spring.get('recovery_volume_spike')" in src
+
+
+def test_phase3_wyckoff_same_bar_recovery_does_not_fake_recovery_spike():
+    """Phase-3: same-bar recovery should not double-count as recovery-bar volume."""
+    from patterns.wyckoff import WyckoffAnalyzer
+
+    a = WyckoffAnalyzer()
+    a._vol_sensitivity = 1.0
+    highs = [101.0] * 26
+    lows = [99.5] * 26
+    closes = [100.0] * 26
+    volumes = [100.0] * 26
+
+    lows[24] = 98.0
+    closes[24] = 100.4         # same-bar recovery
+    volumes[24] = 120.0        # event-bar spike only
+
+    spring = a._detect_spring(
+        highs, lows, closes, volumes,
+        range_low=99.5, range_size=1.5, avg_volume=100.0, atr=1.0,
+    )
+    assert spring is not None
+    assert spring["volume_spike"] is True
+    assert spring["recovery_volume_spike"] is False
+    assert spring["recovery_bar"] is None
+    assert spring["recovery_close"] == pytest.approx(100.4)
+
+
+def test_phase3_wyckoff_utad_rejection_volume_wired_into_confirmation():
+    """Phase-3: UTAD next-bar rejection volume must also wire into volume_confirms."""
+    import inspect
+    from patterns.wyckoff import WyckoffAnalyzer
+
+    src = inspect.getsource(WyckoffAnalyzer.analyze)
+    assert "utad['volume_spike'] or utad.get('rejection_volume_spike')" in src

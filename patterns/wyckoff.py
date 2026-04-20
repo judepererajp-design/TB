@@ -220,7 +220,9 @@ class WyckoffAnalyzer:
                 key_level=range_low,
                 notes=notes,
                 spring_detected=True,
-                volume_confirms=spring['volume_spike'],
+                volume_confirms=bool(
+                    spring['volume_spike'] or spring.get('recovery_volume_spike')
+                ),
                 volume_contraction_in_range=vol_contraction,
                 dryup_before_event=dryup_before_evt,
                 range_high=range_high,
@@ -288,7 +290,9 @@ class WyckoffAnalyzer:
                 key_level=range_high,
                 notes=notes,
                 utad_detected=True,
-                volume_confirms=utad['volume_spike'],
+                volume_confirms=bool(
+                    utad['volume_spike'] or utad.get('rejection_volume_spike')
+                ),
                 volume_contraction_in_range=vol_contraction,
                 dryup_before_event=dryup_before_evt,
                 range_high=range_high,
@@ -554,20 +558,21 @@ class WyckoffAnalyzer:
                     # Default to False when the recovery is same-bar (no next
                     # bar to evaluate) so the caller can still rely on the
                     # spring-bar spike alone.
-                    recovery_bar = i if recovered_same else (i + 1)
+                    recovery_bar = (i + 1) if (not recovered_same and recovered_next) else None
                     recovery_vol_spike = False
-                    if 0 <= recovery_bar < len(volumes):
+                    if recovery_bar is not None and 0 <= recovery_bar < len(volumes):
                         # Require a slightly lower bar on the recovery —
                         # climax is most common on the stop-hunt itself.
                         recovery_vol_spike = (
                             volumes[recovery_bar] > avg_volume * self._vol_sensitivity
                             * self._RECOVERY_VOL_FACTOR
                         )
+                    recovery_close = closes[recovery_bar] if recovery_bar is not None else closes[i]
                     return {
                         'bar': i,
                         'spring_low': float(lows[i]),
-                        'recovery_close': float(closes[i]),
-                        'recovery_bar': int(recovery_bar),
+                        'recovery_close': float(recovery_close),
+                        'recovery_bar': (int(recovery_bar) if recovery_bar is not None else None),
                         'volume_spike': bool(volume_spike),
                         'recovery_volume_spike': bool(recovery_vol_spike),
                     }
@@ -592,18 +597,19 @@ class WyckoffAnalyzer:
                                  closes[i + 1] < range_high - rej_threshold)
                 if rejected_same or rejected_next:
                     volume_spike = volumes[i] > avg_volume * self._vol_sensitivity
-                    rejection_bar = i if rejected_same else (i + 1)
+                    rejection_bar = (i + 1) if (not rejected_same and rejected_next) else None
                     rejection_vol_spike = False
-                    if 0 <= rejection_bar < len(volumes):
+                    if rejection_bar is not None and 0 <= rejection_bar < len(volumes):
                         rejection_vol_spike = (
                             volumes[rejection_bar] > avg_volume * self._vol_sensitivity
                             * self._RECOVERY_VOL_FACTOR
                         )
+                    rejection_close = closes[rejection_bar] if rejection_bar is not None else closes[i]
                     return {
                         'bar': i,
                         'utad_high': float(highs[i]),
-                        'rejection_close': float(closes[i]),
-                        'rejection_bar': int(rejection_bar),
+                        'rejection_close': float(rejection_close),
+                        'rejection_bar': (int(rejection_bar) if rejection_bar is not None else None),
                         'volume_spike': bool(volume_spike),
                         'rejection_volume_spike': bool(rejection_vol_spike),
                     }
