@@ -9,6 +9,10 @@ from scanner.scanner import Scanner, SymbolState, Tier
 @pytest.mark.asyncio
 async def test_check_whale_activity_resets_missing_snapshot_sides_and_persists(monkeypatch):
     scanner = Scanner()
+    scanner._scan_cfg.whale_detection.enabled = True
+    scanner._scan_cfg.whale_detection.min_order_usd = 75_000
+    scanner._scan_cfg.whale_detection.vol_threshold_frac = 0.005
+    scanner._scan_cfg.whale_detection.cooldown_minutes = 45
     scanner._symbols["BTC/USDT"] = SymbolState(
         symbol="BTC/USDT",
         tier=Tier.TIER1,
@@ -38,6 +42,18 @@ async def test_check_whale_activity_resets_missing_snapshot_sides_and_persists(m
 @pytest.mark.asyncio
 async def test_check_promotions_persists_temp_exclusion_state(monkeypatch):
     scanner = Scanner()
+    scanner._scan_cfg.auto_promotion.enabled = True
+    scanner._scan_cfg.auto_promotion.demotion_minutes = 60
+    scanner._scan_cfg.auto_promotion.tier3_exile_minutes = 180
+    scanner._scan_cfg.auto_promotion.cooldown_hours = 24
+    scanner._scan_cfg.auto_promotion.volume_spike_multiplier = 3.0
+    scanner._scan_cfg.auto_promotion.min_volume_for_promotion = 500_000
+    scanner._scan_cfg.tier1.enabled = True
+    scanner._scan_cfg.tier2.enabled = True
+    scanner._scan_cfg.tier3.enabled = True
+    scanner._scan_cfg.tier1.min_volume_24h = 5_000_000
+    scanner._scan_cfg.tier2.min_volume_24h = 1_000_000
+    scanner._scan_cfg.tier3.min_volume_24h = 200_000
     scanner._symbols["ETH/USDT"] = SymbolState(
         symbol="ETH/USDT",
         tier=Tier.TIER3,
