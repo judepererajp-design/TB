@@ -17,7 +17,23 @@ import dataclasses as _dc
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Tuple
 
-from config.constants import Portfolio
+from config.constants import (
+    BTCDominance,
+    Correlation,
+    EnergyModel,
+    Equilibrium,
+    InstitutionalFlow,
+    LeverageMapper,
+    Liquidation,
+    MarketBrain,
+    NoTradeZones,
+    OrderFlow,
+    ParabolicDetector,
+    Portfolio,
+    Sentiment,
+    VolatilityStructure,
+    Volume,
+)
 
 # ══════════════════════════════════════════════════════════════
 # VALIDATION BOUNDARY CONSTANTS
@@ -1049,6 +1065,209 @@ def _build_dataclass(cls: type, data: dict) -> Any:
     return cls(**data)
 
 
+def validate_analyzer_constants() -> List[str]:
+    """Cross-class invariants on the PR-1 analyzer-infrastructure constants.
+
+    Catches drift such as:
+    * EnergyModel component weights not summing to 1.0
+    * NoTradeZones ATR ratios out of monotonic order
+    * Correlation beta clamp with min >= max
+    * Volatility percentile ordering
+    * Sentiment API bounds reversed
+
+    Called from :func:`validate_config` so any regression in
+    ``config/constants.py`` surfaces at startup.
+    """
+    errors: List[str] = []
+
+    # ── EnergyModel weights must sum to 1.0 (±0.001) ──────────────
+    w_sum = (
+        EnergyModel.WEIGHT_MOMENTUM
+        + EnergyModel.WEIGHT_PARTICIPATION
+        + EnergyModel.WEIGHT_POSITIONING
+        + EnergyModel.WEIGHT_FLOW
+    )
+    if abs(w_sum - 1.0) > 0.001:
+        errors.append(
+            f"EnergyModel: component weights must sum to 1.0 (got {w_sum:.4f})"
+        )
+    if not (
+        EnergyModel.EXHAUSTED
+        < EnergyModel.LOW_ENERGY
+        < EnergyModel.HIGH_ENERGY
+    ):
+        errors.append(
+            "EnergyModel: thresholds must be ordered EXHAUSTED < LOW_ENERGY < HIGH_ENERGY "
+            f"(got {EnergyModel.EXHAUSTED} / {EnergyModel.LOW_ENERGY} / {EnergyModel.HIGH_ENERGY})"
+        )
+
+    # ── MarketBrain confluence tiers ──────────────────────────────
+    if MarketBrain.CONFLUENCE_MODERATE_MIN >= MarketBrain.CONFLUENCE_STRONG_MIN:
+        errors.append(
+            "MarketBrain: CONFLUENCE_MODERATE_MIN must be < CONFLUENCE_STRONG_MIN"
+        )
+    if MarketBrain.CONFLUENCE_MODERATE_PTS > MarketBrain.CONFLUENCE_STRONG_PTS:
+        errors.append(
+            "MarketBrain: CONFLUENCE_MODERATE_PTS must be ≤ CONFLUENCE_STRONG_PTS"
+        )
+
+    # ── NoTradeZones ATR ratios must be positive and monotonic ────
+    for attr in (
+        "ATR_BLOCK_RATIO_CHOPPY",
+        "ATR_BLOCK_RATIO_TREND",
+        "ATR_BLOCK_RATIO_VOLATILE",
+    ):
+        v = getattr(NoTradeZones, attr)
+        if v <= 0:
+            errors.append(f"NoTradeZones.{attr}: must be > 0 (got {v})")
+    if not (
+        NoTradeZones.ATR_BLOCK_RATIO_CHOPPY
+        <= NoTradeZones.ATR_BLOCK_RATIO_TREND
+        <= NoTradeZones.ATR_BLOCK_RATIO_VOLATILE
+    ):
+        errors.append(
+            "NoTradeZones: ATR block ratios must be non-decreasing CHOPPY ≤ TREND ≤ VOLATILE"
+        )
+    if NoTradeZones.CONFIRMATION_BARS < 1:
+        errors.append(
+            f"NoTradeZones.CONFIRMATION_BARS: must be ≥ 1 (got {NoTradeZones.CONFIRMATION_BARS})"
+        )
+
+    # ── Correlation beta clamp ────────────────────────────────────
+    if Correlation.BETA_CLAMP_MIN >= Correlation.BETA_CLAMP_MAX:
+        errors.append(
+            "Correlation: BETA_CLAMP_MIN must be < BETA_CLAMP_MAX "
+            f"(got {Correlation.BETA_CLAMP_MIN} / {Correlation.BETA_CLAMP_MAX})"
+        )
+    if not (0.0 <= Correlation.MODERATE_THRESHOLD < Correlation.STRONG_THRESHOLD <= 1.0):
+        errors.append(
+            "Correlation: thresholds must satisfy 0 ≤ MODERATE < STRONG ≤ 1 "
+            f"(got {Correlation.MODERATE_THRESHOLD} / {Correlation.STRONG_THRESHOLD})"
+        )
+
+    # ── ParabolicDetector exhaustion weights sanity ───────────────
+    if ParabolicDetector.EXHAUSTION_MIN_SIGNALS < 1:
+        errors.append("ParabolicDetector.EXHAUSTION_MIN_SIGNALS: must be ≥ 1")
+    if ParabolicDetector.MIN_PRICE_USD <= 0:
+        errors.append("ParabolicDetector.MIN_PRICE_USD: must be > 0")
+
+    # ── Sentiment API bounds ──────────────────────────────────────
+    if Sentiment.API_MIN >= Sentiment.API_MAX:
+        errors.append(
+            f"Sentiment: API_MIN ({Sentiment.API_MIN}) must be < API_MAX ({Sentiment.API_MAX})"
+        )
+    if not (0.0 < Sentiment.EWMA_DECAY < 1.0):
+        errors.append(
+            f"Sentiment: EWMA_DECAY must be in (0, 1) (got {Sentiment.EWMA_DECAY})"
+        )
+
+    # ── BTCDominance rise/fall monotonic ─────────────────────────
+    if not (
+        BTCDominance.SHARP_FALL_PCT
+        < BTCDominance.MODERATE_FALL_PCT
+        < 0.0
+        < BTCDominance.MODERATE_RISE_PCT
+        < BTCDominance.SHARP_RISE_PCT
+    ):
+        errors.append(
+            "BTCDominance: rise/fall thresholds must satisfy "
+            "SHARP_FALL < MODERATE_FALL < 0 < MODERATE_RISE < SHARP_RISE"
+        )
+    if BTCDominance.WINDOW_TOLERANCE_SECS <= 0:
+        errors.append("BTCDominance.WINDOW_TOLERANCE_SECS: must be > 0")
+    if BTCDominance.HISTORY_MAX_POINTS <= 0:
+        errors.append("BTCDominance.HISTORY_MAX_POINTS: must be > 0")
+
+    # ── Equilibrium dead-zone ordering ───────────────────────────
+    if Equilibrium.DEAD_ZONE_PCT_CHOPPY >= Equilibrium.DEAD_ZONE_PCT_DEFAULT:
+        errors.append(
+            "Equilibrium: DEAD_ZONE_PCT_CHOPPY should be < DEAD_ZONE_PCT_DEFAULT"
+        )
+    if not (0.0 < Equilibrium.MIN_CHOP_FOR_RULES <= 1.0):
+        errors.append("Equilibrium.MIN_CHOP_FOR_RULES: must be in (0, 1]")
+
+    # ── OrderFlow sanity ──────────────────────────────────────────
+    if not (0 <= OrderFlow.CVD_RESET_UTC_HOUR <= 23):
+        errors.append("OrderFlow.CVD_RESET_UTC_HOUR: must be in [0, 23]")
+    if not (0.0 < OrderFlow.ABSORPTION_DELTA_RATIO <= 1.0):
+        errors.append("OrderFlow.ABSORPTION_DELTA_RATIO: must be in (0, 1]")
+    if OrderFlow.BLOCK_TRADE_USD_MIN <= 0:
+        errors.append("OrderFlow.BLOCK_TRADE_USD_MIN: must be > 0")
+
+    # ── LeverageMapper ordering ──────────────────────────────────
+    if LeverageMapper.EFFECTIVE_LEVERAGE_HIGH >= LeverageMapper.EFFECTIVE_LEVERAGE_EXTREME:
+        errors.append(
+            "LeverageMapper: EFFECTIVE_LEVERAGE_HIGH must be < EFFECTIVE_LEVERAGE_EXTREME"
+        )
+    if LeverageMapper.CASCADE_MIN_USD <= 0:
+        errors.append("LeverageMapper.CASCADE_MIN_USD: must be > 0")
+
+    # ── Liquidation timings ──────────────────────────────────────
+    for attr in (
+        "OI_REFRESH_SECS",
+        "LIQ_REFRESH_SECS",
+        "DEDUP_BUFFER_SIZE",
+        "DEDUP_TTL_SECS",
+        "REPLAY_WINDOW_SECS",
+    ):
+        v = getattr(Liquidation, attr)
+        if v <= 0:
+            errors.append(f"Liquidation.{attr}: must be > 0 (got {v})")
+
+    # ── InstitutionalFlow intervals ──────────────────────────────
+    if not (
+        InstitutionalFlow.FAST_INTERVAL_SECS
+        < InstitutionalFlow.SLOW_INTERVAL_SECS
+        < InstitutionalFlow.COT_INTERVAL_SECS
+    ):
+        errors.append(
+            "InstitutionalFlow: intervals must be ordered FAST < SLOW < COT"
+        )
+    if (
+        InstitutionalFlow.PCTILE_30D_WINDOW
+        >= InstitutionalFlow.PCTILE_90D_WINDOW
+    ):
+        errors.append(
+            "InstitutionalFlow: PCTILE_30D_WINDOW must be < PCTILE_90D_WINDOW"
+        )
+
+    # ── Volume defaults ──────────────────────────────────────────
+    if Volume.LOG_FLOOR <= 0:
+        errors.append("Volume.LOG_FLOOR: must be > 0")
+    if Volume.SESSION_BUCKETS <= 0:
+        errors.append("Volume.SESSION_BUCKETS: must be > 0")
+    if Volume.BASELINE_BARS < Volume.MIN_SAMPLES:
+        errors.append("Volume: BASELINE_BARS must be ≥ MIN_SAMPLES")
+
+    # ── VolatilityStructure percentiles ordered ──────────────────
+    if not (
+        0
+        < VolatilityStructure.VOL_EXTREME_LOW_PCTILE
+        < VolatilityStructure.VOL_LOW_PCTILE
+        < VolatilityStructure.VOL_HIGH_PCTILE
+        < VolatilityStructure.VOL_EXTREME_HIGH_PCTILE
+        < 100
+    ):
+        errors.append(
+            "VolatilityStructure: percentiles must satisfy "
+            "0 < EXTREME_LOW < LOW < HIGH < EXTREME_HIGH < 100"
+        )
+    g = (
+        VolatilityStructure.GARCH_OMEGA,
+        VolatilityStructure.GARCH_ALPHA,
+        VolatilityStructure.GARCH_BETA,
+    )
+    if any(v < 0 for v in g):
+        errors.append("VolatilityStructure: GARCH coefficients must be ≥ 0")
+    if VolatilityStructure.GARCH_ALPHA + VolatilityStructure.GARCH_BETA >= 1.0:
+        errors.append(
+            "VolatilityStructure: GARCH α + β must be < 1 for a stationary process "
+            f"(got {VolatilityStructure.GARCH_ALPHA + VolatilityStructure.GARCH_BETA:.3f})"
+        )
+
+    return errors
+
+
 def validate_config(raw: dict) -> Tuple[bool, List[str]]:
     """Validate a raw settings dict against all section schemas.
 
@@ -1085,5 +1304,11 @@ def validate_config(raw: dict) -> Tuple[bool, List[str]]:
             all_errors.extend(instance.validate())
         except (TypeError, ValueError) as exc:
             all_errors.append(f"{section_name}: failed to parse — {exc}")
+
+    # Cross-cutting: validate invariants of the PR-1 analyzer-infrastructure
+    # constants (EnergyModel weights, ordering, bounds, etc.). These are
+    # Python-level defaults not backed by YAML, but regressions here would
+    # silently mis-configure the analyzer layer.
+    all_errors.extend(validate_analyzer_constants())
 
     return (len(all_errors) == 0, all_errors)

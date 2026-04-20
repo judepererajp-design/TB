@@ -174,6 +174,79 @@ class MarketStateEngine:
         # State history for transition detection
         self._state_history: List[Tuple[float, MarketState]] = []
 
+        # AUDIT FIX (PR-2): circuit breaker on sub-call timeouts.  When
+        # the exchange is misbehaving a naive `await api.fetch_ohlcv`
+        # can hang indefinitely, freezing every consumer downstream.
+        # Each sub-call is wrapped in ``asyncio.wait_for`` with
+        # ``_SUBCALL_TIMEOUT`` seconds; after ``_CB_TRIP_THRESHOLD``
+        # consecutive timeouts the engine serves the last known state
+        # for ``_CB_COOLDOWN_SECS`` instead of re-attempting.
+        self._subcall_timeouts: int = 0
+        self._cb_tripped_until: float = 0.0
+
+    # Circuit-breaker tunables — intentionally module-local constants
+    # so a future PR can promote them to config without widening PR-2.
+    _SUBCALL_TIMEOUT: float = 10.0     # per api.fetch_ohlcv() budget
+    _CB_TRIP_THRESHOLD: int = 3        # consecutive timeouts before tripping
+    _CB_COOLDOWN_SECS: float = 120.0   # serve stale state for this long after trip
+
+    async def _fetch_ohlcv_guarded(
+        self, symbol: str, tf: str, limit: int
+    ) -> Optional[list]:
+        """``api.fetch_ohlcv`` wrapped in a per-call timeout + breaker.
+
+        Returns None when the call times out or the breaker is tripped.
+        Callers must treat None as "data unavailable" and abort compute.
+
+        AUDIT FIX: the consecutive-timeout counter is NOT reset on
+        success here.  Otherwise a compute cycle that times out on the
+        1h fetch but succeeds on the 15m fetch would silently clear the
+        counter and never trip the breaker.  ``_compute_state`` calls
+        ``_reset_subcall_breaker()`` once, after all subcalls succeed.
+        """
+        now = time.time()
+        if now < self._cb_tripped_until:
+            logger.debug(
+                "MarketStateEngine: subcall breaker tripped "
+                "(%.0fs remaining) — skipping %s %s",
+                self._cb_tripped_until - now, symbol, tf,
+            )
+            return None
+        try:
+            data = await asyncio.wait_for(
+                api.fetch_ohlcv(symbol, tf, limit=limit),
+                timeout=self._SUBCALL_TIMEOUT,
+            )
+            return data
+        except asyncio.TimeoutError:
+            self._subcall_timeouts += 1
+            logger.warning(
+                "MarketStateEngine: api.fetch_ohlcv(%s, %s) timed out "
+                "after %.1fs (%d/%d consecutive)",
+                symbol, tf, self._SUBCALL_TIMEOUT,
+                self._subcall_timeouts, self._CB_TRIP_THRESHOLD,
+            )
+            if self._subcall_timeouts >= self._CB_TRIP_THRESHOLD:
+                self._cb_tripped_until = now + self._CB_COOLDOWN_SECS
+                logger.error(
+                    "MarketStateEngine: subcall breaker tripped — "
+                    "serving last-known state for %.0fs",
+                    self._CB_COOLDOWN_SECS,
+                )
+            return None
+        except Exception as e:
+            # Non-timeout errors should not arm the breaker but still
+            # propagate as "no data" to keep the compute-path uniform.
+            logger.warning(
+                "MarketStateEngine: api.fetch_ohlcv(%s, %s) failed: %s",
+                symbol, tf, e,
+            )
+            return None
+
+    def _reset_subcall_breaker(self) -> None:
+        """Reset the consecutive-timeout counter after a full successful cycle."""
+        self._subcall_timeouts = 0
+
     # ─── Public API ────────────────────────────────────────────────────
 
     async def get_state(self) -> MarketStateResult:
@@ -268,11 +341,21 @@ class MarketStateEngine:
 
     async def _compute_state(self):
         """Core classification logic — runs on BTC 1h + 15m data."""
-        ohlcv_1h = await api.fetch_ohlcv("BTC/USDT", "1h", limit=100)
-        ohlcv_15m = await api.fetch_ohlcv("BTC/USDT", "15m", limit=60)
+        # AUDIT FIX (PR-2): each upstream call is budgeted via
+        # asyncio.wait_for and counted toward the sub-call circuit
+        # breaker.  A single timeout no longer freezes the engine;
+        # repeated timeouts trip the breaker and callers see the
+        # last-known state until cooldown.
+        ohlcv_1h = await self._fetch_ohlcv_guarded("BTC/USDT", "1h", 100)
+        ohlcv_15m = await self._fetch_ohlcv_guarded("BTC/USDT", "15m", 60)
 
         if not ohlcv_1h or len(ohlcv_1h) < 50:
             return
+
+        # Both subcalls returned real data — only now is it safe to
+        # reset the consecutive-timeout counter.  Resetting per-call
+        # would mask a persistent single-timeframe failure.
+        self._reset_subcall_breaker()
 
         closes_1h = np.array([float(c[4]) for c in ohlcv_1h])
         highs_1h  = np.array([float(c[2]) for c in ohlcv_1h])

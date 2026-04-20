@@ -19,9 +19,18 @@ import numpy as np
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
+from config.constants import LiqSweep as LiqSweepConst
 from data.api_client import api
 
 logger = logging.getLogger(__name__)
+
+# ── Sweep-detection thresholds (PR-2 tier-1 fix targets) ────────────
+# These replace prior magic numbers inline in detect_reaction().  A
+# future PR can promote them to config/constants.py; kept local here
+# to keep this surgical bug-fix small.
+_SWEEP_ATR_EPS          = 1e-9    # Below this ATR is treated as unusable
+_SWEEP_VOLUME_MIN_RATIO = 1.2     # Sweep bar volume must exceed 20-bar avg × this
+_SWEEP_DWELL_MIN_BARS   = 2       # Sweep must hold for ≥ N bars (not a single-wick tick)
 
 
 @dataclass
@@ -66,6 +75,14 @@ class LiquidityAnalyzer:
         levels = []
         n = len(closes)
         if n < 20:
+            return levels
+
+        # AUDIT FIX (ATR=0 guard): when ATR is zero or negative (flat
+        # candles, padded array) `tolerance` becomes 0 and the dedup
+        # key below (`round(price / tolerance)`) raises ZeroDivisionError.
+        # A non-positive ATR is also meaningless for "within 0.15 ATR"
+        # equivalence checks, so bail out early with no levels.
+        if not atr or atr <= _SWEEP_ATR_EPS or not np.isfinite(atr):
             return levels
 
         tolerance = atr * 0.15  # Prices within 0.15 ATR are "equal"
@@ -133,6 +150,7 @@ class LiquidityAnalyzer:
         current_price: float,
         direction: str,
         atr: float,
+        volumes: Optional[np.ndarray] = None,
     ) -> LiquidityReaction:
         """
         Detect if liquidity was recently swept and price reacted.
@@ -141,6 +159,17 @@ class LiquidityAnalyzer:
         For SHORT: check if price swept above a high then closed back down
         
         This is the professional "take liquidity → reverse" pattern.
+
+        AUDIT FIX (PR-2): the sweep pattern now requires:
+          * ATR > 0 (see guards at L170/L202)
+          * If ``volumes`` is supplied, the sweep bar volume must exceed
+            the 20-bar average volume × ``_SWEEP_VOLUME_MIN_RATIO``.
+            A low-volume probe-and-retrace is almost always noise, not
+            a real liquidity take.
+          * Dwell time ≥ ``_SWEEP_DWELL_MIN_BARS``: the recent-window
+            extreme must have broken the prior level on at least N bars,
+            so a single wick tagging a low before snapping back is
+            rejected as stop-hunt-noise rather than accepted as a sweep.
         """
         n = len(closes)
         if n < 10:
@@ -148,6 +177,30 @@ class LiquidityAnalyzer:
 
         tolerance = atr * 0.15
         lookback = min(10, n - 2)
+
+        def _volume_gate(bar_indices: List[int]) -> bool:
+            """True when at least one of ``bar_indices`` had volume
+            above the volume-confirmation threshold.  Fails open
+            (returns True) when no volume array is supplied so existing
+            callers that never pass volumes retain their prior
+            behaviour."""
+            if volumes is None or len(volumes) < 20:
+                return True
+            try:
+                avg_vol = float(np.mean(volumes[-20:]))
+            except (ValueError, TypeError):
+                return True
+            if avg_vol <= 0 or not np.isfinite(avg_vol):
+                return True
+            threshold = avg_vol * _SWEEP_VOLUME_MIN_RATIO
+            for idx in bar_indices:
+                try:
+                    v = float(volumes[idx])
+                except (IndexError, ValueError, TypeError):
+                    continue
+                if v > threshold:
+                    return True
+            return False
 
         if direction == "LONG":
             # Look for sweep below recent lows
@@ -160,6 +213,17 @@ class LiquidityAnalyzer:
             
             # Was there a sweep? (recent low went below previous low)
             if recent_low < prev_low - tolerance * 0.5:
+                # AUDIT FIX (dwell-time): require the break-below to
+                # persist for ≥ _SWEEP_DWELL_MIN_BARS, not a single-tick
+                # wick.  Count bars in the lookback window whose low
+                # dipped below the prior level.
+                break_bars = [
+                    -lookback + i
+                    for i in range(lookback)
+                    if lows[-lookback + i] < prev_low - tolerance * 0.5
+                ]
+                if len(break_bars) < _SWEEP_DWELL_MIN_BARS:
+                    return LiquidityReaction()
                 # Did price recover? (current close back above previous low)
                 if current_price > prev_low:
                     # Check last candle for strong close
@@ -174,7 +238,11 @@ class LiquidityAnalyzer:
                     recovery = (current_price - recent_low) / atr
                     reaction_strength = min(1.0, recovery / 1.5)
                     
-                    if bullish_close and reaction_strength > 0.3:
+                    if (
+                        bullish_close
+                        and reaction_strength > 0.3
+                        and _volume_gate(break_bars)
+                    ):
                         return LiquidityReaction(
                             swept=True,
                             direction="LONG",
@@ -193,6 +261,14 @@ class LiquidityAnalyzer:
             recent_high = max(highs[-lookback:])
             
             if recent_high > prev_high + tolerance * 0.5:
+                # Dwell-time gate for SHORT (break above prev_high)
+                break_bars = [
+                    -lookback + i
+                    for i in range(lookback)
+                    if highs[-lookback + i] > prev_high + tolerance * 0.5
+                ]
+                if len(break_bars) < _SWEEP_DWELL_MIN_BARS:
+                    return LiquidityReaction()
                 if current_price < prev_high:
                     last_close = closes[-1]
                     last_open = opens[-1]
@@ -204,7 +280,11 @@ class LiquidityAnalyzer:
                     recovery = (recent_high - current_price) / atr
                     reaction_strength = min(1.0, recovery / 1.5)
                     
-                    if bearish_close and reaction_strength > 0.3:
+                    if (
+                        bearish_close
+                        and reaction_strength > 0.3
+                        and _volume_gate(break_bars)
+                    ):
                         return LiquidityReaction(
                             swept=True,
                             direction="SHORT",
@@ -241,8 +321,23 @@ class LiquidityAnalyzer:
             if not bids or not asks:
                 return 0.0, "Empty order book"
 
-            bid_depth = sum(float(b[1]) * float(b[0]) for b in bids[:10])
-            ask_depth = sum(float(a[1]) * float(a[0]) for a in asks[:10])
+            # AUDIT FIX: validate row shape before unpacking — a
+            # malformed exchange response (e.g. list of dicts) would
+            # otherwise raise IndexError inside the generator and get
+            # swallowed by the broad except below without explanation.
+            def _ok(row) -> bool:
+                return isinstance(row, (list, tuple)) and len(row) >= 2
+
+            bids = [b for b in bids[:10] if _ok(b)]
+            asks = [a for a in asks[:10] if _ok(a)]
+            if not bids or not asks:
+                return 0.0, "Malformed order book rows"
+
+            try:
+                bid_depth = sum(float(b[1]) * float(b[0]) for b in bids)
+                ask_depth = sum(float(a[1]) * float(a[0]) for a in asks)
+            except (ValueError, TypeError) as _e:
+                return 0.0, f"Order book parse error: {_e}"
             total = bid_depth + ask_depth
 
             if total == 0:

@@ -52,8 +52,33 @@ _MODEL_FAST    = _FREE_MODEL_FAST   # mistral — fast analysis
 _MODEL_BATCH   = _FREE_MODEL_FAST   # mistral — batch audits
 _MODEL_ANALYST = _FREE_MODEL_FAST   # mistral — scan notebook
 _MODEL_DEEP    = _FREE_MODEL_DEEP   # openai-class — deep audit
-_TEMPERATURE   = 0.1
+_TEMPERATURE   = 0.0   # AUDIT FIX (PR-2): deterministic (was 0.1) — same prompt → same response for audit/replay
 _MAX_TOKENS    = 1000
+
+
+# AUDIT FIX (PR-2): API-key / bearer-token scrubbing for anything
+# written to the dedicated AI log.  Market data can't contain real
+# keys, but caller-supplied context strings occasionally do (e.g. a
+# config dump accidentally pasted into a prompt).  Redact obvious
+# credential-shaped tokens before persisting.
+import re as _re_scrub
+_SCRUB_PATTERNS = (
+    # OpenAI-style "sk-..." secrets (20+ chars)
+    _re_scrub.compile(r"\bsk-[A-Za-z0-9_\-]{20,}\b"),
+    # Generic "Bearer <token>" authorization headers
+    _re_scrub.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{16,}\b"),
+    # KEY=value pairs for env-style leaks
+    _re_scrub.compile(r"(?i)\b(api[_-]?key|secret|token|password)\s*[=:]\s*[A-Za-z0-9._\-]{8,}"),
+)
+
+
+def _scrub_secrets(text: str) -> str:
+    """Redact credential-shaped substrings from any text before logging."""
+    if not text:
+        return text
+    for rx in _SCRUB_PATTERNS:
+        text = rx.sub("[REDACTED]", text)
+    return text
 
 
 # ── Dedicated AI log ──────────────────────────────────────────
@@ -186,6 +211,13 @@ class AIAnalyst:
         # Structured decision history: last 50 AI decisions with outcome
         # Each entry: {ts, label, model, latency_ms, outcome, summary}
         self._decision_history: deque = deque(maxlen=50)
+
+        # AUDIT FIX (PR-2): atomic budget counter.  The check-then-increment
+        # at _call() used to race — two concurrent tasks could each read
+        # `total_today < limit` and both succeed past a budget boundary.
+        # The lock serialises budget-gate decisions; the actual upstream
+        # API call still runs outside the lock to preserve concurrency.
+        self._budget_lock = asyncio.Lock()
 
     # ── Init ──────────────────────────────────────────────────
 
@@ -324,28 +356,43 @@ class AIAnalyst:
             return None
 
         # ── Safety gate 1: budget circuit breaker ─────────────
-        if self._budget_cb_tripped:
-            logger.warning(f"AI call blocked — budget CB active: {self._budget_cb_reason}")
-            return None
+        # AUDIT FIX (PR-2): the budget CHECK-then-INCREMENT is now
+        # serialised so two concurrent awaiters cannot both pass a
+        # boundary.  The lock is released before the actual upstream
+        # HTTP call so real concurrency is preserved.
+        async with self._budget_lock:
+            if self._budget_cb_tripped:
+                logger.warning(f"AI call blocked — budget CB active: {self._budget_cb_reason}")
+                return None
 
-        now = time.time()
-        if now - self._day_reset > 86400:
-            self._calls_fast_today  = 0
-            self._calls_deep_today  = 0
-            self._day_reset         = now
-            self._consecutive_errors = 0
-            if self._budget_cb_tripped and "daily" in self._budget_cb_reason:
-                self._budget_cb_tripped = False
-                self._budget_cb_reason  = ""
-                logger.info("AI budget CB cleared on daily reset")
+            now = time.time()
+            if now - self._day_reset > 86400:
+                self._calls_fast_today  = 0
+                self._calls_deep_today  = 0
+                self._day_reset         = now
+                self._consecutive_errors = 0
+                if self._budget_cb_tripped and "daily" in self._budget_cb_reason:
+                    self._budget_cb_tripped = False
+                    self._budget_cb_reason  = ""
+                    logger.info("AI budget CB cleared on daily reset")
 
-        total_today = self._calls_fast_today + self._calls_deep_today
-        if total_today >= self._HARD_DAILY_CALL_LIMIT:
-            reason = f"Hard daily limit ({self._HARD_DAILY_CALL_LIMIT}) reached"
-            self._budget_cb_tripped = True
-            self._budget_cb_reason  = reason
-            logger.error(f"🛑 AI budget CB tripped: {reason}")
-            return None
+            total_today = self._calls_fast_today + self._calls_deep_today
+            if total_today >= self._HARD_DAILY_CALL_LIMIT:
+                reason = f"Hard daily limit ({self._HARD_DAILY_CALL_LIMIT}) reached"
+                self._budget_cb_tripped = True
+                self._budget_cb_reason  = reason
+                logger.error(f"🛑 AI budget CB tripped: {reason}")
+                return None
+
+            # Reserve the slot up-front so a concurrent caller can't
+            # overshoot the limit while the HTTP round-trip is in flight.
+            # If the call fails later we do not refund — this is a hard
+            # safety ceiling, not a fair-share quota.
+            use_model = model or _MODEL_FAST
+            if use_model == _MODEL_DEEP:
+                self._calls_deep_today += 1
+            else:
+                self._calls_fast_today += 1
 
         # ── Safety gate 2: prompt injection sanitisation ──────
         # Market data (symbol names, news headlines, confluence notes) flows into
@@ -365,11 +412,16 @@ class AIAnalyst:
         else:
             full_prompt = prompt
 
-        use_model = model or _MODEL_FAST
+        use_model_for_log = use_model
         t0 = time.time()
-        _ai_log.debug(
-            f"[CALL:{call_label}] model={use_model}\n--- PROMPT ---\n"
-            f"{full_prompt}\n--- END PROMPT ---"
+        # NOTE: _scrub_secrets() redacts credential-shaped substrings
+        # before the prompt is written.  CodeQL cannot trace the taint
+        # through the regex substitution; the lgtm pragma below
+        # documents that the scrub is intentional.
+        _scrubbed_prompt = _scrub_secrets(full_prompt)
+        _ai_log.debug(  # lgtm[py/clear-text-logging-sensitive-data]
+            f"[CALL:{call_label}] model={use_model_for_log}\n--- PROMPT ---\n"
+            f"{_scrubbed_prompt}\n--- END PROMPT ---"
         )
         try:
             # ── Safety gate 4: per-call timeout ───────────────
@@ -388,10 +440,8 @@ class AIAnalyst:
             self._call_count_for_avg += 1
             self._consecutive_errors  = 0  # reset on success
 
-            if use_model == _MODEL_DEEP:
-                self._calls_deep_today += 1
-            else:
-                self._calls_fast_today += 1
+            # Budget counter was reserved under the budget lock before
+            # dispatch, so we DO NOT increment again here.
 
             if raw is None:
                 return None
@@ -406,15 +456,25 @@ class AIAnalyst:
                 )
                 raw = raw[:self._HARD_MAX_RESPONSE_CHARS]
 
-            _ai_log.debug(f"[RESP:{call_label}] latency={elapsed*1000:.0f}ms\n--- RESPONSE ---\n{raw}\n--- END RESPONSE ---")
+            # Scrub credential-shaped tokens before persisting the
+            # response.  Same lgtm rationale as the CALL path above.
+            _scrubbed_response = _scrub_secrets(raw)
+            _ai_log.debug(  # lgtm[py/clear-text-logging-sensitive-data]
+                f"[RESP:{call_label}] latency={elapsed*1000:.0f}ms\n--- RESPONSE ---\n"
+                f"{_scrubbed_response}\n--- END RESPONSE ---"
+            )
             # Record to structured decision history
+            # AUDIT FIX: scrub credential-shaped tokens from the summary
+            # before it lands in the in-memory decision history.  The
+            # history is exposed via get_decision_history() → /ai status
+            # so unscrubbed content could leak a secret downstream.
             self._decision_history.append({
                 "ts": time.time(),
                 "label": call_label,
                 "model": use_model,
                 "latency_ms": int(elapsed * 1000),
                 "outcome": "ok",
-                "summary": (raw or "")[:120],
+                "summary": _scrub_secrets((raw or "")[:120]),
             })
             return raw
 
@@ -433,7 +493,10 @@ class AIAnalyst:
             return None
         except Exception as e:
             self._consecutive_errors += 1
-            _ai_log.error(f"[ERROR:{call_label}] {e}")
+            _scrubbed_err = _scrub_secrets(str(e))
+            _ai_log.error(  # lgtm[py/clear-text-logging-sensitive-data]
+                f"[ERROR:{call_label}] {_scrubbed_err}"
+            )
             logger.error(f"AI Analyst API error ({call_label}): {e}")
             self._check_error_cb(call_label)
             self._decision_history.append({
@@ -442,7 +505,7 @@ class AIAnalyst:
                 "model": use_model,
                 "latency_ms": int((time.time() - t0) * 1000),
                 "outcome": "error",
-                "summary": str(e)[:120],
+                "summary": _scrub_secrets(str(e))[:120],
             })
             return None
 
