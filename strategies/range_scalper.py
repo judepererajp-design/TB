@@ -422,15 +422,25 @@ class RangeScalperStrategy(BaseStrategy):
     ) -> int:
         """Count how many times price bounced off this zone in recent history"""
         count = 0
+        # Audit P1: clamp lookback to array length so a misconfigured large
+        # lookback (or short OHLCV window) cannot wrap Python negative indices
+        # back into stale data at the start of the array.  We also need at
+        # least 3 bars so the `i=-lookback → closes[i+1]` check is meaningful.
+        _n = min(len(highs), len(lows), len(closes))
+        if _n < 3:
+            return 0
+        effective_lookback = min(int(lookback), _n - 1)
+        if effective_lookback < 2:
+            return 0
         if direction == "LONG":
             zone_top = range_low + edge_band
-            for i in range(-lookback, -2):
+            for i in range(-effective_lookback, -2):
                 # Price entered demand zone then bounced up
                 if lows[i] <= zone_top and closes[i + 1] > zone_top:
                     count += 1
         else:
             zone_bottom = range_high - edge_band
-            for i in range(-lookback, -2):
+            for i in range(-effective_lookback, -2):
                 # Price entered supply zone then bounced down
                 if highs[i] >= zone_bottom and closes[i + 1] < zone_bottom:
                     count += 1

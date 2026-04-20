@@ -185,8 +185,11 @@ class PriceAction(BaseStrategy):
         primary_pattern = max(signal_patterns, key=lambda p: _PATTERN_WEIGHTS.get(p["pattern"], 0.5) * p["strength"])
 
         # ── Key level detection ────────────────────────────────────────────
+        # Audit P1: enforce a minimum 30-bar swing-scan floor regardless of
+        # config, so major structural swings aren't missed when a user sets
+        # an unusually small key_level_lookback.
         lookback_kl = int(getattr(self._cfg, "key_level_lookback", 50))
-        lookback_kl = max(10, lookback_kl)
+        lookback_kl = max(30, lookback_kl)
         swing_highs = []
         swing_lows  = []
         lb = min(lookback_kl, len(highs) - 2)

@@ -151,8 +151,14 @@ class BreakoutStrategy(BaseStrategy):
         # where ADX starts rising from ~15-22.  Pair with a slope check so we
         # accept *either* "ADX already strong" OR "ADX clearly rising".
         adx = self.calculate_adx(highs, lows, closes, period=14)
-        # Slope: compare current ADX against the value 3 bars ago.
-        _adx_prev = self.calculate_adx(highs[:-3], lows[:-3], closes[:-3], period=14) if len(closes) > 17 else adx
+        # Slope: compare current ADX against the value 3 bars ago.  Require
+        # at least 50 bars so the trailing ADX has completed its Wilder warm-up
+        # — 17 bars (the old floor) leaves the smoothing still ramping and
+        # produces noisy "rising" flags.
+        if len(closes) >= 50:
+            _adx_prev = self.calculate_adx(highs[:-3], lows[:-3], closes[:-3], period=14)
+        else:
+            _adx_prev = adx
         _adx_rising = (adx - _adx_prev) >= 1.5   # Rising at least 1.5 pts over 3 bars
         # BR-Q2b: require adx > 15 when using the rising-slope bypass.  Without the
         # floor, ADX crawling from 10 → 12 passes as "rising" — that's directionless

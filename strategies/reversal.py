@@ -50,7 +50,15 @@ class ReversalStrategy(BaseStrategy):
         try:
             from analyzers.regime import regime_analyzer
             regime = getattr(regime_analyzer.regime, 'value', 'UNKNOWN')
-            allow_volatile = bool(getattr(self._cfg, 'allow_volatile', False))
+            # Audit P1: robust str→bool coercion.  bool("false") is True because
+            # the string is non-empty, so a YAML "false" leaked as string would
+            # silently enable VOLATILE regime.  Accept either native bool or
+            # common string truth values.
+            _av_raw = getattr(self._cfg, 'allow_volatile', False)
+            if isinstance(_av_raw, str):
+                allow_volatile = _av_raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+            else:
+                allow_volatile = bool(_av_raw)
             _valid = set(self.VALID_REGIMES)
             if allow_volatile:
                 _valid = _valid | {"VOLATILE"}

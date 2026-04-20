@@ -90,7 +90,13 @@ class SmartMoneyConcepts(BaseStrategy):
         try:
             from analyzers.regime import regime_analyzer
             regime = getattr(regime_analyzer.regime, 'value', 'UNKNOWN')
-        except Exception:
+        except Exception as _rexc:
+            # Audit P1: don't silently fail — log the first occurrence so an
+            # analyzer breakage is visible instead of quietly zero'ing the
+            # regime bonus for days.
+            if not getattr(self, "_regime_import_warned", False):
+                logger.warning("SMC: regime analyzer unavailable (%s) — defaulting to UNKNOWN", _rexc)
+                self._regime_import_warned = True
             regime = "UNKNOWN"
 
         regime_bonus = 0  # deferred — computed after direction is known
@@ -183,7 +189,10 @@ class SmartMoneyConcepts(BaseStrategy):
         swing_high_points: List[Tuple[int, float]] = []
         swing_low_points: List[Tuple[int, float]] = []
         lb = min(lookback_swings, len(highs) - 3)
-        for i in range(1, lb):
+        # Audit P1: start at i=2 so idx=-3 and idx+1=-2 (last closed bar),
+        # avoiding a right-neighbor comparison against the currently-forming
+        # bar highs[-1]/lows[-1] (which flips as the bar develops).
+        for i in range(2, lb):
             idx = -(i + 1)
             if highs[idx] > highs[idx - 1] and highs[idx] > highs[idx + 1]:
                 swing_highs.append(highs[idx])

@@ -13,7 +13,7 @@ Combined with OI spike for confirmation of overcrowding.
 
 import logging
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -50,7 +50,32 @@ class FundingRateArb(BaseStrategy):
         super().__init__()
         self._cfg = cfg.strategies.funding_arb
         # Per-symbol cache of the previous funding delta for flip detection (B).
-        self._prev_funding_delta: Dict[str, float] = {}
+        # Audit P1: pair the delta with its last-seen wallclock time so a
+        # long-running bot can prune symbols that have not been scanned for a
+        # while (bounded by _PREV_DELTA_TTL_SEC / _PREV_DELTA_MAX_SIZE).
+        self._prev_funding_delta: Dict[str, Tuple[float, float]] = {}
+
+    # Prune stale entries more than 24 h old.  Also bound total size as a
+    # defence against pathological symbol explosions.
+    _PREV_DELTA_TTL_SEC: float = 24 * 60 * 60
+    _PREV_DELTA_MAX_SIZE: int = 512
+
+    def _prune_prev_delta(self, now: float) -> None:
+        """Drop stale / overflow entries from the funding delta cache."""
+        _ttl = self._PREV_DELTA_TTL_SEC
+        if len(self._prev_funding_delta) > self._PREV_DELTA_MAX_SIZE:
+            # Keep the most recent half when the cache overflows.
+            _sorted = sorted(
+                self._prev_funding_delta.items(),
+                key=lambda kv: kv[1][1],
+                reverse=True,
+            )
+            keep = _sorted[: self._PREV_DELTA_MAX_SIZE // 2]
+            self._prev_funding_delta = {k: v for k, v in keep}
+        # TTL sweep
+        _stale = [k for k, (_, ts) in self._prev_funding_delta.items() if now - ts > _ttl]
+        for k in _stale:
+            self._prev_funding_delta.pop(k, None)
 
     async def analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:
         try:
@@ -131,8 +156,11 @@ class FundingRateArb(BaseStrategy):
             # Try raw_data fallback
             funding_rate_pct = 0.0
             oi_change    = 0.0
-        # Sanity guard against obvious unit/corruption errors.
-        if abs(funding_rate_pct) > 5.0:
+        # Sanity guard against obvious unit/corruption errors.  Even 1% funding
+        # per 8h cycle would be historically extreme on any major exchange;
+        # anything above that is almost certainly a unit-conversion bug
+        # (fractional rate treated as percentage or similar).
+        if abs(funding_rate_pct) > 1.0:
             logger.warning(
                 "FundingRateArb: abnormal funding value for %s: %s%% (skipping)",
                 symbol,
@@ -183,7 +211,8 @@ class FundingRateArb(BaseStrategy):
         #   SHORT fade: prev_delta > 0 (funding rising) → now < 0 (falling)
         #   LONG  fade: prev_delta < 0 (funding falling) → now > 0 (rising)
         _flip_bonus = 0.0
-        _prev_delta = self._prev_funding_delta.get(symbol)
+        _prev_entry = self._prev_funding_delta.get(symbol)
+        _prev_delta = _prev_entry[0] if _prev_entry is not None else None
         if (
             _prev_delta is not None
             and funding_delta_pct != 0.0
@@ -197,7 +226,11 @@ class FundingRateArb(BaseStrategy):
                 )
                 if _fade_aligned:
                     _flip_bonus = 4.0
-        self._prev_funding_delta[symbol] = funding_delta_pct
+        _now_ts = time.time()
+        self._prev_funding_delta[symbol] = (funding_delta_pct, _now_ts)
+        # Audit P1: bound cache size / TTL so long-running bots do not leak
+        # memory as new symbols rotate into the scan pool.
+        self._prune_prev_delta(_now_ts)
 
         # ── Confidence ────────────────────────────────────────────────────
         confidence = float(confidence_base)
@@ -225,6 +258,9 @@ class FundingRateArb(BaseStrategy):
         # Fix #3: scale the regime penalty with ADX so a weak trend applies a
         # lighter penalty and a strong trend applies a heavier one.
         adx = self.calculate_adx(highs, lows, closes, period=14)
+        # Audit P1: clamp ADX to the mathematical [0, 100] range so
+        # upstream computation bugs don't inflate _adx_factor.
+        adx = max(0.0, min(100.0, float(adx)))
         # 40 is a conventional "strong trend" threshold on the 0-100 ADX scale;
         # at ADX=40 the full −10 applies, at ADX=20 only −5 applies.
         _adx_factor = min(1.5, adx / 40.0) if adx > 0 else 1.0
@@ -293,7 +329,10 @@ class FundingRateArb(BaseStrategy):
         confidence += min(_pos_adj, 12.0)
 
         # ── Recent swing levels for SL ────────────────────────────────────
-        lookback_sl = min(20, len(highs) - 1)
+        # Audit P1: clamp to [1, 20] so the slice is never empty (len==1)
+        # nor inverted — `highs[-0:]` returns the entire array, which silently
+        # falls back to the global max/min rather than the recent swing.
+        lookback_sl = max(1, min(20, len(highs) - 1))
         recent_high = float(np.max(highs[-lookback_sl:]))
         recent_low  = float(np.min(lows[-lookback_sl:]))
 

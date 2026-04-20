@@ -202,7 +202,11 @@ class Momentum(BaseStrategy):
         # M-2: Use last *closed* bar for volume comparison.  The live bar's volume
         # accumulates throughout the candle period, so comparing volumes[-1] against
         # a 20-bar average suppresses the ratio for early-in-period checks.
-        avg_vol   = float(np.mean(volumes[-20:]))
+        # Audit P1: also exclude the forming bar from the baseline average so
+        # the denominator is 20 closed bars (not 19 closed + 1 in-progress).
+        if len(volumes) < 22:
+            return None
+        avg_vol   = float(np.mean(volumes[-21:-1]))
         vol_ratio = volumes[-2] / avg_vol if avg_vol > 0 else 1.0
         if vol_ratio < _effective_vol_surge:
             return None

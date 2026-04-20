@@ -245,6 +245,10 @@ class WyckoffAccDist(BaseStrategy):
         # with volume confirmation before entry (avoid buying "hope it works" zones)
         if phase in (WP.ACCUMULATION_D, WP.DISTRIBUTION_D):
             key = result.key_level
+            # Audit P1: guard against analyzer not populating key_level — the
+            # price comparison below would raise TypeError on None.
+            if key is None:
+                return None
             phase_e_confirmed = (
                 (direction == "LONG"  and current_price > key and result.volume_confirms) or
                 (direction == "SHORT" and current_price < key and result.volume_confirms)
@@ -270,7 +274,10 @@ class WyckoffAccDist(BaseStrategy):
                 if highs[idx] > highs[idx - 1] and highs[idx] > highs[idx + 1]:
                     if highs[idx] > entry_high + atr:
                         level = highs[idx]
-                        touches = sum(1 for h in highs[-_swing_lookback:] if abs(h - level) <= _tol)
+                        # Audit P1: exclude the forming bar from the touch
+                        # count so an in-progress bar wick does not inflate
+                        # structural validation.
+                        touches = sum(1 for h in highs[-_swing_lookback:-1] if abs(h - level) <= _tol)
                         swing_highs.append((touches, level))
             # Prefer levels tested 2+ times; fall back to any pivot if none qualify
             validated = [lvl for (cnt, lvl) in swing_highs if cnt >= 2]
@@ -294,7 +301,9 @@ class WyckoffAccDist(BaseStrategy):
                 if lows[idx] < lows[idx - 1] and lows[idx] < lows[idx + 1]:
                     if lows[idx] < entry_low - atr:
                         level = lows[idx]
-                        touches = sum(1 for l in lows[-_swing_lookback:] if abs(l - level) <= _tol)
+                        # Audit P1: exclude the forming bar from the touch
+                        # count (see LONG branch above).
+                        touches = sum(1 for l in lows[-_swing_lookback:-1] if abs(l - level) <= _tol)
                         swing_lows.append((touches, level))
             validated = [lvl for (cnt, lvl) in swing_lows if cnt >= 2]
             tp2 = max(validated) if validated else (

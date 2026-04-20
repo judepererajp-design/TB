@@ -80,6 +80,11 @@ def _find_swing_pivots(highs: np.ndarray, lows: np.ndarray,
             continue
         ref_price  = pivots[i - 1][1]   # raw immediate predecessor
         curr_price = pivots[i][1]
+        # Audit P1: guard against pathological zero/near-zero ref_price (a
+        # delisted or data-corrupted pair can produce 0.0 pivots that would
+        # otherwise cause ZeroDivisionError below).
+        if ref_price <= 1e-12:
+            continue
         if abs(curr_price - ref_price) / ref_price >= min_wave_pct:
             filtered.append(pivots[i])
 
@@ -156,7 +161,10 @@ class ElliottWave(BaseStrategy):
         if len(pivots) < 5:
             return None
 
-        current_price = closes[-1]
+        # Audit P1: use the last *closed* bar for the proximity anchor so the
+        # signal does not flap as the currently-forming bar ticks around
+        # entry_level.  closes[-1] is the live bar.
+        current_price = float(closes[-2]) if len(closes) >= 2 else float(closes[-1])
         direction:   Optional[str]  = None
         target_wave: Optional[int]  = None
         entry_level: float          = 0.0
@@ -280,7 +288,10 @@ class ElliottWave(BaseStrategy):
 
                     # EW-Q4: Wave 4 must not enter Wave 1 territory (classic EW rule).
                     # For bullish W5: W4 low (p4[1]) must stay above W1 high (p1[1]).
-                    if p4[1] < p1[1]:
+                    # Audit P1: allow a tiny 0.1×ATR wick tolerance — in 24/7
+                    # crypto, a 1-tick wick into W1 territory routinely
+                    # invalidates otherwise-valid counts.
+                    if p4[1] < p1[1] - atr * 0.1:
                         continue
 
                     if abs(current_price - p4[1]) <= atr * 1.5:
@@ -317,7 +328,9 @@ class ElliottWave(BaseStrategy):
 
                     # EW-Q4: Wave 4 must not enter Wave 1 territory (classic EW rule).
                     # For bearish W5: W4 high (p4[1]) must stay below W1 low (p1[1]).
-                    if p4[1] > p1[1]:
+                    # Audit P1: allow a tiny 0.1×ATR wick tolerance (see bullish
+                    # branch above for rationale).
+                    if p4[1] > p1[1] + atr * 0.1:
                         continue
 
                     if abs(current_price - p4[1]) <= atr * 1.5:
