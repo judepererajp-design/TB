@@ -19,7 +19,7 @@ import pandas as pd
 
 from config.loader import cfg
 from config.constants import STRATEGY_VALID_REGIMES
-from strategies.base import BaseStrategy, SignalResult, SignalDirection, cfg_min_rr
+from strategies.base import BaseStrategy, SignalResult, SignalDirection, cfg_min_rr, btc_regime_penalty
 from utils.formatting import fmt_price
 from utils.risk_params import rp
 
@@ -220,6 +220,20 @@ class MeanReversion(BaseStrategy):
             _btc_dir_penalty = -6
         confidence += _btc_dir_penalty
 
+        # Phase-3 audit: shared BTC-regime helper fills in the symmetric case
+        # (BTC BULL_TREND + alt SHORT) that the MA-based _btc_dir_penalty above
+        # does not cover, and — critically — exempts BTC/ETH majors from
+        # counter-trend penalty (on majors, the "regime" IS their own price
+        # action, so a SHORT in BTC BULL_TREND is a conviction-driven fade,
+        # not a correlation-risk alt trade).  Additive and capped at −4 so it
+        # does not double-count with the MA-based penalty for the LONG case.
+        _btc_reg_delta, _btc_reg_note = btc_regime_penalty(symbol, direction)
+        if _btc_reg_delta != 0:
+            # Avoid double-counting when MA-based penalty already fired on the
+            # same direction (overlap only when BTC is BEAR_TREND and LONG).
+            if _btc_dir_penalty == 0:
+                confidence += _btc_reg_delta
+
         # ── Entry zone ────────────────────────────────────────────────────
         buf = atr * rp.entry_zone_tight
 
@@ -286,6 +300,8 @@ class MeanReversion(BaseStrategy):
             confluence.append(f"⚠️ BTC trending (ADX {_btc_adx:.0f}) — macro risk ({_btc_trend_penalty})")
         if _btc_dir_penalty != 0:
             confluence.append(f"⚠️ BTC bearish — LONG alt correlation risk ({_btc_dir_penalty})")
+        if _btc_reg_delta != 0 and _btc_dir_penalty == 0:
+            confluence.append(_btc_reg_note)
         confluence.append(f"📊 Regime: {regime} | TF: {tf}")
         confluence.append(f"🎯 R:R {rr_ratio:.2f} | ATR: {fmt_price(atr)}")
 

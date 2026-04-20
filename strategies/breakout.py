@@ -150,13 +150,16 @@ class BreakoutStrategy(BaseStrategy):
         # BR-Q2: lower ADX threshold (28→20) to catch accumulation breakouts on alts
         # where ADX starts rising from ~15-22.  Pair with a slope check so we
         # accept *either* "ADX already strong" OR "ADX clearly rising".
-        adx = self.calculate_adx(highs, lows, closes, period=14)
+        # Phase-3: ADX period is now TF-adaptive (10 on intraday, 14 default,
+        # 20 on daily+) so trend confirmation is not lagging on fast TFs.
+        _adx_period = self.adx_period_for_tf(tf)
+        adx = self.calculate_adx(highs, lows, closes, period=_adx_period)
         # Slope: compare current ADX against the value 3 bars ago.  Require
         # at least 50 bars so the trailing ADX has completed its Wilder warm-up
         # — 17 bars (the old floor) leaves the smoothing still ramping and
         # produces noisy "rising" flags.
         if len(closes) >= 50:
-            _adx_prev = self.calculate_adx(highs[:-3], lows[:-3], closes[:-3], period=14)
+            _adx_prev = self.calculate_adx(highs[:-3], lows[:-3], closes[:-3], period=_adx_period)
         else:
             _adx_prev = adx
         _adx_rising = (adx - _adx_prev) >= 1.5   # Rising at least 1.5 pts over 3 bars

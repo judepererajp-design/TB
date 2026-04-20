@@ -184,6 +184,59 @@ class FundingRateArb(BaseStrategy):
         else:
             return None  # Funding not extreme enough
 
+        # ── Perp–spot basis cross-check (Phase-3 audit) ───────────────────
+        # Funding tells us *who is paying*; basis tells us *where price is
+        # vs fair value*.  A true overcrowded-long setup should show BOTH
+        # positive funding AND a perp premium over spot.  When they disagree
+        # the fade is weaker (funding may reflect carry-trade positioning
+        # rather than directional crowding) — apply a soft penalty.  When
+        # they agree strongly, apply a bonus, capped by the existing
+        # positive-adjustment cap.
+        #
+        # Skipped silently when the microstructure feed is unavailable or
+        # the basis snapshot is stale — strategy must degrade gracefully.
+        _basis_pct: Optional[float] = None
+        _basis_note: Optional[str] = None
+        _basis_penalty: float = 0.0
+        _basis_bonus: float = 0.0
+        try:
+            from analyzers.market_microstructure import microstructure  # type: ignore
+            _coin = symbol.split("/")[0] if "/" in symbol else symbol.replace("USDT", "").replace("USDC", "")
+            _bas = microstructure._basis.get(_coin) if hasattr(microstructure, "_basis") else None
+            if _bas is not None and not _bas.is_stale:
+                _basis_pct = float(_bas.basis_pct)
+                if direction == "SHORT":
+                    # Fading crowded longs: perp premium confirms, discount contradicts.
+                    if _basis_pct <= -0.3:
+                        # Funding says longs crowded but perp trades at spot discount.
+                        # This is often a funding-carry setup, not a directional crowd.
+                        _basis_penalty = 6.0
+                        _basis_note = (
+                            f"⚠️ Perp discount {_basis_pct:+.2f}% contradicts "
+                            f"positive funding — fade thesis weakened (-6)"
+                        )
+                    elif _basis_pct >= 0.3:
+                        _basis_bonus = 4.0
+                        _basis_note = (
+                            f"✅ Perp premium {_basis_pct:+.2f}% confirms "
+                            f"crowded-long fade (+4)"
+                        )
+                else:  # LONG — fading crowded shorts
+                    if _basis_pct >= 0.3:
+                        _basis_penalty = 6.0
+                        _basis_note = (
+                            f"⚠️ Perp premium {_basis_pct:+.2f}% contradicts "
+                            f"negative funding — fade thesis weakened (-6)"
+                        )
+                    elif _basis_pct <= -0.3:
+                        _basis_bonus = 4.0
+                        _basis_note = (
+                            f"✅ Perp discount {_basis_pct:+.2f}% confirms "
+                            f"crowded-short fade (+4)"
+                        )
+        except Exception as _basis_err:
+            logger.debug(f"FundingRateArb: basis lookup failed for {symbol}: {_basis_err}")
+
         # ── OI change confirmation (FA-Q3: scale threshold by ATR% so it is
         #    self-calibrating — a 8% OI move on BTC is a major event, but
         #    routine intraday noise on mid-cap alts with high ATR%).
@@ -334,7 +387,11 @@ class FundingRateArb(BaseStrategy):
 
         # Apply capped positive adjustment (C: prevents correlated bonuses from
         # inflating confidence — max combined derivative signal reward = +12).
+        _pos_adj += _basis_bonus
         confidence += min(_pos_adj, 12.0)
+        # Basis-contradiction penalty (Phase-3) — applied outside the
+        # positive-adjustment cap because it is a negative adjustment.
+        confidence -= _basis_penalty
 
         # ── Recent swing levels for SL ────────────────────────────────────
         # Audit P1: clamp to [1, 20] so the slice is never empty (len==1)
@@ -432,6 +489,8 @@ class FundingRateArb(BaseStrategy):
         )
         if _tp2_unwinding_note:
             confluence.append(_tp2_unwinding_note)
+        if _basis_note:
+            confluence.append(_basis_note)
         if regime in ("BULL_TREND", "BEAR_TREND"):
             confluence.append(
                 f"⚠️ Counter-trend in {regime} — requires ≥2× threshold"
@@ -479,6 +538,9 @@ class FundingRateArb(BaseStrategy):
                 "tp2_scale": _tp2_scale,
                 "pos_adj_capped": min(_pos_adj, 12.0),
                 "flip_bonus": _flip_bonus,
+                "basis_pct": _basis_pct,
+                "basis_penalty": _basis_penalty,
+                "basis_bonus": _basis_bonus,
             },
             regime=regime,
         )
@@ -486,3 +548,8 @@ class FundingRateArb(BaseStrategy):
             return None
         return candidate
 FundingArbStrategy = FundingRateArb
+# Phase-3: preferred semantic alias.  The strategy *fades* crowded funding
+# extremes — it is not a pure arbitrage.  External references (config,
+# regime_thresholds, tests) continue to use the original class name for
+# back-compatibility; new call sites should prefer ``FundingRateFade``.
+FundingRateFade = FundingRateArb

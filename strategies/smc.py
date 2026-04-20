@@ -78,6 +78,47 @@ class SmartMoneyConcepts(BaseStrategy):
         expected_choch = "BULLISH" if direction == "LONG" else "BEARISH"
         return has_choch and choch_direction == expected_choch
 
+    @classmethod
+    def _local_poc(
+        cls,
+        highs: np.ndarray,
+        lows: np.ndarray,
+        closes: np.ndarray,
+        volumes: np.ndarray,
+        lookback: int = 50,
+        bins: int = 24,
+    ) -> Optional[float]:
+        """Volume-weighted Point of Control over the recent ``lookback`` bars.
+
+        Phase-3 audit helper.  Stdlib + numpy only — safe under
+        ``tests/conftest.py`` module mocks.  Returns ``None`` when the data
+        is too sparse to form a meaningful histogram.
+
+        Typical price (H+L+C)/3 is used as the per-bar price stand-in, which
+        is both textbook-VP and cheap (no intrabar interpolation needed).
+        """
+        try:
+            n = min(int(lookback), len(closes), len(volumes), len(highs), len(lows))
+            if n < 15:  # too few bars — POC would be noise
+                return None
+            hi = np.asarray(highs[-n:], dtype=float)
+            lo = np.asarray(lows[-n:], dtype=float)
+            cl = np.asarray(closes[-n:], dtype=float)
+            vol = np.asarray(volumes[-n:], dtype=float)
+            typ = (hi + lo + cl) / 3.0
+            p_max = float(np.max(typ))
+            p_min = float(np.min(typ))
+            if not (p_max > p_min) or np.sum(vol) <= 0.0:
+                return None
+            # np.histogram already bins and weights — one allocation, no loop.
+            hist, edges = np.histogram(typ, bins=int(bins), range=(p_min, p_max), weights=vol)
+            if not np.any(hist > 0):
+                return None
+            poc_bin = int(np.argmax(hist))
+            return float((edges[poc_bin] + edges[poc_bin + 1]) / 2.0)
+        except Exception:
+            return None
+
     async def analyze(self, symbol: str, ohlcv_dict: Dict) -> Optional[SignalResult]:
         try:
             return await self._analyze(symbol, ohlcv_dict)
@@ -481,6 +522,23 @@ class SmartMoneyConcepts(BaseStrategy):
                 _age_factor = max(0.0, 1.0 - (_oi / ob_max_age))
                 _ob_decay_mult = 0.8 + 0.2 * _age_factor
                 raw_data["ob_age_factor"] = round(_ob_decay_mult, 3)
+                # Phase-3 audit: OB-near-POC confluence — a bullish OB that sits
+                # on or near the recent volume Point of Control is high-interest
+                # institutional zone (price revisits where prior volume printed).
+                _poc = self._local_poc(highs, lows, closes, volumes)
+                if _poc is not None and atr > 0:
+                    _overlap = ob_low <= _poc <= ob_high
+                    _near    = abs(_poc - ((ob_low + ob_high) / 2.0)) <= atr * 0.5
+                    if _overlap or _near:
+                        confidence += 4
+                        confluence.append(
+                            f"✅ OB overlaps volume POC {fmt_price(_poc)} — institutional zone (+4)"
+                        )
+                        raw_data["ob_poc_overlap"] = True
+                        raw_data["ob_poc_price"] = round(_poc, 8)
+                    else:
+                        raw_data["ob_poc_overlap"] = False
+                        raw_data["ob_poc_price"] = round(_poc, 8)
             elif bear_ob_candidates:
                 bear_ob_candidates.sort(reverse=True)
                 _, _oi, ob_high, ob_low = bear_ob_candidates[0]
@@ -506,6 +564,21 @@ class SmartMoneyConcepts(BaseStrategy):
                 _age_factor = max(0.0, 1.0 - (_oi / ob_max_age))
                 _ob_decay_mult = 0.8 + 0.2 * _age_factor
                 raw_data["ob_age_factor"] = round(_ob_decay_mult, 3)
+                # Phase-3 audit: bearish OB-near-POC confluence (mirror of bullish).
+                _poc = self._local_poc(highs, lows, closes, volumes)
+                if _poc is not None and atr > 0:
+                    _overlap = ob_low <= _poc <= ob_high
+                    _near    = abs(_poc - ((ob_low + ob_high) / 2.0)) <= atr * 0.5
+                    if _overlap or _near:
+                        confidence += 4
+                        confluence.append(
+                            f"✅ OB overlaps volume POC {fmt_price(_poc)} — institutional zone (+4)"
+                        )
+                        raw_data["ob_poc_overlap"] = True
+                        raw_data["ob_poc_price"] = round(_poc, 8)
+                    else:
+                        raw_data["ob_poc_overlap"] = False
+                        raw_data["ob_poc_price"] = round(_poc, 8)
 
             # Apply OB time decay to structural portion only: keep _pre_ob_confidence
             # intact and scale only the delta (the OB-specific contribution).

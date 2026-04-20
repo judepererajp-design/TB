@@ -156,6 +156,18 @@ class WyckoffAnalyzer:
             if spring['volume_spike']:
                 notes.append("✅ Volume climax on Spring — absorption confirmed")
                 conf += 10.0
+            elif spring.get('recovery_volume_spike'):
+                # Phase-3 audit: recovery-bar volume is the second-best absorption
+                # signature — smaller bonus, still confirms the Wyckoff narrative.
+                notes.append("✅ Volume climax on Spring recovery — late absorption")
+                conf += 5.0
+            else:
+                # Phase-3 audit: neither the stop-hunt bar nor the recovery bar
+                # showed volume confirmation.  The "spring" is shape-only —
+                # apply a quality downgrade so marginal springs don't ship at
+                # full confidence.
+                notes.append("⚠️ Spring without volume confirmation — low absorption (-6)")
+                conf -= 6.0
             if vol_contraction:
                 notes.append("✅ Volume contracted inside range — Wyckoff narrative confirmed")
                 conf += 4.0
@@ -224,6 +236,12 @@ class WyckoffAnalyzer:
             if utad['volume_spike']:
                 notes.append("✅ Volume climax on UTAD — supply confirmed")
                 conf += 10.0
+            elif utad.get('rejection_volume_spike'):
+                notes.append("✅ Volume climax on UTAD rejection — late supply")
+                conf += 5.0
+            else:
+                notes.append("⚠️ UTAD without volume confirmation — low supply (-6)")
+                conf -= 6.0
             if vol_contraction:
                 notes.append("✅ Volume contracted inside range — Wyckoff narrative confirmed")
                 conf += 4.0
@@ -506,6 +524,9 @@ class WyckoffAnalyzer:
                 dip = 3× the range, which is absurd — fixed thresholds
                 must be replaced with range-relative ones.
         P1-W8: recovery requires AND (bar closes above low) instead of OR.
+        Phase-3: also record recovery-bar volume (``recovery_volume_spike``)
+                 so the strategy layer can gate on Wyckoff-textbook absorption
+                 happening on either the stop-hunt bar or the recovery bar.
         """
         # Dip depth: max of 10% of range or 0.5 ATR
         dip_threshold = max(range_size * 0.1, atr * 0.5) if atr > 0 else range_size * 0.1
@@ -521,11 +542,26 @@ class WyckoffAnalyzer:
                                   closes[i + 1] > range_low + recovery_threshold)
                 if recovered_same or recovered_next:
                     volume_spike = volumes[i] > avg_volume * self._vol_sensitivity
+                    # Phase-3 audit: the recovery bar is the textbook absorption
+                    # signature — institutional bids stepping in on the bounce.
+                    # Default to False when the recovery is same-bar (no next
+                    # bar to evaluate) so the caller can still rely on the
+                    # spring-bar spike alone.
+                    recovery_bar = i if recovered_same else (i + 1)
+                    recovery_vol_spike = False
+                    if 0 <= recovery_bar < len(volumes):
+                        # Require a slightly lower bar (0.8×) on the recovery —
+                        # climax is most common on the stop-hunt itself.
+                        recovery_vol_spike = (
+                            volumes[recovery_bar] > avg_volume * self._vol_sensitivity * 0.8
+                        )
                     return {
                         'bar': i,
                         'spring_low': float(lows[i]),
                         'recovery_close': float(closes[i]),
+                        'recovery_bar': int(recovery_bar),
                         'volume_spike': bool(volume_spike),
+                        'recovery_volume_spike': bool(recovery_vol_spike),
                     }
         return None
 
@@ -548,11 +584,19 @@ class WyckoffAnalyzer:
                                  closes[i + 1] < range_high - rej_threshold)
                 if rejected_same or rejected_next:
                     volume_spike = volumes[i] > avg_volume * self._vol_sensitivity
+                    rejection_bar = i if rejected_same else (i + 1)
+                    rejection_vol_spike = False
+                    if 0 <= rejection_bar < len(volumes):
+                        rejection_vol_spike = (
+                            volumes[rejection_bar] > avg_volume * self._vol_sensitivity * 0.8
+                        )
                     return {
                         'bar': i,
                         'utad_high': float(highs[i]),
                         'rejection_close': float(closes[i]),
+                        'rejection_bar': int(rejection_bar),
                         'volume_spike': bool(volume_spike),
+                        'rejection_volume_spike': bool(rejection_vol_spike),
                     }
         return None
 

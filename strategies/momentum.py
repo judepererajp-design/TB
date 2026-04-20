@@ -194,7 +194,8 @@ class Momentum(BaseStrategy):
             return None
 
         # ── ADX filter ─────────────────────────────────────────────────────
-        adx = self.calculate_adx(highs, lows, closes, period=14)
+        # Phase-3: TF-adaptive ADX period (faster on intraday, slower on daily+)
+        adx = self.calculate_adx(highs, lows, closes, period=self.adx_period_for_tf(tf))
         if adx < min_adx:
             return None
 
