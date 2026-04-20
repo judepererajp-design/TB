@@ -369,7 +369,7 @@ class Scanner:
         self._ohlcv_fail_counts[symbol] = count
 
         if count >= OHLCVCooldown.FAIL_THRESHOLD:
-            self._ohlcv_fail_counts.pop(symbol, None)  # reset counter
+            self._ohlcv_fail_counts.pop(symbol, None)  # reset the per-cycle counter before cooldown/exclusion
             cycles = self._ohlcv_fail_cycles.get(symbol, 0) + 1
             self._ohlcv_fail_cycles[symbol] = cycles
             if cycles >= 2:

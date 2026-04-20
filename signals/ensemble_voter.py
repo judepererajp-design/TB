@@ -603,11 +603,18 @@ class EnsembleVoter:
             else logger.info if action == "SUPPRESS"
             else logger.debug
         )
-        _log_fn(
-            "Ensemble %s %s: score=%.1f sup=%d opp=%d adj=%+d streak=%d | %s",
-            symbol, action, weighted_score, support_count, oppose_count,
-            conf_adj, _suppress_streak, reason,
-        )
+        if action == "SUPPRESS":
+            _log_fn(
+                "Ensemble %s %s: score=%.1f sup=%d opp=%d adj=%+d streak=%d | %s",
+                symbol, action, weighted_score, support_count, oppose_count,
+                conf_adj, _suppress_streak, reason,
+            )
+        else:
+            _log_fn(
+                "Ensemble %s %s: score=%.1f sup=%d opp=%d adj=%+d | %s",
+                symbol, action, weighted_score, support_count, oppose_count,
+                conf_adj, reason,
+            )
 
         return EnsembleVerdict(
             action         = action,
