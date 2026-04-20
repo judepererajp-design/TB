@@ -376,6 +376,12 @@ class WyckoffAccDist(BaseStrategy):
                 "range_bars": result.range_bars,
                 "atr": atr,
                 "regime": regime,
+                # Phase-2 W-Q5: advisory partial-exit fractions so the
+                # execution/runtime layer (or humans reading the alert) knows
+                # the intended scale-out plan.  Wyckoff re-accumulation moves
+                # typically need to hold the runner for the major markup leg,
+                # hence the heavier runner (40%) vs a standard 25/50/25 split.
+                "tp_fractions": {"tp1": 0.30, "tp2": 0.30, "tp3": 0.40},
             },
             regime=regime,
         )

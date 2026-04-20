@@ -678,6 +678,50 @@ class BaseStrategy(ABC):
             return 0.0
         return round(reward / risk, 2)
 
+    @staticmethod
+    def slippage_adjusted_rr(
+        direction: SignalDirection | str,
+        entry_low: float,
+        entry_high: float,
+        stop_loss: float,
+        tp: float,
+        fee_bps: float = 5.0,
+        slippage_bps: float = 5.0,
+    ) -> float:
+        """
+        Phase-2 helper — fee + slippage aware R:R.
+
+        Strategies can opt in to this when they want a realistic
+        after-cost R:R for min-RR gating.  The default fees (5 bps taker
+        + 5 bps slippage) are conservative for institutional-grade execution
+        on the major venues and can be tightened in the future once
+        we have per-exchange/per-symbol spread data.
+
+        Unlike ``calculate_effective_rr`` this does NOT use worst-case fill
+        (that is already a slippage proxy).  Use the entry midpoint but
+        charge a fee/slippage haircut on BOTH the SL and TP legs so the
+        measured reward and risk are both realistic.
+
+        Returns 0.0 on invalid geometry.
+        """
+        direction_str = direction.value if hasattr(direction, "value") else str(direction)
+        if entry_low <= 0 or entry_high <= 0 or entry_high < entry_low:
+            return 0.0
+        mid = (entry_low + entry_high) / 2.0
+        # Convert bps → fractional cost.  Fees + slippage bite twice on a round trip
+        # but we only charge once per leg here (entry & exit) for simplicity.
+        _cost_frac = max(0.0, float(fee_bps) + float(slippage_bps)) / 10000.0
+        _cost_per_leg = mid * _cost_frac
+        if direction_str == SignalDirection.LONG.value:
+            risk   = (mid - stop_loss) + _cost_per_leg
+            reward = (tp - mid) - _cost_per_leg
+        else:
+            risk   = (stop_loss - mid) + _cost_per_leg
+            reward = (mid - tp) - _cost_per_leg
+        if risk <= 0 or reward <= 0:
+            return 0.0
+        return round(reward / risk, 2)
+
     # ── Compression / Squeeze Detection ──────────────────────────────
 
     @staticmethod

@@ -225,7 +225,12 @@ class PriceAction(BaseStrategy):
 
         at_key_level = False
         key_level_desc = ""
-        kl_tolerance = atr * float(getattr(self._cfg, "key_level_tolerance_atr", 0.5))
+        # Phase-2 PA-Q5: TF-scaled key-level tolerance.  On higher TFs (4h, 1d)
+        # price typically oscillates more widely around S/R — a fixed 0.5×ATR
+        # tolerance is tight enough on 15m but misses valid 4h touches.  Scale
+        # gently by TF so the same config default works across the strategy.
+        _tf_scale = {"15m": 0.85, "1h": 1.00, "4h": 1.15, "1d": 1.30}.get(tf, 1.00)
+        kl_tolerance = atr * float(getattr(self._cfg, "key_level_tolerance_atr", 0.5)) * _tf_scale
 
         if direction == "LONG":
             # At swing low, BB lower, or round number below
@@ -282,14 +287,21 @@ class PriceAction(BaseStrategy):
                 _mtf_bonus = 0
 
         # ── Confidence ────────────────────────────────────────────────────
-        confidence = float(confidence_base) + regime_bonus + _mtf_bonus - _mtf_penalty
-        confidence += primary_pattern["strength"] * 15
+        # Phase-2 PA-Q6: cap the combined pattern-structural bonus at +28 so a
+        # strong pattern + key level + volume + multi-pattern stack cannot
+        # collectively push confidence over the intended ceiling; counter-trend
+        # and MTF mismatch penalties still apply outside the cap.
+        _pattern_bonus = primary_pattern["strength"] * 15
         if at_key_level:
-            confidence += 12
+            _pattern_bonus += 12
         if vol_confirmed:
-            confidence += 8
+            _pattern_bonus += 8
         if len(signal_patterns) > 1:
-            confidence += 5 * (len(signal_patterns) - 1)
+            _pattern_bonus += 5 * (len(signal_patterns) - 1)
+        _pattern_bonus = min(28.0, _pattern_bonus)
+
+        confidence = float(confidence_base) + regime_bonus + _mtf_bonus - _mtf_penalty
+        confidence += _pattern_bonus
 
         # ── Prior-bar context for single-bar patterns ─────────────────────
         # For PinBar and Doji — which are single-bar signals — check that the

@@ -324,6 +324,14 @@ class FundingRateArb(BaseStrategy):
                 elif squeeze_risk == "MEDIUM":
                     _pos_adj += 3  # Moderate short covering
 
+        # Phase-2 FA-Q6: Payment-window freshness bonus.  The first 15 minutes
+        # after a funding payment have the highest information value — the
+        # just-paid cash flow is actively re-positioning leveraged books.
+        # Reward fresh entries; do not apply a symmetric penalty (staleness
+        # already handled by FA-Q5 above).
+        if funding_age_sec is not None and funding_age_sec <= 900:
+            _pos_adj += 3
+
         # Apply capped positive adjustment (C: prevents correlated bonuses from
         # inflating confidence — max combined derivative signal reward = +12).
         confidence += min(_pos_adj, 12.0)

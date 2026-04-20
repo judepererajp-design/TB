@@ -152,7 +152,7 @@ class ElliottWave(BaseStrategy):
         # EW-4: Wave 4 retracements are structurally tighter than Wave 2 — use a
         # stricter tolerance so the 23.6%/38.2% check is actually selective
         # (at 0.08 tolerance any retrace 15.6%–46.2% passes, which is too wide).
-        fib_tolerance_w4 = getattr(self._cfg, "fibonacci_tolerance_w4", min(fib_tolerance, 0.04))
+        fib_tolerance_w4 = getattr(self._cfg, "fibonacci_tolerance_w4", min(fib_tolerance, 0.06))
         max_wave_bars = getattr(self._cfg, "max_wave_bars", 200)
         confidence_base = getattr(self._cfg, "confidence_base", 72)
 
@@ -188,9 +188,12 @@ class ElliottWave(BaseStrategy):
                 w2_retrace = p1[1] - p2[1]
                 if w1_size <= 0:
                     continue
-                # EW-Q1: W1 must be a meaningful impulse — require at least 2 ATRs.
-                # Minor pullbacks following random noise don't qualify as Wave 1.
-                if w1_size < atr * 2:
+                # EW-Q1: W1 must be a meaningful impulse — require at least 1.5 ATRs.
+                # Phase-2: lowered from 2.0 → 1.5 ATRs.  The 2.0 floor was cutting
+                # out many valid early-trend W3 setups where W1 was modest but the
+                # subsequent W3 expansion was large.  1.5 ATRs still filters random
+                # noise pullbacks while admitting real initial impulses.
+                if w1_size < atr * 1.5:
                     continue
                 w2_ratio = w2_retrace / w1_size
                 best_fib, fib_dist = _closest_fib(w2_ratio, _WAVE2_FIBS)
@@ -229,8 +232,9 @@ class ElliottWave(BaseStrategy):
                 w2_retrace = p2[1] - p1[1]
                 if w1_size <= 0:
                     continue
-                # EW-Q1: W1 must be a meaningful impulse — require at least 2 ATRs.
-                if w1_size < atr * 2:
+                # EW-Q1: W1 must be a meaningful impulse — require at least 1.5 ATRs
+                # (Phase-2: relaxed from 2.0 ATRs — see bullish branch rationale).
+                if w1_size < atr * 1.5:
                     continue
                 w2_ratio = w2_retrace / w1_size
                 best_fib, fib_dist = _closest_fib(w2_ratio, _WAVE2_FIBS)

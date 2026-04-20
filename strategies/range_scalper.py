@@ -347,20 +347,20 @@ class RangeScalperStrategy(BaseStrategy):
             stop_loss  = range_low_abs - sl_buffer
             tp1        = current + (equilibrium - current) * 0.50    # Halfway to EQ
             tp2        = equilibrium                                   # Full EQ
-            # TP3-FIX: Old TP3 targeted 30% into the supply zone (above EQ toward
-            # range_high), which is the area the strategy itself considers a sell zone.
-            # Placing a LONG TP inside the sell zone is architecturally contradictory.
-            # New TP3 = 10% past EQ — a modest overshoot capturing momentum without
-            # reaching into the supply zone where institutional selling is expected.
-            tp3        = equilibrium + (range_high - equilibrium) * 0.10
+            # Phase-2 RS-Q4: TP3 = EQ + min(0.5·ATR, 10% past-EQ).  The 10%
+            # cap prevents a large ATR on a tight range from pushing TP3 near
+            # the opposite edge (sell zone for LONG).  The ATR floor gives
+            # a structurally meaningful target on ranges that are EQ-dominated
+            # (where 10% of the upper half would be trivially small).
+            tp3        = equilibrium + min(atr * 0.5, (range_high - equilibrium) * 0.10)
         else:
             entry_high = current + atr * rp.entry_zone_atr * 0.75
             entry_low  = current - atr * rp.entry_zone_tight
             stop_loss  = range_high_abs + sl_buffer
             tp1        = current - (current - equilibrium) * 0.50
             tp2        = equilibrium
-            # TP3-FIX: Mirror fix — 10% past EQ into demand zone, not 30%.
-            tp3        = equilibrium - (equilibrium - range_low) * 0.10
+            # Mirror: TP3 = EQ − min(0.5·ATR, 10% past-EQ).
+            tp3        = equilibrium - min(atr * 0.5, (equilibrium - range_low) * 0.10)
 
         # ── 8. Risk/Reward check ──────────────────────────────────
         risk = abs(current - stop_loss)

@@ -72,12 +72,20 @@ def test_breakout_sl_no_longer_uses_range_percentage():
 
 # ── BR-Q1: measured-move target ratios ───────────────────────────────────────
 
-def test_breakout_tp2_is_80_pct_measured_move():
+def test_breakout_tp2_is_100_pct_measured_move():
+    """
+    Phase-2 BR-Q6: TP2 was moved from 80% → 100% measured move (main target)
+    and TP3 from 100% → 140% (runner).  Back-tests showed winning breakouts in
+    trending regimes rarely stop at the 100% projection, so TP3 extension out
+    to 140% captures the typical momentum overshoot.
+    """
     src = inspect.getsource(__import__("strategies.breakout", fromlist=["BreakoutStrategy"]).BreakoutStrategy)
-    assert "range_size * 0.80" in src
-    # 100% measured move is now TP3, not TP2
+    # TP2 is now the 100% measured move (previously TP3)
     assert "range_size * 1.00" in src
-    # Old 100% TP2 and 150% TP3 should be gone
+    # TP3 is now the 140% runner
+    assert "range_size * 1.40" in src
+    # Old TP2 80% and TP3 150% anchors should be gone
+    assert "range_size * 0.80" not in src
     assert "range_size * 1.50" not in src
 
 

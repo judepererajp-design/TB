@@ -119,10 +119,12 @@ class Ichimoku(BaseStrategy):
         current_price = closes[-1]
 
         # IC-Q1: Thin cloud → weak S/R zone → high failure rate.
-        # Use the larger of 1×ATR or 0.2% of price so the gate scales correctly across
-        # assets where ATR is very small relative to price (e.g. low-vol alts) or very
-        # large relative to price (e.g. high-vol micro-caps).
-        if kumo_size < max(atr * 1.0, current_price * 0.002):
+        # Phase-2: loosen from 1.0×ATR to 0.5×ATR.  Requiring a full 1×ATR
+        # cloud rejected many valid setups on lower-volatility pairs where
+        # Ichimoku still works; 0.5×ATR keeps out pathologically thin clouds
+        # while allowing normal cloud geometry.  The 0.2% price floor is
+        # retained for very-low-vol assets.
+        if kumo_size < max(atr * 0.5, current_price * 0.002):
             return None
 
         # Chikou span = close shifted back `displacement` bars
@@ -279,6 +281,36 @@ class Ichimoku(BaseStrategy):
         if _late_strong_entry:
             confidence -= 6
 
+        # Phase-2 IC-Q5: Senkou-span slope alignment.  If the future cloud (Senkou
+        # A projected forward) is tilting *against* the trade direction, the
+        # structural resistance/support is weakening — apply a -4 penalty.  When
+        # the slope aligns with the trade, +3 as confirmation the cloud is
+        # expanding in our favour.  We look 10 bars back in the Senkou A series
+        # relative to its current-displacement value.
+        _senkou_slope_penalty = 0
+        try:
+            _sa_now  = float(senkou_a_raw[-displacement])
+            _sa_back = float(senkou_a_raw[-displacement - 10])
+            _sa_slope = _sa_now - _sa_back
+            if direction == "LONG" and _sa_slope < -atr * 0.1:
+                _senkou_slope_penalty = -4
+                confluence_note = "⚠️ Senkou A sloping down against LONG (-4)"
+            elif direction == "SHORT" and _sa_slope > atr * 0.1:
+                _senkou_slope_penalty = -4
+                confluence_note = "⚠️ Senkou A sloping up against SHORT (-4)"
+            elif direction == "LONG" and _sa_slope > atr * 0.1:
+                _senkou_slope_penalty = 3
+                confluence_note = "✅ Senkou A sloping up — cloud support building (+3)"
+            elif direction == "SHORT" and _sa_slope < -atr * 0.1:
+                _senkou_slope_penalty = 3
+                confluence_note = "✅ Senkou A sloping down — cloud resistance building (+3)"
+            else:
+                confluence_note = None
+            confidence += _senkou_slope_penalty
+        except (IndexError, ValueError, TypeError):
+            confluence_note = None
+            _sa_slope = 0.0
+
         # ── Entry around TK cross level (or Kijun on pullback) ──────────
         # When flat-Kijun pullback is detected, enter near Kijun level
         # for a tighter stop and better R:R.
@@ -330,6 +362,8 @@ class Ichimoku(BaseStrategy):
             confluence.append(f"✅ Flat Kijun pullback — high-probability entry at {fmt_price(current_kijun)}")
         elif _kijun_flat:
             confluence.append(f"📊 Kijun flat — awaiting pullback for optimal entry")
+        if confluence_note:
+            confluence.append(confluence_note)
         confluence.append(f"📊 Regime: {regime} | TF: {tf}")
         confluence.append(f"🎯 R:R {rr_ratio:.2f} | ATR: {fmt_price(atr)}")
 
