@@ -58,8 +58,12 @@ def _log_gate_decision(result: "ExecutionAssessment", symbol: str = "", directio
             penalty_mult=result.penalty_mult,
             extra=extra if extra else None,
         )
-    except Exception:
-        pass  # Never crash for logging
+    except Exception as _e:
+        # AUDIT FIX (PR-2): previously a silent `except: pass` that would
+        # also hide genuine logger misconfiguration.  Log at DEBUG so the
+        # main execution path isn't noisy on a detached file-handler, but
+        # the exception is no longer invisible on investigation.
+        logger.debug("exec_gate_log dispatch failed: %s", _e, exc_info=True)
 
 
 @dataclass
@@ -142,6 +146,12 @@ class ExecutionQualityGate:
         sentiment_score = 50.0
         funding_rate = 0.0
         oi_change_24h = 0.0
+        # AUDIT FIX (PR-2 / slippage-missing → reject): only the
+        # context-driven call path knows whether the upstream truly had
+        # a spread reading or just didn't provide one.  Legacy
+        # positional callers keep the old behaviour (treated as
+        # "known" so we do not retroactively penalise them).
+        _spread_known = True
         if context:
             session_ctx = dict((context or {}).get("session") or {})
             trigger_ctx = dict((context or {}).get("trigger") or {})
@@ -163,6 +173,12 @@ class ExecutionQualityGate:
             trigger_quality_label = str(_tql) if _tql is not None else trigger_quality_label
 
             _sbps = liquidity_ctx.get("spread_bps")
+            # AUDIT FIX (PR-2): track whether the caller explicitly
+            # provided a spread measurement.  "No spread data" used to
+            # silently score as moderate (60) — effectively a free pass.
+            # We now flag it below so the composite can penalise
+            # slippage-blind entries.
+            _spread_known = _sbps is not None
             spread_bps = float(_sbps) if _sbps is not None else spread_bps
             _vc = liquidity_ctx.get("volume_context")
             volume_context = str(_vc) if _vc is not None else volume_context
@@ -227,6 +243,14 @@ class ExecutionQualityGate:
         result.factors['spread'] = spread_score
         if spread_score <= EG.BAD_FACTOR_THRESHOLD:
             result.bad_factors.append('spread')
+        elif not _spread_known:
+            # AUDIT FIX (PR-2): when the upstream context explicitly
+            # did not provide a spread reading, surface that as
+            # ``spread_unknown`` in bad_factors so the composite
+            # treats a slippage-blind entry as degraded rather than
+            # silently scoring "moderate".
+            result.bad_factors.append('spread_unknown')
+            result.factors['spread_unknown'] = 1.0
 
         # ── 4. Whale alignment score ──────────────────────────────
         whale_score = self._score_whale_alignment(
@@ -649,8 +673,15 @@ class ExecutionQualityGate:
         try:
             from analyzers.near_miss_tracker import near_miss_tracker
             threshold += float(near_miss_tracker.compute_threshold_adjustment() or 0.0)
-        except Exception:
-            pass
+        except Exception as _e:
+            # AUDIT FIX (PR-2): was silent.  Threshold adjustment is a
+            # real governance input; a failure here should surface in
+            # the logs so we can tell adaptive gating from frozen
+            # defaults.  WARN (not ERROR) because the fallback is safe.
+            logger.warning(
+                "ExecutionGate: near_miss_tracker threshold adjust failed: %s",
+                _e, exc_info=True,
+            )
 
         return max(EG.ADAPTIVE_THRESHOLD_MIN, min(EG.ADAPTIVE_THRESHOLD_MAX, threshold))
 
@@ -817,6 +848,14 @@ class ExecutionQualityGate:
         blended = context_score * 0.60 + volume_score * 0.40
         return max(0.0, min(100.0, blended))
 
+    # One-time warn flag: the contract with analyzers/derivatives.py is
+    # that funding_rate is in **percentage points** (0.05 → 0.05%).  If
+    # a caller passes the raw fractional form (0.0005) the thresholds
+    # below will never fire; if they pass a wildly out-of-range value
+    # (± > 5 pp) it's almost certainly a unit error on the upstream.
+    _FUNDING_SUSPECT_ABS_PP = 5.0
+    _funding_unit_warned: bool = False
+
     @staticmethod
     def _score_positioning(
         *,
@@ -836,6 +875,22 @@ class ExecutionQualityGate:
                 base -= 5.0
 
         funding = float(funding_rate or 0.0)
+        # AUDIT FIX (PR-2): assert funding unit against the
+        # derivatives.py contract (percentage points).  We don't raise —
+        # a wrong-unit caller shouldn't hard-stop gating — but we warn
+        # exactly once per process so the issue is visible.
+        if (
+            abs(funding) > ExecutionQualityGate._FUNDING_SUSPECT_ABS_PP
+            and not ExecutionQualityGate._funding_unit_warned
+        ):
+            ExecutionQualityGate._funding_unit_warned = True
+            logger.warning(
+                "ExecutionGate: funding_rate=%s is outside the "
+                "±%.1f percentage-point range expected by "
+                "derivatives.py (0.05 == 0.05%%). Likely unit mismatch "
+                "(fractional vs. pp) at the call site.",
+                funding, ExecutionQualityGate._FUNDING_SUSPECT_ABS_PP,
+            )
         if direction == "LONG":
             if funding <= -0.01:
                 base += 4.0

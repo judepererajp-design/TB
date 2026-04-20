@@ -14,12 +14,14 @@ Fear & Greed scale:
 
 import asyncio
 import logging
+import math
 import time
 from typing import Dict, Optional
 
 import aiohttp
 
-from config.constants import NewsIntelligence
+from analyzers._common.stats import blom_percentile as _blom_percentile
+from config.constants import NewsIntelligence, Sentiment as SentimentConst
 from config.feature_flags import ff
 from config.shadow_mode import shadow_log
 from config.loader import cfg
@@ -109,37 +111,70 @@ class SentimentAnalyzer:
                             if not entries:
                                 return
 
-                            # Latest reading
+                            # Latest reading — CLAMP to the [0, 100] API contract
+                            # before it contaminates the EWMA / history. Upstream
+                            # error responses have historically returned e.g. 255
+                            # or -1 (int cast of a string).
                             latest = entries[0]
-                            new_val = int(latest['value'])
+                            try:
+                                raw_val = int(latest['value'])
+                            except (TypeError, ValueError, KeyError):
+                                return
+                            new_val = max(
+                                SentimentConst.API_MIN,
+                                min(SentimentConst.API_MAX, raw_val),
+                            )
                             self._fear_greed = new_val
                             self._label = latest.get('value_classification', 'Neutral')
 
                             # Build history (newest first from API, reverse to oldest first)
                             now = time.time()
-                            self._history = [
-                                (now - i * 86400, int(e['value']))
-                                for i, e in enumerate(entries)
-                                if e.get('value')
-                            ]
+                            _history = []
+                            for i, e in enumerate(entries):
+                                _v = e.get('value')
+                                if _v is None:
+                                    continue
+                                try:
+                                    _iv = int(_v)
+                                except (TypeError, ValueError):
+                                    continue
+                                _iv = max(
+                                    SentimentConst.API_MIN,
+                                    min(SentimentConst.API_MAX, _iv),
+                                )
+                                _history.append((now - i * 86400, _iv))
+                            self._history = _history
 
-                            # Update EWMA (exponential decay toward new value)
-                            self._ewma = (self._ewma_alpha * new_val
-                                         + (1 - self._ewma_alpha) * self._ewma)
+                            # Update EWMA — guard against NaN/Inf from a
+                            # malformed upstream response (already clamped
+                            # above, but defend against prior _ewma state
+                            # that may have drifted).
+                            if not math.isfinite(self._ewma):
+                                self._ewma = float(new_val)
+                            _next_ewma = (
+                                self._ewma_alpha * new_val
+                                + (1 - self._ewma_alpha) * self._ewma
+                            )
+                            if math.isfinite(_next_ewma):
+                                self._ewma = _next_ewma
+                            else:
+                                self._ewma = float(new_val)
 
                             # Velocity: change vs 24h ago (index 1 = yesterday)
                             if len(self._history) >= 2:
                                 prev_24h = self._history[1][1]
                                 self._velocity = (new_val - prev_24h) / 24  # per hour
 
-                            # Percentile rank vs 30d history (0 = lowest ever, 1 = highest)
+                            # Percentile rank vs 30d history using the
+                            # Blom plotting-position formula — handles
+                            # ties, small-sample bias and NaN input
+                            # correctly (the previous searchsorted hack
+                            # mis-ranked ties and returned 1.0 on an
+                            # all-equal history).
                             if len(self._history) >= 5:
-                                import numpy as _np
                                 vals = [v for _, v in self._history]
-                                if vals:
-                                    self._pct_rank = float(_np.searchsorted(sorted(vals), new_val)) / len(vals)
-                                else:
-                                    self._pct_rank = 0.5
+                                _pct = _blom_percentile(new_val, vals, default=0.5)
+                                self._pct_rank = float(_pct) if _pct is not None else 0.5
 
                             self._last_update = now
                             logger.debug(
@@ -185,12 +220,20 @@ class SentimentAnalyzer:
         # ── Velocity adjustment (momentum of sentiment) ─────────
         # If F&G is falling fast, that's bearish (even if currently high)
         # If F&G is rising fast, that's bullish (even if currently low)
+        #
+        # AUDIT FIX: the old code was `min(8, vel * 4)` which is *not*
+        # a symmetric cap — a velocity of -10 for LONG produced -40
+        # (passes through min because -40 < 8), blowing the bound.
+        # Use `max(-cap, min(cap, signed))` so the magnitude is clamped
+        # on both sides while the sign is preserved.
         vel_adj = 0.0
-        if abs(vel) > 0.5:  # Meaningful velocity (>0.5 F&G units/hour)
+        _vel_cap = SentimentConst.VELOCITY_CAP_PTS
+        _vel_slope = SentimentConst.VELOCITY_PTS_PER_UNIT
+        if abs(vel) > 0.5 and math.isfinite(vel):  # Meaningful velocity
             if direction == "LONG":
-                vel_adj = min(8, vel * 4)    # Rising F&G helps longs
+                vel_adj = max(-_vel_cap, min(_vel_cap, vel * _vel_slope))
             else:
-                vel_adj = min(8, -vel * 4)   # Falling F&G helps shorts
+                vel_adj = max(-_vel_cap, min(_vel_cap, -vel * _vel_slope))
 
         # ── Percentile amplification ────────────────────────────
         # Being at an extreme percentile amplifies the contrarian signal

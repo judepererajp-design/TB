@@ -19,6 +19,8 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
+from config.constants import ParabolicDetector as PDConst
+
 logger = logging.getLogger(__name__)
 
 
@@ -77,6 +79,20 @@ class ParabolicDetector:
             closes  = np.array([float(c[4]) for c in ohlcv], dtype=float)
             volumes = np.array([float(c[5]) for c in ohlcv], dtype=float)
         except (IndexError, TypeError, ValueError):
+            return result
+
+        # Near-zero / invalid price guard — ROC and exhaustion ratios are
+        # numerically unstable below this threshold (penny tokens, test
+        # feeds). Cheaper to bail out than propagate garbage downstream.
+        # Check directly on the raw ohlcv list so the guard also works
+        # under numpy-mocked test harnesses (where np.array(...) would
+        # return a MagicMock that can't be compared to a float).
+        try:
+            _last_close = float(ohlcv[-1][4])
+        except (IndexError, TypeError, ValueError):
+            return result
+        import math as _math
+        if not _math.isfinite(_last_close) or _last_close <= PDConst.MIN_PRICE_USD:
             return result
 
         # ── ROC-of-ROC (acceleration) ───────────────────────────────
@@ -155,9 +171,22 @@ class ParabolicDetector:
                     exhaust_signals.append("volume_spike")
                     exhaust_score += 0.15
 
-        result.is_exhausted = len(exhaust_signals) >= 2
+        result.is_exhausted = len(exhaust_signals) >= PDConst.EXHAUSTION_MIN_SIGNALS
         result.exhaustion_signals = exhaust_signals
-        result.exhaustion_score = min(1.0, round(exhaust_score, 3))
+        # Normalize to [0, 1] by the theoretical maximum.  The individual
+        # contributions above can sum to > 1.0 before clamping (e.g.
+        # momentum_deceleration 0.30 + range_contraction 0.25 +
+        # doji_exhaustion 0.15 + volume_climax 0.35 = 1.05), so divide by
+        # the real achievable max — not by 1.0 — before the min() clamp.
+        _exhaust_max = (
+            0.30  # momentum_deceleration
+            + 0.25  # range_contraction
+            + 0.15  # doji_exhaustion
+            + 0.35  # volume_climax (XOR with volume_spike → take the larger)
+        )
+        if _exhaust_max > 0:
+            exhaust_score = exhaust_score / _exhaust_max
+        result.exhaustion_score = round(min(1.0, max(0.0, exhaust_score)), 3)
 
         # ── Confidence penalty calculation ──────────────────────────
         penalty = 0
