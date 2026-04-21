@@ -1755,7 +1755,7 @@ tr:hover td{background:rgba(255,255,255,.015)}
     <div class="card-h"><div class="card-t">⌨️ Keyboard shortcuts</div></div>
     <div class="card-b">
       <div class="guide-shortcut-grid">
-        <div><span class="kbd">⌘</span><span class="kbd">K</span><span style="color:var(--text2)">Command palette — jump to any page or symbol</span></div>
+        <div><span class="kbd">⌘</span>/<span class="kbd">Ctrl</span>+<span class="kbd">K</span><span style="color:var(--text2)">Command palette — jump to any page or symbol</span></div>
         <div><span class="kbd">?</span><span style="color:var(--text2)">Contextual help for the current page</span></div>
         <div><span class="kbd">/</span><span style="color:var(--text2)">Focus symbol search on current page</span></div>
         <div><span class="kbd">Esc</span><span style="color:var(--text2)">Close any open drawer or modal</span></div>
@@ -1879,11 +1879,11 @@ var PAGE_GROUPS={
 
 function nav(p){
   document.querySelectorAll('.page').forEach(x=>x.classList.remove('on'));
-  document.querySelectorAll('.nb').forEach(x=>x.classList.remove('on'));
+  document.querySelectorAll('.nb').forEach(x=>{x.classList.remove('on');x.removeAttribute('aria-current');});
   document.querySelectorAll('.nav-group-head').forEach(x=>x.classList.remove('active'));
   document.querySelectorAll('.nav-group').forEach(x=>x.classList.remove('open'));
   var pe=document.getElementById('page-'+p);if(pe)pe.classList.add('on');
-  var nb=document.getElementById('nb-'+p);if(nb)nb.classList.add('on');
+  var nb=document.getElementById('nb-'+p);if(nb){nb.classList.add('on');nb.setAttribute('aria-current','page');}
   var grp=PAGE_GROUPS[p];
   if(grp){
     var head=document.querySelector('[data-group="'+grp+'"] .nav-group-head, [data-group="'+grp+'"] .nb');
@@ -1892,7 +1892,6 @@ function nav(p){
     if(gEl)gEl.classList.add('open');
   }
   pg=p;
-  try{localStorage.setItem('tb_last_page',p);}catch(e){}
   ({overview:loadOverview,positions:loadPositions,signals:loadSignals,
     markets:loadMarkets,performance:loadPerf,risk:loadRisk,
     btcintel:loadBtcIntel,
@@ -2036,7 +2035,7 @@ var HELP={
   },
   guide:{title:'Guide &amp; Playbook',group:'Guide',ico:'📖',
     what:'The dashboard user-manual — playbooks, per-page help, metric glossary, signal lifecycle, shortcuts, FAQ.',
-    howpro:['Press <span class="kbd">?</span> anywhere for contextual help on the current page.','Press <span class="kbd">⌘</span><span class="kbd">K</span> anywhere to jump to a page or search a symbol.'],
+    howpro:['Press <span class="kbd">?</span> anywhere for contextual help on the current page.','Press <span class="kbd">⌘</span>/<span class="kbd">Ctrl</span>+<span class="kbd">K</span> anywhere to jump to a page or search a symbol.'],
     metrics:[],
     next:[]
   }
@@ -2064,20 +2063,23 @@ function openHelp(p){
   if(h.next&&h.next.length){
     html+='<div class="help-section"><h4>What to do next</h4>';
     h.next.forEach(lbl=>{
-      var target=lbl.split('→').pop().trim().toLowerCase().replace(/[^a-z0-9]+/g,'_');
-      var slug=LABEL_TO_PAGE[lbl]||LABEL_TO_PAGE[target]||'';
+      var slug=LABEL_TO_PAGE[lbl]||'';
       if(slug)html+='<span class="help-xlink" onclick="nav(\''+slug+'\');closeHelp()">'+esc(lbl)+'</span>';
       else html+='<span class="help-xlink" style="opacity:.7">'+esc(lbl)+'</span>';
     });
     html+='</div>';
   }
-  html+='<div class="help-section" style="margin-top:22px"><h4>Shortcuts</h4><p style="font-size:11px"><span class="kbd">⌘</span><span class="kbd">K</span> palette · <span class="kbd">?</span> help · <span class="kbd">/</span> search · <span class="kbd">Esc</span> close</p></div>';
+  html+='<div class="help-section" style="margin-top:22px"><h4>Shortcuts</h4><p style="font-size:11px"><span class="kbd">⌘</span>/<span class="kbd">Ctrl</span>+<span class="kbd">K</span> palette · <span class="kbd">?</span> help · <span class="kbd">/</span> search · <span class="kbd">Esc</span> close</p></div>';
   body.innerHTML=html;
-  document.getElementById('help-drawer').classList.add('open');
+  var hd=document.getElementById('help-drawer');
+  hd.classList.add('open');
+  hd.setAttribute('aria-hidden','false');
   document.getElementById('help-overlay').style.display='block';
 }
 function closeHelp(){
-  document.getElementById('help-drawer').classList.remove('open');
+  var hd=document.getElementById('help-drawer');
+  hd.classList.remove('open');
+  hd.setAttribute('aria-hidden','true');
   document.getElementById('help-overlay').style.display='none';
 }
 
@@ -2099,11 +2101,17 @@ var LABEL_TO_PAGE={};
 /* ─── COMMAND PALETTE ─── */
 var _cmdkItems=[];
 function cmdkOpen(){
-  document.getElementById('cmdk-bg').classList.add('open');
+  var bg=document.getElementById('cmdk-bg');
+  bg.classList.add('open');
+  bg.setAttribute('aria-hidden','false');
   var inp=document.getElementById('cmdk-in');inp.value='';inp.focus();
   cmdkRender();
 }
-function cmdkClose(){document.getElementById('cmdk-bg').classList.remove('open');}
+function cmdkClose(){
+  var bg=document.getElementById('cmdk-bg');
+  bg.classList.remove('open');
+  bg.setAttribute('aria-hidden','true');
+}
 function cmdkBuildIndex(){
   var items=[];
   Object.keys(HELP).forEach(p=>{
@@ -2138,20 +2146,16 @@ function cmdkRender(){
     var arr=bySec[sec];if(!arr||!arr.length)return;
     html+='<div class="cmdk-sec">'+labels[sec]+'</div>';
     arr.slice(0,sec==='symbol'?20:8).forEach(x=>{
-      html+='<button class="cmdk-row" data-gi="'+gi+'" onclick="_cmdkClick('+gi+')"><span class="cmdk-ico">'+x.ico+'</span><span class="cmdk-title">'+esc(x.title)+'</span><span class="cmdk-sub">'+esc(x.sub||'')+'</span></button>';
+      html+='<button class="cmdk-row" role="option" data-gi="'+gi+'" onclick="_cmdkClick('+gi+')"><span class="cmdk-ico" aria-hidden="true">'+x.ico+'</span><span class="cmdk-title">'+esc(x.title)+'</span><span class="cmdk-sub">'+esc(x.sub||'')+'</span></button>';
       gi++;
     });
   });
   list.innerHTML=html;
-  // Track visible items for key-nav
+  // Track visible items for key-nav, in the same order as rendered
   _cmdkVisible=[];
-  list.querySelectorAll('.cmdk-row').forEach((el,i)=>{_cmdkVisible.push({el:el,item:filtered.filter(x=>true)[parseInt(el.dataset.gi)]});});
-  // easier: rebuild list in order
-  _cmdkVisible=[];
-  var visIdx=0;
   order.forEach(sec=>{
     var arr=bySec[sec];if(!arr||!arr.length)return;
-    arr.slice(0,sec==='symbol'?20:8).forEach(x=>{_cmdkVisible.push(x);visIdx++;});
+    arr.slice(0,sec==='symbol'?20:8).forEach(x=>{_cmdkVisible.push(x);});
   });
   _cmdkFocus=0;_cmdkUpdFocus();
 }
@@ -2231,12 +2235,12 @@ function freshBadge(ts,ttlSec){
   var t=typeof ts==='string'?(new Date(ts).getTime()/1000):parseFloat(ts);
   if(!t||isNaN(t))return '<span class="fresh fr-unknown">unknown</span>';
   var age=Math.max(0,Math.floor(Date.now()/1000-t));
-  var cls='fr-fresh',lbl=age+'s';
-  if(age>=ttlSec*4){cls='fr-stale';}
-  else if(age>=ttlSec){cls='fr-aging';}
+  var cls='fr-fresh',lbl=age+'s',status='fresh';
+  if(age>=ttlSec*4){cls='fr-stale';status='stale';}
+  else if(age>=ttlSec){cls='fr-aging';status='aging';}
   if(age>=60)lbl=Math.round(age/60)+'m';
   if(age>=3600)lbl=Math.round(age/3600)+'h';
-  return '<span class="fresh '+cls+'" title="Data age: '+age+'s · TTL '+ttlSec+'s">'+lbl+'</span>';
+  return '<span class="fresh '+cls+'" role="status" aria-label="Data status: '+status+', last update '+lbl+' ago" title="Data age: '+age+'s · TTL '+ttlSec+'s">'+lbl+'</span>';
 }
 
 /* ─── INFO BUTTON INJECTION (every page topbar gets an (i) ─── */
@@ -4612,7 +4616,7 @@ pollApprCnt();
 </div>
 
 <!-- ── HELP DRAWER ── -->
-<div class="help-drawer" id="help-drawer">
+<div class="help-drawer" id="help-drawer" role="dialog" aria-modal="true" aria-labelledby="help-title" aria-hidden="true">
   <div class="help-head">
     <div>
       <div class="help-title" id="help-title">Page Help</div>
@@ -4620,24 +4624,24 @@ pollApprCnt();
     </div>
     <div style="display:flex;gap:6px;align-items:center">
       <button class="btn btn-sm" onclick="nav('guide');closeHelp()">Full Guide →</button>
-      <button class="btn btn-sm" onclick="closeHelp()">✕</button>
+      <button class="btn btn-sm" onclick="closeHelp()" aria-label="Close help">✕</button>
     </div>
   </div>
   <div class="help-body" id="help-body">
     <div class="loading"><div class="spin"></div> Loading help…</div>
   </div>
 </div>
-<div id="help-overlay" style="display:none;position:fixed;inset:0;z-index:699" onclick="closeHelp()"></div>
+<div id="help-overlay" style="display:none;position:fixed;inset:0;z-index:699" onclick="closeHelp()" aria-hidden="true"></div>
 
 <!-- ── COMMAND PALETTE ── -->
-<div class="cmdk-bg" id="cmdk-bg" onclick="if(event.target===this)cmdkClose()">
+<div class="cmdk-bg" id="cmdk-bg" role="dialog" aria-modal="true" aria-label="Command palette" aria-hidden="true" onclick="if(event.target===this)cmdkClose()">
   <div class="cmdk">
     <div class="cmdk-in-wrap">
-      <span class="cmdk-hint">⌘</span>
-      <input type="text" id="cmdk-in" class="cmdk-in" placeholder="Jump to page, search symbol, run command…" oninput="cmdkRender()" onkeydown="cmdkKey(event)">
-      <span class="cmdk-kbd">Esc</span>
+      <span class="cmdk-hint" aria-hidden="true">⌘</span>
+      <input type="text" id="cmdk-in" class="cmdk-in" placeholder="Jump to page, search symbol, run command…" aria-label="Search pages, symbols and actions" oninput="cmdkRender()" onkeydown="cmdkKey(event)">
+      <span class="cmdk-kbd" aria-hidden="true">Esc</span>
     </div>
-    <div class="cmdk-list" id="cmdk-list"></div>
+    <div class="cmdk-list" id="cmdk-list" role="listbox"></div>
   </div>
 </div>
 
