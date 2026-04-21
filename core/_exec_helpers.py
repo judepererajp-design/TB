@@ -90,7 +90,11 @@ def trigger_adjustment_for_regime(
         (d == "SHORT" and b == "BEARISH" and r == "BEAR_TREND")
     )
 
-    if is_counter and r in ("BEAR_TREND", "CHOPPY") and adx >= 25:
+    # Counter-trend should tighten in *any* confirmed trending or choppy
+    # regime — both BEAR_TREND (original LONG vs bearish week) and
+    # BULL_TREND (SHORT vs bullish week) qualify.  Choppy still counts
+    # because counter-trend in chop tends to chop-out the stop.
+    if is_counter and r in ("BEAR_TREND", "BULL_TREND", "CHOPPY") and adx >= 25:
         return (max(base_min_triggers, 2),
                 f"counter-trend {d}/{r}/{b} adx={adx:.0f} → ratchet up")
     if is_with_trend and adx >= 25:

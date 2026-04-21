@@ -184,6 +184,41 @@ def _get_trigger_window_secs(setup_class: str) -> int:
     )
 
 
+# Gap 6 feedback loop — per-(strategy|regime|setup_class) min_triggers deltas
+# applied by track() on top of the static _STRATEGY_MIN_TRIGGERS table.
+# Populated by DiagnosticEngine._apply_known_change when an "execution_config"
+# LOW-risk proposal is approved (manually or via auto-apply).  Deltas are
+# clamped to [-2, +2] so a runaway tuner can't drive min_triggers negative
+# or absurdly high.  The floor at 1 trigger is re-applied at read time.
+_MIN_TRIG_BUCKET_DELTAS: Dict[str, int] = {}
+_MIN_TRIG_BUCKET_DELTA_CLAMP: int = 2
+
+
+def set_min_triggers_bucket_delta(bucket: str, delta: int) -> int:
+    """Record a clamped delta for (strategy|regime|setup_class) bucket.
+
+    Returns the clamped value actually stored.  A delta of 0 removes the
+    entry so lookups fall back to the static table cleanly.
+    """
+    try:
+        d = int(delta)
+    except (TypeError, ValueError):
+        return 0
+    d = max(-_MIN_TRIG_BUCKET_DELTA_CLAMP,
+            min(_MIN_TRIG_BUCKET_DELTA_CLAMP, d))
+    if not bucket:
+        return 0
+    if d == 0:
+        _MIN_TRIG_BUCKET_DELTAS.pop(bucket, None)
+    else:
+        _MIN_TRIG_BUCKET_DELTAS[bucket] = d
+    return d
+
+
+def get_min_triggers_bucket_delta(bucket: str) -> int:
+    return int(_MIN_TRIG_BUCKET_DELTAS.get(bucket or "", 0))
+
+
 def _distance_to_entry_zone(sig, price: float) -> float:
     if price <= 0:
         return 1.0
@@ -258,6 +293,18 @@ class TrackedExecution:
     min_triggers: int = 2              # V11: triggers needed (grade-dependent)
     setup_class: str = "intraday"      # FIX #31: scalp/intraday/swing/positional
     staleness_data: Optional[dict] = None  # BUG-13: conditions at signal creation time
+
+    # Gap 7 — cached raw_data snapshot from the signal so the pre-fill
+    # semantic-kill pass can evaluate CHoCH/BOS/Wyckoff/sweep fields that live
+    # only in raw_data.  Optional; falls back to {} when absent.
+    raw_data: Optional[dict] = None
+
+    # Gap 5 — effective required triggers at the most recent _check_triggers
+    # evaluation.  Starts at min_triggers and is raised by HTF-bear, low
+    # confidence, and decay adjustments in the watch loop.  Used when
+    # recording ALMOST→EXPIRED so tuner stats reflect the actual bar, not
+    # the nominal floor.  None until first evaluation.
+    last_required_triggers: Optional[int] = None
 
     # FIX #32: Trigger quality weights — structure_shift outweighs rejection_candle
     TRIGGER_WEIGHTS: dict = None  # set as class var below (dataclass limitation)
@@ -367,7 +414,8 @@ class ExecutionEngine:
               entry_low, entry_high, stop_loss, confidence,
               tp1=0.0, tp2=0.0, tp3=None, rr_ratio=0.0, message_id=None,
               grade: str = "B", staleness_data: Optional[dict] = None,
-              setup_class: str = "intraday"):
+              setup_class: str = "intraday",
+              raw_data: Optional[dict] = None):
         # Stop-loss / take-profit side sanity check: catches corrupted records
         # before they enter the tracker (e.g. SHORT with stop below entry would
         # silently lose the entire move once price moves the "wrong" way).
@@ -469,6 +517,30 @@ class ExecutionEngine:
         except Exception:
             pass
 
+        # Gap 6 feedback application — if the param-tuner has accepted a
+        # LOW-risk proposal for this (strategy|regime|setup_class) bucket,
+        # apply the clamped delta on top.  Floored at 1 so a bucket can never
+        # fire on 0 triggers (that's still reserved for immediate-entry
+        # strategies, which already have _min_trig=0 from the static table —
+        # and we intentionally skip the delta when _min_trig == 0 to preserve
+        # that intent).
+        try:
+            from analyzers.regime import regime_analyzer as _ee_ra2
+            _bkt_regime = getattr(_ee_ra2.regime, 'value', 'UNKNOWN')
+            _bkt_key = f"{strategy}|{_bkt_regime}|{setup_class or 'intraday'}"
+            _bkt_delta = get_min_triggers_bucket_delta(_bkt_key)
+            if _bkt_delta != 0 and _min_trig > 0:
+                _pre = _min_trig
+                _min_trig = max(1, int(_min_trig) + int(_bkt_delta))
+                if _min_trig != _pre:
+                    logger.info(
+                        f"ExecutionEngine: #{signal_id} {symbol} min_triggers "
+                        f"tuned {_pre}→{_min_trig} for bucket {_bkt_key} "
+                        f"(delta={_bkt_delta:+d})"
+                    )
+        except Exception:
+            pass
+
         # BUG-13: Snapshot baseline conditions at creation time for pre-fill staleness check.
         # When price finally reaches the zone hours later, we compare current conditions
         # against these baselines to detect if the market has genuinely reversed.
@@ -495,6 +567,7 @@ class ExecutionEngine:
             grade=grade, min_triggers=_min_trig,
             staleness_data=staleness_data,
             setup_class=setup_class,
+            raw_data=(dict(raw_data) if isinstance(raw_data, dict) else None),
         )
         self._tracked[signal_id].TRIGGER_WINDOW_SECS = _get_trigger_window_secs(setup_class)
         price_cache.subscribe(symbol)
@@ -779,7 +852,11 @@ class ExecutionEngine:
                         regime=_regime,
                         setup_class=getattr(sig, 'setup_class', 'intraday'),
                         score=sig.triggers_met,
-                        min_triggers=sig.min_triggers,
+                        min_triggers=(
+                            sig.last_required_triggers
+                            if sig.last_required_triggers is not None
+                            else sig.min_triggers
+                        ),
                     )
                 except Exception:
                     pass
@@ -878,6 +955,11 @@ class ExecutionEngine:
                 _required_triggers += 1
             if decayed_confidence <= sig.confidence - DECAY_TRIGGER_INCREMENT_THRESHOLD and _required_triggers < 4:
                 _required_triggers += 1
+
+            # Gap 5 — remember the effective (post-HTF / post-decay) trigger
+            # bar so ALMOST→EXPIRED feedback doesn't understate what was
+            # actually required at the moment of evaluation.
+            sig.last_required_triggers = _required_triggers
 
             if sig.triggers_met >= _required_triggers:
                 # BUG-13: Pre-fill staleness validation.
@@ -1072,7 +1154,7 @@ class ExecutionEngine:
                     tp3 = sig.tp3
                     confidence = sig.confidence
                     setup_class = getattr(sig, 'setup_class', 'intraday')
-                    raw_data = {}
+                    raw_data = sig.raw_data if isinstance(sig.raw_data, dict) else {}
                 _live_ctx = _bsc(_SignalContextShim())
                 _sem_reason = ExecutionQualityGate._check_semantic_kills(
                     direction=sig.direction,

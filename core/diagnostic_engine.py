@@ -527,6 +527,10 @@ class DiagnosticEngine:
                     return f"suppress_strategy:{new_value.get('strategy', '_')}"
                 if change_type == "exclude_symbol":
                     return f"exclude_symbol:{new_value.get('symbol', '_')}"
+                if change_type == "execution_config":
+                    # Bucket-aware key so per-(strategy|regime|setup_class)
+                    # proposals don't overwrite each other.
+                    return f"execution_config:{new_value.get('bucket', '_')}"
         except Exception:
             pass
         return change_type
@@ -573,6 +577,15 @@ class DiagnosticEngine:
                 _existing.reason = reason
                 _existing.risk_level = risk_level
                 _existing.estimated_impact = estimated_impact
+                # Refresh the auto-apply timer so a LOW-risk proposal always
+                # gets its full veto window from the most recent refresh, and
+                # a risk-level change (e.g. MEDIUM→LOW or LOW→HIGH) is
+                # reflected in the timer rather than inheriting the stale one.
+                try:
+                    from core._exec_helpers import auto_apply_at_for_risk as _aaar_refresh
+                    _existing.auto_apply_at = _aaar_refresh(risk_level, time.time())
+                except Exception:
+                    pass
                 logger.info(
                     f"🔬 Approval refreshed [{_existing.approval_id}] "
                     f"(duplicate suppressed): {description}"
@@ -804,9 +817,34 @@ In 1-2 sentences: should they approve or wait? Start with "Approve" or "Wait —
                 logger.info(f"  → Symbol excluded: {value['symbol']}")
 
             elif change_type == "execution_config":
-                # Execution funnel proposals are advisory — log that user acknowledged.
-                # The actual config change description is stored in the approval for audit.
-                logger.info(f"  → Execution config acknowledged: {str(value)[:120]}")
+                # Gap 6 wiring: LOW-risk proposals from governance.param_tuner
+                # for chronic ALMOST→EXPIRED buckets carry the target bucket
+                # and a clamped min_triggers delta. Apply it to the runtime
+                # override so track() reflects the tuner's verdict.
+                try:
+                    from core.execution_engine import set_min_triggers_bucket_delta
+                    if isinstance(value, dict):
+                        _bkt = value.get("bucket")
+                        _delta = value.get("min_triggers_delta", 0)
+                        if _bkt:
+                            _applied = set_min_triggers_bucket_delta(_bkt, _delta)
+                            logger.info(
+                                f"  → Execution config applied: "
+                                f"{_bkt} min_triggers_delta={_applied:+d}"
+                            )
+                        else:
+                            logger.info(
+                                f"  → Execution config acknowledged (no bucket): "
+                                f"{str(value)[:120]}"
+                            )
+                    else:
+                        logger.info(
+                            f"  → Execution config acknowledged: {str(value)[:120]}"
+                        )
+                except Exception as _exec_cfg_err:
+                    logger.warning(
+                        f"execution_config apply failed: {_exec_cfg_err}"
+                    )
 
         except Exception as e:
             logger.warning(f"In-memory apply failed ({change_type}): {e}")

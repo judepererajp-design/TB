@@ -608,6 +608,7 @@ class Engine:
                             tp1=signal.tp1, tp2=signal.tp2, tp3=signal.tp3,
                             rr_ratio=signal.rr_ratio, message_id=msg_id, grade="A",
                             setup_class=getattr(signal, 'setup_class', 'intraday'),
+                            raw_data=getattr(signal, 'raw_data', None),
                         )
                     else:
                         logger.info(f"⚡ A+ signal #{signal_id} — bypassing execution engine (immediate entry)")
@@ -651,6 +652,7 @@ class Engine:
                             message_id=msg_id,
                             grade=alpha_score.grade,
                             setup_class=getattr(signal, 'setup_class', 'intraday'),
+                            raw_data=getattr(signal, 'raw_data', None),
                         )
                     pass
         except Exception as e:
