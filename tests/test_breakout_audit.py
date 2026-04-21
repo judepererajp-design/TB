@@ -105,8 +105,11 @@ def test_breakout_adx_slope_check_in_source():
     src = inspect.getsource(__import__("strategies.breakout", fromlist=["BreakoutStrategy"]).BreakoutStrategy)
     assert "_adx_rising" in src
     assert "_adx_prev" in src
-    # Filter accepts rising slope as alternative
-    assert "adx < min_adx and not _adx_rising" in src
+    # Filter accepts rising slope as alternative. The actual guard is
+    # ``adx < min_adx and not (_adx_rising and adx > 15)`` — we assert on
+    # the stable leading fragment so future tweaks to the rising-slope
+    # escape hatch don't require editing this test.
+    assert "adx < min_adx and not (_adx_rising" in src
 
 
 # ── BR-Q3: false_breakout_filter penalty ─────────────────────────────────────

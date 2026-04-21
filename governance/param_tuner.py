@@ -92,6 +92,17 @@ class ParamTuner:
         self._last_run: float = 0.0
         self._loaded_from_db: bool = False  # lazy-load rollback state on first cycle
 
+        # Apr 2026 audit fix: independent throttle for the "no market-state
+        # data yet" skip log. Without this, callers that poll run_tuning_cycle
+        # every minute during bootstrap emit the same skip line every minute
+        # because _last_run (the 24h tuning throttle) never advances on the
+        # no-data path. The existing test invariant
+        # test_param_tuner_no_data_does_not_advance_last_run requires
+        # _last_run to stay at 0.0 in this case, so we use a separate field.
+        self._last_nodata_log: float = 0.0
+        # Emit the skip line at most once per hour while bootstrapping.
+        self._nodata_log_interval_s: float = 3600.0
+
         # Rollback support —————————————————————————————————————————
         # win rates recorded at the time of the last adjustment, keyed by state.
         # Used on the next cycle to detect regression.
@@ -135,7 +146,12 @@ class ParamTuner:
         # ── Step 1: Fetch statistics (7d primary, 30d fallback) ──────────
         stats_7d, stats_30d = await self._fetch_stats()
         if not stats_7d and not stats_30d:
-            logger.info("⚙️  param_tuner: no market-state data yet — skipping")
+            # Throttle log: emit at most once per self._nodata_log_interval_s.
+            # _last_run is deliberately NOT advanced (see __init__ comment).
+            _now_ts = time.time()
+            if _now_ts - self._last_nodata_log >= self._nodata_log_interval_s:
+                logger.info("⚙️  param_tuner: no market-state data yet — skipping")
+                self._last_nodata_log = _now_ts
             return []
 
         self._last_run = time.time()

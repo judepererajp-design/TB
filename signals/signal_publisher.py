@@ -226,6 +226,21 @@ class SignalPublisher:
         # Track per-symbol publish time for the min_signal_interval gate.
         self._last_symbol_publish[signal.symbol] = _now
 
+        # Trade-tape marker (Apr 2026): distinguish PUBLISHED from PASSED_AGGREGATOR
+        # so the tape no longer conflates aggregator approval with actual delivery.
+        try:
+            from utils.trade_logger import trade_logger as _pub_tl
+            _pub_tl.published(
+                signal_id=signal_id,
+                symbol=signal.symbol,
+                direction=_dir_str,
+                grade=_grade,
+                strategy=getattr(signal, 'strategy', '') or '',
+                message_id=msg_id,
+            )
+        except Exception:
+            pass
+
         # ── 2. Update DB with message ID ──────────────────────
         try:
             await db.update_signal_message_id(signal_id, msg_id)

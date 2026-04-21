@@ -94,6 +94,7 @@ class NoTradeZoneEngine:
         range_low: float = 0.0,
         session: str = "NEUTRAL",
         adx: float = 20.0,
+        regime: str = "UNKNOWN",
     ) -> NoTradeDecision:
         """
         Evaluate all no-trade rules and return combined decision.
@@ -221,17 +222,30 @@ class NoTradeZoneEngine:
         # Phase 9-12 audit fix: this rule was documented in the module
         # docstring but never implemented.  UTC 03:00-07:00 and weekends
         # are low-liquidity periods; signals are less reliable.
+        #
+        # Apr 2026 audit fix (dead-zone regime-aware): in strong trending
+        # regimes (BULL_TREND/BEAR_TREND) the regime floor is already 68
+        # and the news pre-gate can stack another ×0.70. A flat -8 on top
+        # of that makes the 03-07 UTC window nearly impossible to pass.
+        # Halve the dead-zone penalty in trending regimes where liquidity
+        # is naturally routed into the dominant direction.
         _session_upper = session.upper() if session else "NEUTRAL"
+        _regime_upper = (regime or "").upper()
+        _trend_regime = _regime_upper in ("BULL_TREND", "BEAR_TREND")
         if _session_upper == "DEAD_ZONE":
+            _dz_pen = 3 if _trend_regime else 8
             reasons.append(
-                "⚠️ Dead-zone session (03-07 UTC) — low liquidity, reduced confidence"
+                f"⚠️ Dead-zone session (03-07 UTC) — low liquidity, "
+                f"reduced confidence (-{_dz_pen}{' trend-scaled' if _trend_regime else ''})"
             )
-            total_penalty += 8
+            total_penalty += _dz_pen
         elif _session_upper == "WEEKEND":
+            _wk_pen = 2 if _trend_regime else 5
             reasons.append(
-                "⚠️ Weekend session — thin liquidity, reduced confidence"
+                f"⚠️ Weekend session — thin liquidity, "
+                f"reduced confidence (-{_wk_pen}{' trend-scaled' if _trend_regime else ''})"
             )
-            total_penalty += 5
+            total_penalty += _wk_pen
 
         # ── Compile result ─────────────────────────────────────────────
         if hard_blocks:

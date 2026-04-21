@@ -3236,6 +3236,7 @@ class Engine:
                         range_low=regime_analyzer.range_low,
                         session=regime_analyzer.session.value,  # Phase 9-12 fix: pass session for dead-zone rule
                         adx=_btc_adx,
+                        regime=getattr(regime_analyzer.regime, 'value', 'UNKNOWN'),
                     )
 
                     if ntze_result.hard_block and ntze_result.blocks(signal.strategy):
@@ -3705,12 +3706,20 @@ class Engine:
                     try:
                         _btc_ctx_pregate = btc_news_intelligence.get_event_context()
                         if _btc_ctx_pregate.is_active and _btc_ctx_pregate.confidence_mult != 1.0:
-                            scored.final_confidence = min(
-                                100, scored.final_confidence * _btc_ctx_pregate.confidence_mult
-                            )
-                            logger.info(
-                                f"   🗞️ {symbol}: BTC news pre-gate conf ×{_btc_ctx_pregate.confidence_mult:.2f}"
-                            )
+                            # Apr 2026 audit fix: direction-aware multiplier so
+                            # the friendly side of a news event isn't hit by
+                            # the same ×0.70 as the adverse side.
+                            _sig_dir_news = direction_str(signal) if hasattr(signal, 'direction') else ""
+                            _news_mult = _btc_ctx_pregate.conf_mult_for_direction(_sig_dir_news)
+                            if _news_mult != 1.0:
+                                scored.final_confidence = min(
+                                    100, scored.final_confidence * _news_mult
+                                )
+                                logger.info(
+                                    f"   🗞️ {symbol}: BTC news pre-gate conf ×{_news_mult:.2f} "
+                                    f"(raw={_btc_ctx_pregate.confidence_mult:.2f} "
+                                    f"dir={_sig_dir_news} ev={_btc_ctx_pregate.direction})"
+                                )
                         # ── Net news score bias adjustment ─────────────
                         # Aggregate of all recent headlines: boost longs in
                         # bullish regime, penalize in bearish, reduce size in mixed.
