@@ -1,0 +1,3 @@
+2026-04-21 01:02:39 | DAILY_RESET | hard_kill_cleared=False
+2026-04-21 01:02:39 | Circuit breaker daily counters reset
+2026-04-21 01:02:39 | Daily risk counters reset (risk_manager + circuit_breaker)
