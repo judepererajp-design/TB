@@ -421,12 +421,16 @@ class LLMReRanker:
         cap = int(NewsLLM.DISAGREEMENT_LOG_CAP)
         if len(self._disagreement_buffer) > cap:
             self._disagreement_buffer = self._disagreement_buffer[-cap:]
-        # Fire-and-forget persistence; tests supply a MagicMock db.
+        # Fire-and-forget persistence.  ``asyncio.get_running_loop()`` only
+        # returns inside an active loop (Python 3.10+ preferred API); if
+        # there is no running loop (e.g. unit tests calling the sync
+        # validation path) we just keep the in-memory buffer and skip
+        # persistence — tests can still read it via ``recent_disagreements``.
         try:
-            asyncio.get_event_loop().create_task(self._persist_disagreement())
+            loop = asyncio.get_running_loop()
         except RuntimeError:
-            # No running loop (sync test) — skip; buffer still readable.
-            pass
+            return
+        loop.create_task(self._persist_disagreement())
 
     async def _persist_disagreement(self) -> None:
         try:

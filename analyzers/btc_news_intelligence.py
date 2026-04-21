@@ -822,12 +822,18 @@ class BTCNewsIntelligence:
                         _body = str(h.get("body") or h.get("raw_text") or "")
                         break
                 # Best-effort hit count from single-headline classify for
-                # the sanity veto guard.
+                # the sanity veto guard.  NewsClassifier.classify() adds
+                # roughly +0.08 confidence per extra keyword hit on top of
+                # a base ~0.20, so we invert that schedule to recover an
+                # approximate hit count for the flip-guard threshold.
+                _CONF_HIT_BASE = 0.20
+                _CONF_HIT_STEP = 0.08
                 try:
                     _, _, _single_conf, _ = self._classifier.classify(winning_headline or "")
-                    # Approximate hit count from the base 0.25 + 0.08*(n-1)
-                    # schedule used in classify().  Reversed: n ≈ 1 + (conf-base)/0.08
-                    _hit_count = max(1, int(round(1 + (_single_conf - 0.20) / 0.08)))
+                    _hit_count = max(
+                        1,
+                        int(round(1 + (_single_conf - _CONF_HIT_BASE) / _CONF_HIT_STEP)),
+                    )
                 except Exception:
                     _hit_count = 1
                 rerank = await llm_reranker.rerank(

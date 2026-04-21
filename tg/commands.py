@@ -12,7 +12,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -622,7 +622,7 @@ class CommandsMixin:
         except ValueError:
             await update.message.reply_text("❌ conf_mult and size_mult must be numbers.")
             return
-        ttl_minutes: int = None  # default — store fills in
+        ttl_minutes: Optional[int] = None  # default — store fills in
         reason_start = 5
         if len(args) >= 6:
             try:

@@ -96,7 +96,7 @@ class NewsOverride:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "NewsOverride":
         # Filter to known fields so legacy / newer payloads don't crash.
-        known = {f for f in cls.__dataclass_fields__.keys()}  # type: ignore[attr-defined]
+        known = set(cls.__dataclass_fields__)  # type: ignore[attr-defined]
         return cls(**{k: v for k, v in d.items() if k in known})
 
     # ── Lifecycle predicates ──────────────────────────────────
