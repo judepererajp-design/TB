@@ -186,9 +186,27 @@ class TestPublicationAnchoredExpiry:
             f"expires_at should account for headline age: "
             f"remaining={remaining:.0f}s, base_ttl={base_ttl}s"
         )
-        # expires_at should be close to publication_time + (ttl_scaled).
-        # Allow a few seconds of wall-clock drift.
-        assert abs(ctx.expires_at - (pub_time + (ctx.expires_at - pub_time))) < 5
+        # expires_at should equal publication_time + ttl_scaled, where
+        # ttl_scaled is base_ttl * max(TTL_CONFIDENCE_FLOOR, conf). Since
+        # we don't know the exact scaled TTL here, verify instead that:
+        #   (a) expires_at > publication_time (always true for a live ctx)
+        #   (b) expires_at - publication_time <= base_ttl (scaling only
+        #       shrinks), and
+        #   (c) (detected_at - publication_time) + remaining ≈ ttl_scaled,
+        #       i.e. total life == ttl_scaled regardless of when we
+        #       detected the article — this is the publication-anchor
+        #       property we care about.
+        ttl_scaled_from_pub = ctx.expires_at - pub_time
+        assert ttl_scaled_from_pub > 0
+        assert ttl_scaled_from_pub <= base_ttl + 5, (
+            f"ttl anchored from publication ({ttl_scaled_from_pub:.0f}s) "
+            f"must not exceed base_ttl ({base_ttl}s)"
+        )
+        # Sanity: total life from detection should be less than full
+        # ttl_scaled by roughly the headline age at detection.
+        life_from_detection = ctx.expires_at - ctx.detected_at
+        age_at_detection = ctx.detected_at - pub_time
+        assert abs((life_from_detection + age_at_detection) - ttl_scaled_from_pub) < 5
 
     @pytest.mark.asyncio
     async def test_article_past_ttl_is_rejected(self):

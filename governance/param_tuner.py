@@ -136,9 +136,6 @@ class ParamTuner:
         stats_7d, stats_30d = await self._fetch_stats()
         if not stats_7d and not stats_30d:
             logger.info("⚙️  param_tuner: no market-state data yet — skipping")
-            # Update _last_run so the next "no data" log is throttled by
-            # the normal tuning interval instead of re-firing every cycle.
-            self._last_run = time.time()
             return []
 
         self._last_run = time.time()
