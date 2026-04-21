@@ -630,10 +630,25 @@ class EnsembleVoter:
 
         # Log at appropriate levels: normal SUPPRESS=info, anomalous streaks=warning,
         # BOOST/REDUCE=info, PASS=debug.
+        # Streak warning boundary: only warn at {N=threshold, 2N, 3N, 5N, 10N}
+        # boundaries instead of every increment past N. Prevents 20+ identical
+        # "Ensemble ZEC SUPPRESS streak=20..23..24" warnings when the veto is
+        # stable across many scan cycles.
+        _streak_boundaries = {
+            SUPPRESS_STREAK_WARNING_THRESHOLD,
+            SUPPRESS_STREAK_WARNING_THRESHOLD * 2,
+            SUPPRESS_STREAK_WARNING_THRESHOLD * 3,
+            SUPPRESS_STREAK_WARNING_THRESHOLD * 5,
+            SUPPRESS_STREAK_WARNING_THRESHOLD * 10,
+        }
+        _warn_streak = (
+            action == "SUPPRESS"
+            and _suppress_streak in _streak_boundaries
+        )
         _log_fn = (
-            logger.warning if action == "SUPPRESS" and _suppress_streak >= SUPPRESS_STREAK_WARNING_THRESHOLD
+            logger.warning if _warn_streak
             else logger.info if action in ("BOOST", "REDUCE")
-            else logger.info if action == "SUPPRESS"
+            else logger.info if action == "SUPPRESS" and _suppress_streak < SUPPRESS_STREAK_WARNING_THRESHOLD
             else logger.debug
         )
         if action == "SUPPRESS":

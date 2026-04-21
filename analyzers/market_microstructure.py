@@ -960,6 +960,12 @@ def _fmt_usd(v: float) -> str:
 
 # ── Feature 9: Pump/Dump Detection ────────────────────────────────────────────
 
+# Module-level dedup for the pump/dump WARNING (see detect_pump_dump). Keyed
+# on f"{symbol}:{direction}:{risk_level}:{round1(price)}:{round50(volume)}"
+# so the log only repeats when the event signature meaningfully changes.
+_PD_LAST_LOG: Dict[str, float] = {}
+
+
 @dataclass
 class PumpDumpAlert:
     """Detected pump/dump event."""
@@ -1050,11 +1056,32 @@ def detect_pump_dump(
         is_no_trade=is_no_trade,
     )
 
-    logger.warning(
-        f"🚨 PUMP/DUMP {direction}: {symbol} price={price_change_pct:+.1f}% "
-        f"volume={volume_change_pct:+.0f}% risk={risk_level} "
-        f"no_trade={is_no_trade} news_correlated={has_correlated_news}"
-    )
+    # Event-dedup: a pump/dump that persists for 30+ minutes (e.g. PIEVERSE
+    # staying at price=-16% vol=+541% risk=VERY_HIGH) emitted one WARNING per
+    # scan cycle — 20+ identical log lines per event in production. Keep the
+    # first alert WARN-level, then log repeats as DEBUG until the event
+    # signature changes or 15 min has passed (whichever comes first).
+    _pd_event_sig = f"{symbol}:{direction}:{risk_level}:{round(abs_price, 1)}:{round(abs_volume / 50.0) * 50}"
+    _now_ts = time.time()
+    _last_ts = _PD_LAST_LOG.get(_pd_event_sig, 0.0)
+    # Opportunistic GC — drop entries older than 1h so the dict can't grow
+    # unbounded across a multi-day run.
+    if len(_PD_LAST_LOG) > 512:
+        _cutoff = _now_ts - 3600
+        for _k in [k for k, t in _PD_LAST_LOG.items() if t < _cutoff]:
+            _PD_LAST_LOG.pop(_k, None)
+    if _now_ts - _last_ts > 900:  # 15 min
+        logger.warning(
+            f"🚨 PUMP/DUMP {direction}: {symbol} price={price_change_pct:+.1f}% "
+            f"volume={volume_change_pct:+.0f}% risk={risk_level} "
+            f"no_trade={is_no_trade} news_correlated={has_correlated_news}"
+        )
+        _PD_LAST_LOG[_pd_event_sig] = _now_ts
+    else:
+        logger.debug(
+            f"pump/dump persist: {symbol} {direction} risk={risk_level} "
+            f"price={price_change_pct:+.1f}% vol={volume_change_pct:+.0f}%"
+        )
 
     if ff.is_shadow("PUMP_DUMP_DETECTION"):
         shadow_log("PUMP_DUMP_DETECTION", {

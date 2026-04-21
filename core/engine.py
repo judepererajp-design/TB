@@ -2950,7 +2950,26 @@ class Engine:
                                     detail=_pd_reason,
                                     extra=_pd_debug,
                                 )
-                                logger.warning("🚫 %s suppressed by pump/dump guard | %s", symbol, _pd_reason)
+                                # Dedup guard log — 15 min per (symbol, risk_level, direction).
+                                # The underlying pump/dump analyzer already dedups its 🚨
+                                # log on the same signature; suppress this engine-side
+                                # mirror the same way to stop doubling the noise.
+                                if not hasattr(self, '_pd_guard_last_log'):
+                                    self._pd_guard_last_log: Dict[str, float] = {}
+                                _pd_key = f"{symbol}:{_pd_alert.direction}:{_pd_alert.risk_level}"
+                                _pd_now = time.time()
+                                _pd_last = self._pd_guard_last_log.get(_pd_key, 0.0)
+                                if len(self._pd_guard_last_log) > 1024:
+                                    _pd_cutoff = _pd_now - 3600
+                                    self._pd_guard_last_log = {
+                                        k: t for k, t in self._pd_guard_last_log.items()
+                                        if t > _pd_cutoff
+                                    }
+                                if _pd_now - _pd_last > 900:
+                                    logger.warning("🚫 %s suppressed by pump/dump guard | %s", symbol, _pd_reason)
+                                    self._pd_guard_last_log[_pd_key] = _pd_now
+                                else:
+                                    logger.debug("🚫 %s suppressed by pump/dump guard (repeat) | %s", symbol, _pd_reason)
                                 return
 
                     _fear_greed_adj = (

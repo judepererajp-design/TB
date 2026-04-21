@@ -663,11 +663,37 @@ class SignalAggregator:
         _RR_SANITY_CAP = Penalties.RR_SANITY_CAP
         _rr_before_cap = signal.rr_ratio
         if signal.rr_ratio > _RR_SANITY_CAP:
-            logger.warning(
-                f"⚠️ RR sanity: {signal.symbol} {signal.strategy} "
-                f"R/R={signal.rr_ratio:.1f}R exceeds cap — TP levels may be miscalculated. "
-                f"Capping display at {_RR_SANITY_CAP}R."
-            )
+            # Log dedup: in live flow the same (symbol, strategy) fires the cap
+            # dozens of times per hour (500+ warnings observed for SMC +
+            # PriceAction + GeometricPattern:FallingWedge). Emit the full
+            # WARNING once per (symbol, strategy) per hour; subsequent caps go
+            # to DEBUG. The cap itself, the confluence tag, and
+            # `raw_data['rr_capped']` all still fire so downstream behavior is
+            # unchanged — only the log volume is reduced.
+            _cap_key = f"{signal.symbol}:{signal.strategy}"
+            _now = time.time()
+            if not hasattr(self, '_rr_cap_last_log'):
+                self._rr_cap_last_log: Dict[str, float] = {}
+            _last = self._rr_cap_last_log.get(_cap_key, 0.0)
+            # Opportunistic GC so the dict can't grow unbounded across a
+            # multi-day run (each new symbol:strategy pair adds one entry).
+            if len(self._rr_cap_last_log) > 2048:
+                self._rr_cap_last_log = {
+                    k: t for k, t in self._rr_cap_last_log.items()
+                    if _now - t < 3600
+                }
+            if _now - _last > 3600:
+                logger.warning(
+                    f"⚠️ RR sanity: {signal.symbol} {signal.strategy} "
+                    f"R/R={signal.rr_ratio:.1f}R exceeds cap — TP levels may be miscalculated. "
+                    f"Capping display at {_RR_SANITY_CAP}R."
+                )
+                self._rr_cap_last_log[_cap_key] = _now
+            else:
+                logger.debug(
+                    f"RR sanity (repeat): {signal.symbol} {signal.strategy} "
+                    f"R/R={signal.rr_ratio:.1f}R → {_RR_SANITY_CAP}R"
+                )
             signal.rr_ratio = _RR_SANITY_CAP
             signal.confluence.append(
                 f"⚠️ R/R capped at {_RR_SANITY_CAP}R — original {verified_rr:.1f}R suggests "
