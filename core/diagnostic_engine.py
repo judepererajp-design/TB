@@ -60,6 +60,12 @@ class PendingApproval:
     # Personalised AI verdict generated at proposal time using live bot metrics
     user_verdict: str = ""    # "Your win rate is X%. AI says: approve/wait because..."
     verdict_approve: bool = True  # True=lean approve, False=lean reject/wait
+    # Option B — tiered auto-approval.  LOW risk proposals set this to now+VETO;
+    # the diagnostic watch loop applies them automatically if the user has not
+    # tapped NO by then.  MEDIUM and HIGH keep auto_apply_at = 0 (manual only).
+    # Rollback snapshot is always captured on auto-apply so a bad change can be
+    # reverted via /undo <approval_id>.
+    auto_apply_at: float = 0.0
 
 
 @dataclass
@@ -294,6 +300,75 @@ class DiagnosticEngine:
         except Exception:
             pass
 
+    # Gap 6 — ALMOST→EXPIRED feedback for the param tuner.
+    # Accumulated in a per-bucket counter so the tuner can propose lowering
+    # require_triggers for (strategy, regime, setup_class) combinations that
+    # chronically stall in ALMOST without firing.  Bucket keys expire after
+    # 14 days so an old regime's data doesn't bias tuning forever.
+    _ALMOST_EXPIRED_BUCKET_TTL_SEC: float = 14 * 86400
+
+    def record_almost_expired(self, *, strategy: str, regime: str,
+                               setup_class: str, score: float,
+                               min_triggers: float) -> None:
+        """Record a signal that reached ALMOST but timed out without firing.
+
+        The param tuner inspects the resulting bucket counters in its 24h
+        cycle: if a single bucket has ≥ MIN_TRADES * 3 almost-expired events
+        with median (score / min_triggers) ≥ 0.6, the bucket is a candidate
+        for a 1-step trigger-threshold relaxation.  The relaxation flows
+        through the normal LOW-risk auto-approval path (Option B).
+        """
+        if not hasattr(self, '_almost_expired_log'):
+            self._almost_expired_log: List[dict] = []
+        now = time.time()
+        # Prune stale entries in-line (cheap; bounded log size).
+        cutoff = now - self._ALMOST_EXPIRED_BUCKET_TTL_SEC
+        if self._almost_expired_log and self._almost_expired_log[0]['ts'] < cutoff:
+            self._almost_expired_log = [
+                e for e in self._almost_expired_log if e['ts'] >= cutoff
+            ]
+        self._almost_expired_log.append({
+            'ts': now,
+            'strategy': strategy or 'UNKNOWN',
+            'regime': regime or 'UNKNOWN',
+            'setup_class': setup_class or 'intraday',
+            'score': float(score or 0.0),
+            'min_triggers': float(min_triggers or 0.0),
+        })
+        # Hard cap on log length so it never grows pathologically.
+        if len(self._almost_expired_log) > 5000:
+            self._almost_expired_log = self._almost_expired_log[-5000:]
+
+    def get_almost_expired_buckets(self) -> Dict[str, dict]:
+        """Aggregate almost-expired events into (strategy|regime|setup_class) buckets.
+
+        Returns a dict keyed by bucket string with stats:
+          {'count', 'median_fill_ratio', 'sample_size'}
+        where fill_ratio = score / min_triggers for each event.
+
+        The tuner reads this to decide whether to propose a threshold change.
+        """
+        if not hasattr(self, '_almost_expired_log'):
+            return {}
+        buckets: Dict[str, List[float]] = {}
+        for e in self._almost_expired_log:
+            key = f"{e['strategy']}|{e['regime']}|{e['setup_class']}"
+            mt = e['min_triggers']
+            ratio = (e['score'] / mt) if (mt and mt > 0) else 0.0
+            buckets.setdefault(key, []).append(ratio)
+        out: Dict[str, dict] = {}
+        for key, ratios in buckets.items():
+            ratios_sorted = sorted(ratios)
+            n = len(ratios_sorted)
+            median = (ratios_sorted[n // 2] if n % 2
+                      else (ratios_sorted[n // 2 - 1] + ratios_sorted[n // 2]) / 2)
+            out[key] = {
+                'count': n,
+                'median_fill_ratio': median,
+                'sample_size': n,
+            }
+        return out
+
     def record_scan(self):
         self._scan_count += 1
         self._total_scan_count += 1
@@ -524,6 +599,14 @@ class DiagnosticEngine:
 
         import uuid
         approval_id = str(uuid.uuid4())[:8]
+        # Option B — tiered auto-approval window: LOW risk proposals auto-apply
+        # after the veto window; MEDIUM/HIGH require manual tap.  Computed once
+        # at proposal time so the watch loop only needs cheap comparisons.
+        try:
+            from core._exec_helpers import auto_apply_at_for_risk as _aaar
+            _auto_at = _aaar(risk_level, time.time())
+        except Exception:
+            _auto_at = 0.0
         approval = PendingApproval(
             approval_id=approval_id,
             change_type=change_type,
@@ -534,6 +617,7 @@ class DiagnosticEngine:
             risk_level=risk_level,
             estimated_impact=estimated_impact,
             expires_at=time.time() + 86400,  # Expires in 24h
+            auto_apply_at=_auto_at,
         )
         # ── Generate personalised "should you approve?" verdict ──────────────
         # Pull live bot metrics and ask AI to give a specific recommendation
@@ -611,6 +695,69 @@ In 1-2 sentences: should they approve or wait? Start with "Approve" or "Wait —
         except Exception as e:
             logger.error(f"Failed to apply approval {approval_id}: {e}")
             return False
+
+    async def apply_all_low_risk(self) -> List[str]:
+        """Option B — batch-apply every currently pending LOW-risk proposal.
+
+        Returns the list of approval_ids that were successfully applied.
+        Intended for /approve_all_low in Telegram.  MEDIUM and HIGH are
+        deliberately excluded — they always require per-item review.
+        """
+        applied: List[str] = []
+        for approval_id, approval in list(self._pending_approvals.items()):
+            if str(approval.risk_level or "").upper() != "LOW":
+                continue
+            try:
+                if await self.apply_approval(approval_id):
+                    applied.append(approval_id)
+            except Exception as e:
+                logger.error(
+                    f"apply_all_low_risk: failed #{approval_id}: {e}"
+                )
+        if applied:
+            logger.info(
+                f"✅ Batch-applied {len(applied)} LOW-risk approval(s): "
+                f"{', '.join(applied)}"
+            )
+        return applied
+
+    async def _process_auto_apply(self) -> None:
+        """Option B — auto-apply mature LOW-risk proposals whose veto window elapsed.
+
+        Called from the watch loop.  For each pending approval with a non-zero
+        auto_apply_at ≤ now, we fire apply_approval() and emit a brief
+        notification via on_send_report so the user knows to tap /undo if
+        they disagree.  Rollback snapshot is the standard _applied_overrides
+        entry, so /undo works identically for manual and auto-applied changes.
+        """
+        now = time.time()
+        mature: List[PendingApproval] = []
+        for a in list(self._pending_approvals.values()):
+            if a.auto_apply_at and a.auto_apply_at <= now:
+                if a.expires_at and a.expires_at <= now:
+                    # Also-expired — let the normal expiry path handle it.
+                    continue
+                mature.append(a)
+
+        for a in mature:
+            try:
+                ok = await self.apply_approval(a.approval_id)
+            except Exception as e:
+                logger.error(
+                    f"_process_auto_apply: failed #{a.approval_id}: {e}"
+                )
+                continue
+            if ok and self.on_send_report:
+                try:
+                    _desc = (a.description or "")[:100]
+                    await self.on_send_report(
+                        f"🤖 <b>Auto-applied LOW-risk change</b>\n"
+                        f"[{a.approval_id}] {_desc}\n"
+                        f"Reason: {(a.reason or '')[:120]}\n"
+                        f"Use /undo {a.approval_id} to revert."
+                    )
+                except Exception:
+                    pass
 
     async def undo_change(self, approval_id: str) -> bool:
         """Revert an applied change."""
@@ -696,6 +843,15 @@ In 1-2 sentences: should they approve or wait? Start with "Approve" or "Wait —
                 await self._check_signal_drought()
                 await self._check_edge_cases()
                 await self._check_performance_gaps()
+
+                # Option B — auto-apply mature LOW-risk proposals.  Runs every
+                # watch cycle; individual proposals are only applied once their
+                # auto_apply_at timestamp has passed.  MEDIUM/HIGH are never
+                # auto-applied regardless of age.
+                try:
+                    await self._process_auto_apply()
+                except Exception as _aa_err:
+                    logger.debug(f"_process_auto_apply error: {_aa_err}")
 
                 # Run AI dead signal analysis (V2.09: every 2h, was 30min — saves ~36 calls/day)
                 try:

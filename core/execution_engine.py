@@ -421,19 +421,31 @@ class ExecutionEngine:
         else:
             _min_trig = _grade_trig
 
-        # FIX: Counter-trend signals in bear/choppy regimes require +1 trigger
-        # Evidence: AAVE LONG entered on 1.3/1 score (liquidity reaction only) — lost $193
-        # KITE LONG entered on 2.2/1 score — lost $638. Both counter-trend in BEAR_TREND.
+        # FIX: Symmetric regime-aware trigger adjustment.
+        # Previously we only *ratcheted up* for counter-trend (AAVE / KITE losses
+        # at 1.3–2.2/1 score in BEAR_TREND).  The inverse is equally valid: a
+        # LONG in a confirmed BULL_TREND with weekly ADX≥25 is buying dips in a
+        # trending market, and should be allowed to fire on one fewer trigger
+        # (floored at 1).  core/_exec_helpers.trigger_adjustment_for_regime
+        # encapsulates both sides so the rule is testable and symmetric.
         try:
             from analyzers.regime import regime_analyzer as _ee_ra
             from analyzers.htf_guardrail import htf_guardrail as _ee_htf
+            from core._exec_helpers import trigger_adjustment_for_regime as _ee_adj
             _ee_regime = _ee_ra.regime.value
-            _is_counter = (
-                (direction == "LONG" and _ee_htf._weekly_bias == "BEARISH") or
-                (direction == "SHORT" and _ee_htf._weekly_bias == "BULLISH")
+            _adj_min, _adj_note = _ee_adj(
+                direction=direction,
+                regime=_ee_regime,
+                weekly_bias=_ee_htf._weekly_bias,
+                weekly_adx=_ee_htf._weekly_adx,
+                base_min_triggers=_min_trig,
             )
-            if _is_counter and _ee_regime in ("BEAR_TREND", "CHOPPY") and _ee_htf._weekly_adx >= 25:
-                _min_trig = max(_min_trig, 2)  # Always need at least 2 triggers for counter-trend
+            if _adj_note:
+                _min_trig = _adj_min
+                logger.info(
+                    f"ExecutionEngine: #{signal_id} {symbol} {direction} "
+                    f"min_triggers adjusted — {_adj_note}"
+                )
         except Exception:
             pass
 
@@ -733,6 +745,40 @@ class ExecutionEngine:
                     f"ExecutionEngine: #{sig.signal_id} {sig.symbol} EXPIRED "
                     f"(in ALMOST for {(now - sig.almost_since)/3600:.1f}h)"
                 )
+                # Gap 6: feed ALMOST→EXPIRED into the diagnostic / param tuner.
+                # Chronic "zone reached, triggers never confluenced" means the
+                # trigger threshold for this (strategy, regime, setup_class)
+                # bucket may be too strict — the tuner accumulates these events
+                # and can propose lowering require_triggers for that bucket.
+                try:
+                    from core.diagnostic_engine import diagnostic_engine as _de
+                    from analyzers.regime import regime_analyzer as _ra
+                    _regime = getattr(_ra.regime, 'value', 'UNKNOWN')
+                    _de.record_almost_expired(
+                        strategy=sig.strategy,
+                        regime=_regime,
+                        setup_class=getattr(sig, 'setup_class', 'intraday'),
+                        score=sig.triggers_met,
+                        min_triggers=sig.min_triggers,
+                    )
+                except Exception:
+                    pass
+
+        # Gap 3: expire signals whose live RR has decayed below 1.0 after
+        # SL tightening.  We only fire this in pre-fill states because once the
+        # signal has fired we're in the outcome monitor's domain.
+        if (
+            sig.state in (SignalState.APPROVED, SignalState.PREPARING,
+                          SignalState.WATCHING, SignalState.ENTRY_ZONE,
+                          SignalState.ALMOST)
+            and getattr(sig, '_rr_decay_flag', False)
+        ):
+            _live_rr = getattr(sig, '_live_rr', 0.0)
+            sig.state = SignalState.EXPIRED
+            logger.info(
+                f"ExecutionEngine: #{sig.signal_id} {sig.symbol} EXPIRED "
+                f"(RR_DECAY live_rr={_live_rr:.2f} < 1.0 after SL tightening)"
+            )
 
         if (
             decayed_confidence <= 50.0
@@ -972,6 +1018,45 @@ class ExecutionEngine:
             signal_age_hours = (time.time() - sig.created_at) / 3600
             ohlcv_1h = None
 
+            # ── Gap 4: re-run semantic kills against live context ──────
+            # setup_context on the signal was built at creation.  By fill time,
+            # a CHoCH may have formed, the weekly trend may have flipped, or
+            # Wyckoff phase may have rolled — all things _check_semantic_kills
+            # already knows how to detect, and all things that should block an
+            # execution regardless of microstructure triggers lining up.
+            # This is the second call of the same helper (aggregator already
+            # runs it at publish time), this time with a freshly rebuilt
+            # setup_context so the semantic read is current.
+            try:
+                from analyzers.execution_gate import ExecutionQualityGate
+                from signals.context_contracts import build_setup_context as _bsc
+
+                class _ShimSig:
+                    symbol = sig.symbol
+                    direction = sig.direction
+                    strategy = sig.strategy
+                    entry_low = sig.entry_low
+                    entry_high = sig.entry_high
+                    stop_loss = sig.stop_loss
+                    tp1 = sig.tp1
+                    tp2 = sig.tp2
+                    tp3 = sig.tp3
+                    confidence = sig.confidence
+                    setup_class = getattr(sig, 'setup_class', 'intraday')
+                    raw_data = {}
+                _live_ctx = _bsc(_ShimSig())
+                _sem_reason = ExecutionQualityGate._check_semantic_kills(
+                    direction=sig.direction,
+                    setup_context=_live_ctx,
+                    execution_context=None,
+                )
+                if _sem_reason:
+                    return f"PRE_FILL_SEMANTIC_KILL: {_sem_reason[:100]}"
+            except Exception as _sk_err:
+                logger.debug(
+                    f"Pre-fill semantic kill check skipped (non-fatal): {_sk_err}"
+                )
+
             # ── Check 0: local-range drift before execute ──────────────
             # A setup can be valid at publish time but become a bad live trade if
             # price runs into the wrong side of a tight local range before triggers complete.
@@ -1193,6 +1278,74 @@ class ExecutionEngine:
         else:
             atr_14 = rng * 0.5
         avg_vol = float(np.mean(vols[-10:])) if len(vols) >= 10 else float(vols[-1])
+
+        # ── Gap 1: Vol-aware trigger window refresh ─────────────────────────
+        # Recompute TRIGGER_WINDOW_SECS from live ATR %.  Compare recent ATR %
+        # (last 5 bars) to baseline ATR % (last 20 bars).  In fast vol the
+        # confluence window shortens; in quiet markets it stretches.  We scale
+        # off the setup-class-derived base so the original 4-bar heuristic is
+        # preserved as the neutral point.
+        try:
+            if len(closes) >= 5 and len(_tr) >= 20 and c > 0:
+                atr_pct_recent = float(np.mean(_tr[-5:])) / c
+                atr_pct_baseline = float(np.mean(_tr[-20:])) / c
+                if atr_pct_recent > 0 and atr_pct_baseline > 0:
+                    from core._exec_helpers import scale_trigger_window as _vscale
+                    _base_w = _get_trigger_window_secs(
+                        getattr(sig, 'setup_class', 'intraday')
+                    )
+                    sig.TRIGGER_WINDOW_SECS = _vscale(
+                        _base_w, atr_pct_recent, atr_pct_baseline,
+                        min_secs=TRIGGER_WINDOW_MIN_SECS,
+                        max_secs=TRIGGER_WINDOW_MAX_SECS,
+                    )
+        except Exception:
+            pass
+
+        # ── Gap 3: SL refresh against newest swing pivot + RR decay check ───
+        # Between publication and fill, a new swing pivot may have formed closer
+        # to entry.  Tightening SL to that pivot preserves RR integrity and
+        # avoids giving away an entire leg of stop distance that the original
+        # computation left behind.  Never loosens (max/min with original).
+        #
+        # After tightening, if the resulting RR to TP1 has decayed below 1.0,
+        # we mark the signal RR_DECAY and let the top-level _check expire it.
+        try:
+            from core._exec_helpers import (
+                tightened_sl as _tsl, compute_rr as _crr,
+            )
+            # Nearest opposite-side pivot in the last ~12 bars of the confirm TF.
+            if len(closes) >= 12:
+                window = closes[-12:]
+                if sig.direction == "LONG":
+                    pivot = float(np.min(lows[-12:]))
+                    new_sl = _tsl(sig.direction, sig.stop_loss, pivot)
+                elif sig.direction == "SHORT":
+                    pivot = float(np.max(highs[-12:]))
+                    new_sl = _tsl(sig.direction, sig.stop_loss, pivot)
+                else:
+                    new_sl = sig.stop_loss
+                if new_sl != sig.stop_loss:
+                    _old = sig.stop_loss
+                    sig.stop_loss = float(new_sl)
+                    logger.info(
+                        f"🎯 SL tightened | #{sig.signal_id} {sig.symbol} "
+                        f"{sig.direction} | {_old:.6g} → {sig.stop_loss:.6g} "
+                        f"(pivot={pivot:.6g})"
+                    )
+                # Recompute RR to TP1 from current mid-entry.  If RR floor
+                # collapses below 1.0 after repricing, stamp rr_decay so the
+                # top-level _check path can expire the signal cleanly.
+                if sig.tp1 and sig.entry_mid > 0:
+                    _live_rr = _crr(
+                        sig.direction, sig.entry_mid, sig.stop_loss, sig.tp1,
+                    )
+                    sig._live_rr = _live_rr  # exposed for logging / expire
+                    if _live_rr > 0 and _live_rr < 1.0:
+                        sig._rr_decay_flag = True
+        except Exception:
+            pass
+
 
         # Trigger 1: rejection candle — wick-heavy candle with meaningful size
         #
