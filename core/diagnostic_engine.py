@@ -357,15 +357,13 @@ class DiagnosticEngine:
             ratio = (e['score'] / mt) if (mt and mt > 0) else 0.0
             buckets.setdefault(key, []).append(ratio)
         out: Dict[str, dict] = {}
+        import statistics as _stats
         for key, ratios in buckets.items():
-            ratios_sorted = sorted(ratios)
-            n = len(ratios_sorted)
-            median = (ratios_sorted[n // 2] if n % 2
-                      else (ratios_sorted[n // 2 - 1] + ratios_sorted[n // 2]) / 2)
+            median = _stats.median(ratios) if ratios else 0.0
             out[key] = {
-                'count': n,
+                'count': len(ratios),
                 'median_fill_ratio': median,
-                'sample_size': n,
+                'sample_size': len(ratios),
             }
         return out
 

@@ -152,8 +152,15 @@ def compute_rr(direction: str, entry: float, stop_loss: float,
     return reward / risk
 
 
+#: Buffer (as a fraction) used when tightening an SL past a newly formed
+#: swing pivot.  15 bps keeps us just below (LONG) or just above (SHORT) the
+#: pivot — close enough to preserve the risk tightening but with margin for
+#: wick noise that would otherwise stop us out prematurely.
+SL_TIGHTENING_BUFFER_PCT: float = 0.0015
+
+
 def tightened_sl(direction: str, original_sl: float, swing_pivot: float,
-                 buffer_pct: float = 0.0015) -> float:
+                 buffer_pct: float = SL_TIGHTENING_BUFFER_PCT) -> float:
     """Return the *tighter* of (original_sl, swing_pivot ± buffer).
 
     For a LONG, tighter means higher (closer to entry).  For a SHORT,

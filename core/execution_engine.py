@@ -1051,7 +1051,16 @@ class ExecutionEngine:
                 from analyzers.execution_gate import ExecutionQualityGate
                 from signals.context_contracts import build_setup_context as _bsc
 
-                class _ShimSig:
+                class _SignalContextShim:
+                    """Minimal SignalResult-shaped adapter for build_setup_context().
+
+                    build_setup_context reads a handful of attributes off the
+                    signal object to construct the structure/pattern/location
+                    dicts.  We rebuild it here from the live TrackedExecution
+                    so Wyckoff-phase flips, CHoCH formations, and trend
+                    reversals since publication are visible to the semantic
+                    kill pass.
+                    """
                     symbol = sig.symbol
                     direction = sig.direction
                     strategy = sig.strategy
@@ -1064,7 +1073,7 @@ class ExecutionEngine:
                     confidence = sig.confidence
                     setup_class = getattr(sig, 'setup_class', 'intraday')
                     raw_data = {}
-                _live_ctx = _bsc(_ShimSig())
+                _live_ctx = _bsc(_SignalContextShim())
                 _sem_reason = ExecutionQualityGate._check_semantic_kills(
                     direction=sig.direction,
                     setup_context=_live_ctx,
