@@ -649,11 +649,6 @@ class RegimeAnalyzer:
         # A single "blip" detection (e.g. VOLATILE during a rally) would previously
         # reset count to 0, causing the real trend transition to never be detected.
         # Now we decay the counter by 1 on a mismatch instead of resetting to 0.
-        _large_distance = (
-            (self._regime in (Regime.CHOPPY, Regime.BEAR_TREND) and proposed_regime == Regime.BULL_TREND) or
-            (self._regime in (Regime.CHOPPY, Regime.BULL_TREND) and proposed_regime == Regime.BEAR_TREND) or
-            (self._regime == Regime.VOLATILE and proposed_regime != Regime.VOLATILE)
-        )
         # FIX #30: Volatility spike fast-path.
         # If ATR has expanded > 2.5× its 20-bar average, this is a real volatility event
         # (flash crash, major news). The 5-cycle delay would leave the bot in NEUTRAL/CHOPPY
@@ -678,11 +673,18 @@ class RegimeAnalyzer:
             self._regime_candidate = proposed_regime
             self._regime_candidate_count = 0
         elif proposed_regime == self._regime_candidate:
-            # Same candidate as last cycle — increment counter
+            # Same candidate as last cycle — increment counter.
             self._regime_candidate_count += 1
-            # Large distance transitions (e.g. CHOPPY→BULL) confirm after 1 cycle;
-            # FIX #30: reduced from 2→1 for VOLATILE transitions (any volatile candidate)
-            _threshold = 1 if (_large_distance or proposed_regime == Regime.VOLATILE) else 2
+            # Historical (pre-Apr-2026) behaviour: `_large_distance` flips such as
+            # CHOPPY→BULL committed after ONE matching cycle. In practice this
+            # caused the regime to flap between CHOPPY and BULL_TREND when the
+            # discriminating feature (e.g. BTC ADX) hovered right at the
+            # classification threshold — chop=0.64 with ADX ≈ chop_adx_max+5
+            # would re-commit on every 300s tick. Require 2 matching cycles for
+            # *all* discretionary transitions; keep the fast-path only for true
+            # VOLATILE events (ATR spikes are a real discontinuity and need
+            # immediate action).
+            _threshold = 1 if proposed_regime == Regime.VOLATILE else 2
             if self._regime_candidate_count >= _threshold:
                 if self._regime != proposed_regime:
                     self._last_regime_change_at = time.time()

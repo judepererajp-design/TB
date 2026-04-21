@@ -103,6 +103,14 @@ class DiagnosticEngine:
 
         # Scan stats (per-report cycle — reset after each 6h diagnostic report)
         self._scan_count: int = 0
+
+        # Errors.log ingestion — tail-read the shared log file so errors
+        # logged via the root logger (not via explicit record_error calls)
+        # still surface in diagnostic reports. Offset persists across loop
+        # iterations so we only ever read the tail since last poll.
+        self._errors_log_path: str = "logs/errors.log"
+        self._errors_log_offset: int = 0
+        self._errors_log_last_poll: float = 0.0
         self._signals_generated: int = 0
         # Cumulative totals (never reset — true uptime stats for dashboard)
         self._total_scan_count: int = 0
@@ -158,6 +166,83 @@ class DiagnosticEngine:
             self._task.cancel()
 
     # ── Observation feeds (called by engine.py) ───────────────
+
+    _ERRORS_LOG_MAX_BYTES = 2_000_000   # read at most 2 MB per poll
+    _ERRORS_LOG_MIN_INTERVAL = 60.0     # don't re-poll more than once/min
+    _ERRORS_LOG_MAX_LINES = 400         # cap per-poll ingest
+
+    def _ingest_errors_log(self) -> None:
+        """Tail-read logs/errors.log and feed new ERROR/CRITICAL lines
+        into ``record_error``.
+
+        Many modules log via the root logger (which fans out to errors.log
+        through the configured file handler) but never call record_error
+        explicitly. Without ingestion, those errors never surface in the 6h
+        diagnostic report. The poll is cheap (seek to last offset) and
+        rate-limited to at most once per minute.
+        """
+        try:
+            now = time.time()
+            if now - self._errors_log_last_poll < self._ERRORS_LOG_MIN_INTERVAL:
+                return
+            self._errors_log_last_poll = now
+
+            import os
+            path = self._errors_log_path
+            if not os.path.exists(path):
+                return
+            size = os.path.getsize(path)
+
+            # Log rotation / truncation: reset offset if file shrank.
+            if size < self._errors_log_offset:
+                self._errors_log_offset = 0
+
+            # Cap how far we seek back on first read so we don't ingest the
+            # entire historical file on startup.
+            if self._errors_log_offset == 0 and size > self._ERRORS_LOG_MAX_BYTES:
+                self._errors_log_offset = size - self._ERRORS_LOG_MAX_BYTES
+
+            if size <= self._errors_log_offset:
+                return  # nothing new
+
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                fh.seek(self._errors_log_offset)
+                chunk = fh.read(self._ERRORS_LOG_MAX_BYTES)
+                self._errors_log_offset = fh.tell()
+
+            # Parse lines of the form:
+            #   YYYY-MM-DD HH:MM:SS ... - <module> - ERROR - <message>
+            #   YYYY-MM-DD HH:MM:SS ... - <module> - CRITICAL - <message>
+            import re as _re_log
+            pattern = _re_log.compile(
+                r" - (?P<module>[\w\.]+) - (?P<level>ERROR|CRITICAL) - (?P<msg>.+)"
+            )
+            count = 0
+            for line in chunk.splitlines():
+                if count >= self._ERRORS_LOG_MAX_LINES:
+                    break
+                m = pattern.search(line)
+                if not m:
+                    continue
+                module = m.group("module") or "unknown"
+                msg = (m.group("msg") or "").strip()
+                # Derive a coarse error_type from the message (first 1-3 words)
+                # so repeated errors aggregate on the ErrorRecord counter.
+                first = msg.split(":", 1)[0].strip()
+                error_type = (first[:40] if first else m.group("level")) or "ERROR"
+                try:
+                    # Skip lines we already recorded via explicit record_error
+                    # to avoid double-counting. We cannot reliably distinguish
+                    # them, but the keyed aggregation in record_error merges
+                    # duplicates into a single ErrorRecord by count, so the
+                    # effect is just a slightly higher count — acceptable.
+                    self.record_error(module, error_type, msg[:240])
+                except Exception:
+                    pass
+                count += 1
+        except Exception as _ingest_err:
+            # Never let log ingestion break the watch loop.
+            logger.debug(f"errors.log ingestion failed (non-fatal): {_ingest_err}")
 
     def record_error(self, module: str, error_type: str, message: str, symbol: str = ""):
         """Called by engine whenever an error occurs."""
@@ -606,6 +691,7 @@ In 1-2 sentences: should they approve or wait? Start with "Approve" or "Wait —
         await asyncio.sleep(30)  # Let bot warm up first
         while self._running:
             try:
+                self._ingest_errors_log()
                 await self._check_error_rate()
                 await self._check_signal_drought()
                 await self._check_edge_cases()
@@ -1016,6 +1102,56 @@ In 1-2 sentences: should they approve or wait? Start with "Approve" or "Wait —
                             )
                 except Exception:
                     pass
+
+        # ── Per-symbol underperformance auto-exclude ─────────────────────
+        # Parallel to the per-strategy suppression above. Symbols that keep
+        # generating losing signals should be auto-excluded via the same
+        # approval flow so the user remains in control. Threshold is stricter
+        # than per-strategy: 8+ closed trades and < 25% win rate over 72h
+        # (longer window since per-symbol sample size is smaller).
+        recent_72h = [o for o in self._outcome_log if now - o["ts"] < 72 * 3600]
+        sym_outcomes: Dict[str, List[bool]] = defaultdict(list)
+        for o in recent_72h:
+            _sym = o.get("symbol") or ""
+            if _sym:
+                sym_outcomes[_sym].append(o["outcome"] == "WIN")
+        for sym, results in sym_outcomes.items():
+            if len(results) < 8:
+                continue
+            swr = sum(results) / len(results)
+            if swr >= 0.25:
+                continue
+            try:
+                from scanner.scanner import scanner as _sc
+                # Already excluded?  scanner exposes an _excluded set; skip in
+                # that case to avoid noisy re-proposal. Defensive — attribute
+                # names may vary across builds.
+                _already = False
+                for _attr in ("_excluded_symbols", "_excluded", "excluded_symbols"):
+                    _cont = getattr(_sc, _attr, None)
+                    if _cont and sym in _cont:
+                        _already = True
+                        break
+                if _already:
+                    continue
+            except Exception:
+                pass
+            _dedup_key = f"perf_exclude:{sym}"
+            if now - self._last_proposals.get(_dedup_key, 0) > 24 * 3600:
+                self._last_proposals[_dedup_key] = now
+                try:
+                    await self.propose_change(
+                        change_type="exclude_symbol",
+                        description=f"Exclude {sym} for 24h (win rate: {swr:.0%} over {len(results)} trades)",
+                        old_value={"symbol": sym, "excluded": False},
+                        new_value={"symbol": sym, "duration_mins": 1440},
+                        reason=(f"{sym} win rate: {swr:.0%} over {len(results)} closed trades "
+                                f"in last 72h. Below 25% threshold — auto-exclude recommended."),
+                        risk_level="LOW",
+                        estimated_impact="Removes losing symbol from scan universe; can be reversed manually.",
+                    )
+                except Exception as _pe_err:
+                    logger.debug(f"perf_exclude proposal failed ({sym}): {_pe_err}")
 
         # ── Confidence floor raise-back: detect if a previously-lowered
         # confidence floor is now producing too many low-quality signals ─────

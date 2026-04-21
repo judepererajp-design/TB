@@ -143,6 +143,11 @@ class TelegramBot(CommandsMixin, CallbacksMixin):
         # Control panel
         self._panel_message_id: Optional[int] = None
 
+        # News-risk alert dedup — key=(event_type, headline_hash) → last send ts.
+        # Prevents the same geopolitical story (e.g. multiple US-Iran / Hormuz
+        # headlines within an hour) from firing 5× in a row.
+        self._news_alert_dedup: Dict[str, float] = {}
+
         # Multi-step state for text input
         self._awaiting_entry:   dict = {}
         self._awaiting_outcome: dict = {}
@@ -862,6 +867,36 @@ class TelegramBot(CommandsMixin, CallbacksMixin):
         Called via btc_news_intelligence.on_risk_event callback when a
         MACRO_RISK_OFF or other bearish event context is created.
         """
+        # ── Topic dedup ──────────────────────────────────────────────────
+        # Within a 45-min window, collapse alerts that share both the event
+        # type *and* a normalized headline signature (lowercase, alphanumeric,
+        # truncated). Without this, overlapping US-Iran / Strait-of-Hormuz
+        # headlines arriving minutes apart each fire their own push alert
+        # (observed: 5× in a row with identical severity).
+        try:
+            import re as _re_news
+            _TTL_SEC = 45 * 60
+            _now_ts = time.time()
+            _ev_type = getattr(getattr(ctx, 'event_type', None), 'value', '') or ''
+            _headline = (getattr(ctx, 'headline', '') or '')[:200].lower()
+            _norm = _re_news.sub(r'[^a-z0-9]+', '', _headline)[:80]
+            _topic_key = f"{_ev_type}::{_norm}"
+            # GC stale entries (bounded dict growth).
+            _stale = [k for k, t in self._news_alert_dedup.items() if _now_ts - t > _TTL_SEC]
+            for k in _stale:
+                self._news_alert_dedup.pop(k, None)
+            _last = self._news_alert_dedup.get(_topic_key, 0.0)
+            if _last and _now_ts - _last < _TTL_SEC:
+                logger.info(
+                    f"🔕 Suppressed duplicate news alert (topic='{_ev_type}', "
+                    f"headline={_headline[:60]!r}, last fired {int(_now_ts - _last)}s ago)"
+                )
+                return
+            self._news_alert_dedup[_topic_key] = _now_ts
+        except Exception as _dedup_err:
+            # Dedup must never prevent a genuine alert — log and fall through.
+            logger.debug(f"news alert dedup failed (non-fatal): {_dedup_err}")
+
         try:
             # Build event header
             _severity_emoji = {"EXTREME": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "⚪"}.get(
@@ -1113,13 +1148,27 @@ class TelegramBot(CommandsMixin, CallbacksMixin):
                             "momentum","ichimoku","elliott_wave","funding_arb","wyckoff",
                             "harmonic","geometric","range_scalper"]
             _n_strats = sum(1 for s in _strat_names if cfg.is_strategy_enabled(s))
+            # Use the live adaptive floor (matches what the aggregator gate
+            # actually enforces) instead of the static config value, so the
+            # banner doesn't claim "Min conf 60/100" while the real gate sits
+            # at ~66 because the 40th-percentile adaptive floor kicked in.
+            try:
+                from signals.aggregator import signal_aggregator as _agg
+                _eff_min = float(_agg.get_effective_min_confidence())
+            except Exception:
+                _eff_min = float(cfg.aggregator.get('min_confidence', 70))
+            _raw_min = float(cfg.aggregator.get('min_confidence', 70))
+            if _eff_min > _raw_min + 0.5:
+                _min_conf_line = f"Min conf   {_eff_min:.0f}/100 (adaptive · cfg {int(_raw_min)})\n\n"
+            else:
+                _min_conf_line = f"Min conf   {int(_eff_min)}/100\n\n"
             text = (
                 f"⚡ <b>TitanBot Pro v{version} — Online</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"Mode       {mode}\n"
                 f"Regime     {r_emoji} <b>{regime}</b>\n"
                 f"Universe   {universe} symbols · {_n_strats} strategies\n"
-                f"Min conf   {cfg.aggregator.get('min_confidence', 70)}/100\n\n"
+                f"{_min_conf_line}"
                 f"<b>Channels</b>\n"
                 f"📊 Signals channel  — Executable setups\n"
                 f"📡 Market channel   — Digests every 4h\n"

@@ -412,6 +412,35 @@ class SignalAggregator:
         """
         self._deduplicator.unmark(symbol, direction)
 
+    def get_effective_min_confidence(self) -> float:
+        """Return the live effective minimum confidence threshold.
+
+        Matches the adaptive formula inside ``process()``:
+
+            max(config_floor, min(ADAPTIVE_FLOOR_MAX_CAP,
+                                  percentile(recent_buffer,
+                                             ADAPTIVE_FLOOR_PERCENTILE)))
+
+        Exposed as a public helper so surfaces like the Telegram startup
+        banner / /status card show the same number the gate actually uses,
+        instead of the raw `cfg.aggregator.min_confidence` which can be
+        many points below the live floor once the rolling buffer warms up.
+        """
+        try:
+            from config.constants import Grading  # local import for test isolation
+            recent_scores = list(self._recent_score_buffer)
+            if len(recent_scores) >= Grading.ADAPTIVE_FLOOR_MIN_HISTORY:
+                adaptive_floor = float(np.percentile(
+                    recent_scores, Grading.ADAPTIVE_FLOOR_PERCENTILE
+                ))
+                return float(max(
+                    self._min_confidence,
+                    min(Grading.ADAPTIVE_FLOOR_MAX_CAP, adaptive_floor),
+                ))
+        except Exception:
+            pass
+        return float(self._min_confidence)
+
     def _check_day_rollover(self):
         """FIX M5: Reset daily counts when UTC date changes (survives restarts via date check).
         FIX MEMORY-LEAK: Also purge stale entries from _daily_count_times to prevent
@@ -632,6 +661,7 @@ class SignalAggregator:
         # If we see 13.6R it almost always means TP3 was calculated incorrectly.
         # Cap display at 8R and add a flag so the user knows the levels may be off.
         _RR_SANITY_CAP = Penalties.RR_SANITY_CAP
+        _rr_before_cap = signal.rr_ratio
         if signal.rr_ratio > _RR_SANITY_CAP:
             logger.warning(
                 f"⚠️ RR sanity: {signal.symbol} {signal.strategy} "
@@ -643,6 +673,15 @@ class SignalAggregator:
                 f"⚠️ R/R capped at {_RR_SANITY_CAP}R — original {verified_rr:.1f}R suggests "
                 f"TP calculation may be off. Verify TP3 before sizing."
             )
+            # Expose the cap in raw_data so the Telegram card can surface it
+            # as a prominent warning line instead of burying it in Tier 3
+            # confluence (which the formatter truncates to 3 items and often
+            # drops entirely when higher-tier confluence is present).
+            if signal.raw_data is None:
+                signal.raw_data = {}
+            signal.raw_data['rr_capped'] = True
+            signal.raw_data['rr_original'] = round(float(verified_rr), 2)
+            signal.raw_data['rr_cap_reason'] = 'sanity'
 
         # ── Enforce max_rr from risk config ──────────────────────────
         # The user-configurable max_rr (default 6.0) was defined in settings.yaml
@@ -663,6 +702,15 @@ class SignalAggregator:
                 f"{_user_max_rr:.1f}R (risk.max_rr)"
             )
             signal.rr_ratio = round(_user_max_rr, 2)
+            # Surface the cap on the card. If the sanity cap already set the
+            # flag, keep the original (pre-any-cap) rr_ratio — which may be
+            # the sanity-cap value — and don't overwrite the reason string.
+            if signal.raw_data is None:
+                signal.raw_data = {}
+            if not signal.raw_data.get('rr_capped'):
+                signal.raw_data['rr_capped'] = True
+                signal.raw_data['rr_original'] = round(float(_rr_before_cap), 2)
+                signal.raw_data['rr_cap_reason'] = 'max_rr'
 
         # ── Resync TP2 after any RR cap ──────────────────────────────────
         # Capping rr_ratio without adjusting TP2 means the exchange receives
