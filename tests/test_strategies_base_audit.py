@@ -29,7 +29,10 @@ def test_indicator_cache_is_populated_for_repeated_calls():
 
 
 def test_bollinger_nan_is_guarded_in_strategies():
-    rev_src = inspect.getsource(ReversalStrategy.analyze)
+    # ``ReversalStrategy.analyze`` is a thin error-handling wrapper that
+    # delegates to ``_analyze`` where the BB NaN guard lives.  Inspect
+    # both so the assertion stays stable if the wrapper layer changes.
+    rev_src = inspect.getsource(ReversalStrategy._analyze)
     pa_src = inspect.getsource(PriceActionStrategy)
     assert "np.isfinite(bb_mid)" in rev_src
     assert "np.isfinite(bb_upper)" in pa_src

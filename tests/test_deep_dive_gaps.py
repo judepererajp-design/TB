@@ -14,17 +14,36 @@ from unittest.mock import MagicMock, patch, PropertyMock
 import pytest
 
 # Pre-mock heavy modules that risk.manager imports transitively
-# (circuit_breaker → cfg.risk.circuit_breaker, database → aiosqlite)
+# (circuit_breaker → cfg.risk.circuit_breaker, database → aiosqlite).
+# Track which entries we inserted so we can pop them in a module-scoped
+# teardown — otherwise these MagicMocks leak into sibling test files
+# (e.g. test_log_issue_fixes.py then gets a MagicMock PerformanceTracker).
+_INSERTED_MOCK_MODULES = []
 if "risk.circuit_breaker" not in sys.modules:
     _mock_cb_mod = MagicMock()
     _mock_cb_mod.circuit_breaker = MagicMock()
     sys.modules["risk.circuit_breaker"] = _mock_cb_mod
+    _INSERTED_MOCK_MODULES.append("risk.circuit_breaker")
 
 if "data.database" not in sys.modules:
     sys.modules["data.database"] = MagicMock()
+    _INSERTED_MOCK_MODULES.append("data.database")
 
-if "governance.performance_tracker" not in sys.modules:
-    sys.modules["governance.performance_tracker"] = MagicMock()
+# NOTE: do NOT pre-mock ``governance.performance_tracker`` here.
+# It imports cleanly under the conftest.py mock set, and installing a
+# MagicMock for it at module-import time leaks to every later test file
+# that does ``from governance.performance_tracker import ...`` at module
+# scope (e.g. test_log_issue_fixes.py), breaking real behaviour checks.
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _cleanup_mocked_sys_modules():
+    """Remove the MagicMock shims this module installed so later tests
+    re-import the real modules (e.g. governance.performance_tracker).
+    """
+    yield
+    for _name in _INSERTED_MOCK_MODULES:
+        sys.modules.pop(_name, None)
 
 # ═══════════════════════════════════════════════════════════
 # GAP 1: Regime transition → risk manager Kelly reduction

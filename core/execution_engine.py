@@ -786,7 +786,11 @@ class ExecutionEngine:
                     f"ExecutionEngine: #{sig.signal_id} {sig.symbol} invalidated by BTC news "
                     f"block — {_btc_block_reason}"
                 )
-                return
+                # Fall through (no early return) so the terminal-state
+                # pathway at the end of _check fires on_stage_change and
+                # pops the signal out of self._tracked.  An early return
+                # here would leave the INVALIDATED signal sitting in the
+                # tracked map and re-checked forever.
         except Exception:
             pass
 
