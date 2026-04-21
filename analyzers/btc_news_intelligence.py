@@ -727,6 +727,27 @@ class BTCNewsIntelligence:
                 ttl_scale = max(NewsIntelligence.TTL_CONFIDENCE_FLOOR, conf)
                 ttl = int(base_ttl * ttl_scale)
 
+                # ── Publication-anchored staleness gate ───────────
+                # Anchor expiry to the headline's publication time,
+                # not the bot's detection time. Otherwise restarting
+                # the bot N minutes after an article was published
+                # re-arms a brand-new full-duration penalty window,
+                # even though the market has already digested the
+                # news. If the article is already older than its
+                # effective TTL at detection, skip activating the
+                # context entirely.
+                if _winning_published_at > 0:
+                    _age_at_detection = max(0.0, now - _winning_published_at)
+                    if _age_at_detection >= ttl:
+                        logger.info(
+                            f"🕐 BTC event skipped (already past TTL): "
+                            f"{etype.value} age={_age_at_detection/60:.0f}m "
+                            f"ttl={ttl/60:.0f}m"
+                        )
+                        _should_update = False
+
+            if _should_update:
+
                 adj_key = (etype, direction) if (etype, direction) in self._adjustments \
                           else (etype, "NEUTRAL") if (etype, "NEUTRAL") in self._adjustments \
                           else None
@@ -783,12 +804,28 @@ class BTCNewsIntelligence:
                 sources = list({h.get("source", "unknown") for h in btc_headlines[:3]})
                 _detected_at = time.time()
 
+                # ── Publication-anchored expiry ───────────────────
+                # Anchor expires_at to when the article was published
+                # rather than when the bot happened to detect it. This
+                # preserves the natural "news decays with age" property
+                # across bot restarts: a 2-hour-old article that passes
+                # the freshness gate has ~ttl - 2h of life remaining,
+                # not a full fresh ttl window.
+                if _winning_published_at > 0:
+                    _expires_at = _winning_published_at + ttl
+                    # Guarantee at least 1 minute of active context once we
+                    # reach this point (staleness was already checked above).
+                    if _expires_at - _detected_at < 60:
+                        _expires_at = _detected_at + 60
+                else:
+                    _expires_at = _detected_at + ttl
+
                 self._current_ctx = BTCEventContext(
                     event_type      = etype,
                     confidence      = conf,
                     direction       = direction,
                     detected_at     = _detected_at,
-                    expires_at      = _detected_at + ttl,
+                    expires_at      = _expires_at,
                     confidence_mult = adj.get("confidence_mult", 1.0),
                     block_longs     = adj.get("block_longs", False),
                     block_shorts    = adj.get("block_shorts", False),

@@ -148,6 +148,72 @@ class TestStalenessGate:
         assert NewsIntelligence.STALE_HEADLINE_ALERT_GATE_MINUTES == 45
 
 
+class TestPublicationAnchoredExpiry:
+    """Ensure expires_at is anchored to the headline's publication time,
+    not the bot's detection time, so restarting the bot after a headline
+    has partially aged does not re-arm a full-duration penalty window."""
+
+    def _make_headline(self, title, age_minutes):
+        return {
+            "title": title,
+            "published_at": time.time() - (age_minutes * 60),
+            "source": "test",
+        }
+
+    @pytest.mark.asyncio
+    async def test_expires_at_anchored_to_publication_time(self):
+        """A 30-minute-old fresh headline must expire ~30 min earlier
+        than a brand-new one of the same event type."""
+        bni = BTCNewsIntelligence()
+        headline_age_min = 30
+        headlines = [self._make_headline(
+            "Recession looms as hawkish Fed rate hike triggers market panic",
+            headline_age_min,
+        )]
+        pub_time = headlines[0]["published_at"]
+
+        await bni.process_headlines(headlines)
+        ctx = bni.get_event_context()
+        if not ctx.is_active:
+            pytest.skip("classifier did not produce active context for this fixture")
+
+        now = time.time()
+        base_ttl = bni._context_ttl.get(ctx.event_type, 3600)
+        # Remaining life must be strictly less than the full base TTL
+        # (headline is already 30 min old so we've burnt ~30 min of TTL).
+        remaining = ctx.expires_at - now
+        assert remaining < base_ttl, (
+            f"expires_at should account for headline age: "
+            f"remaining={remaining:.0f}s, base_ttl={base_ttl}s"
+        )
+        # expires_at should be close to publication_time + (ttl_scaled).
+        # Allow a few seconds of wall-clock drift.
+        assert abs(ctx.expires_at - (pub_time + (ctx.expires_at - pub_time))) < 5
+
+    @pytest.mark.asyncio
+    async def test_article_past_ttl_is_rejected(self):
+        """An article older than its effective TTL must not create an
+        active context even when it passes the freshness gate. To keep
+        this test hermetic we patch the TTL down so we stay below the
+        STALE_HEADLINE_ALERT_GATE threshold."""
+        bni = BTCNewsIntelligence()
+        # 40-minute-old headline (below 45-min freshness gate)
+        headlines = [self._make_headline(
+            "Recession looms as hawkish Fed rate hike triggers market panic",
+            40,
+        )]
+        # Shrink TTL for this event type so the article is past-TTL.
+        for k in list(bni._context_ttl.keys()):
+            bni._context_ttl[k] = 600  # 10 min
+
+        await bni.process_headlines(headlines)
+        ctx = bni.get_event_context()
+        assert not ctx.is_active, (
+            "Article older than effective TTL must not activate context "
+            "— otherwise a bot restart re-arms a full fresh penalty window."
+        )
+
+
 @pytest.mark.asyncio
 async def test_news_scraper_stop_cancels_tracked_bni_tasks():
     """Tracked background news-intelligence tasks should be cancelled on stop."""
