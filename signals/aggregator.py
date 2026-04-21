@@ -412,6 +412,35 @@ class SignalAggregator:
         """
         self._deduplicator.unmark(symbol, direction)
 
+    def get_effective_min_confidence(self) -> float:
+        """Return the live effective minimum confidence threshold.
+
+        Matches the adaptive formula inside ``process()``:
+
+            max(config_floor, min(ADAPTIVE_FLOOR_MAX_CAP,
+                                  percentile(recent_buffer,
+                                             ADAPTIVE_FLOOR_PERCENTILE)))
+
+        Exposed as a public helper so surfaces like the Telegram startup
+        banner / /status card show the same number the gate actually uses,
+        instead of the raw `cfg.aggregator.min_confidence` which can be
+        many points below the live floor once the rolling buffer warms up.
+        """
+        try:
+            from config.constants import Grading  # local import for test isolation
+            recent_scores = list(self._recent_score_buffer)
+            if len(recent_scores) >= Grading.ADAPTIVE_FLOOR_MIN_HISTORY:
+                adaptive_floor = float(np.percentile(
+                    recent_scores, Grading.ADAPTIVE_FLOOR_PERCENTILE
+                ))
+                return float(max(
+                    self._min_confidence,
+                    min(Grading.ADAPTIVE_FLOOR_MAX_CAP, adaptive_floor),
+                ))
+        except Exception:
+            pass
+        return float(self._min_confidence)
+
     def _check_day_rollover(self):
         """FIX M5: Reset daily counts when UTC date changes (survives restarts via date check).
         FIX MEMORY-LEAK: Also purge stale entries from _daily_count_times to prevent
@@ -632,17 +661,53 @@ class SignalAggregator:
         # If we see 13.6R it almost always means TP3 was calculated incorrectly.
         # Cap display at 8R and add a flag so the user knows the levels may be off.
         _RR_SANITY_CAP = Penalties.RR_SANITY_CAP
+        _rr_before_cap = signal.rr_ratio
         if signal.rr_ratio > _RR_SANITY_CAP:
-            logger.warning(
-                f"⚠️ RR sanity: {signal.symbol} {signal.strategy} "
-                f"R/R={signal.rr_ratio:.1f}R exceeds cap — TP levels may be miscalculated. "
-                f"Capping display at {_RR_SANITY_CAP}R."
-            )
+            # Log dedup: in live flow the same (symbol, strategy) fires the cap
+            # dozens of times per hour (500+ warnings observed for SMC +
+            # PriceAction + GeometricPattern:FallingWedge). Emit the full
+            # WARNING once per (symbol, strategy) per hour; subsequent caps go
+            # to DEBUG. The cap itself, the confluence tag, and
+            # `raw_data['rr_capped']` all still fire so downstream behavior is
+            # unchanged — only the log volume is reduced.
+            _cap_key = f"{signal.symbol}:{signal.strategy}"
+            _now = time.time()
+            if not hasattr(self, '_rr_cap_last_log'):
+                self._rr_cap_last_log: Dict[str, float] = {}
+            _last = self._rr_cap_last_log.get(_cap_key, 0.0)
+            # Opportunistic GC so the dict can't grow unbounded across a
+            # multi-day run (each new symbol:strategy pair adds one entry).
+            if len(self._rr_cap_last_log) > 2048:
+                self._rr_cap_last_log = {
+                    k: t for k, t in self._rr_cap_last_log.items()
+                    if _now - t < 3600
+                }
+            if _now - _last > 3600:
+                logger.warning(
+                    f"⚠️ RR sanity: {signal.symbol} {signal.strategy} "
+                    f"R/R={signal.rr_ratio:.1f}R exceeds cap — TP levels may be miscalculated. "
+                    f"Capping display at {_RR_SANITY_CAP}R."
+                )
+                self._rr_cap_last_log[_cap_key] = _now
+            else:
+                logger.debug(
+                    f"RR sanity (repeat): {signal.symbol} {signal.strategy} "
+                    f"R/R={signal.rr_ratio:.1f}R → {_RR_SANITY_CAP}R"
+                )
             signal.rr_ratio = _RR_SANITY_CAP
             signal.confluence.append(
                 f"⚠️ R/R capped at {_RR_SANITY_CAP}R — original {verified_rr:.1f}R suggests "
                 f"TP calculation may be off. Verify TP3 before sizing."
             )
+            # Expose the cap in raw_data so the Telegram card can surface it
+            # as a prominent warning line instead of burying it in Tier 3
+            # confluence (which the formatter truncates to 3 items and often
+            # drops entirely when higher-tier confluence is present).
+            if signal.raw_data is None:
+                signal.raw_data = {}
+            signal.raw_data['rr_capped'] = True
+            signal.raw_data['rr_original'] = round(float(verified_rr), 2)
+            signal.raw_data['rr_cap_reason'] = 'sanity'
 
         # ── Enforce max_rr from risk config ──────────────────────────
         # The user-configurable max_rr (default 6.0) was defined in settings.yaml
@@ -663,6 +728,15 @@ class SignalAggregator:
                 f"{_user_max_rr:.1f}R (risk.max_rr)"
             )
             signal.rr_ratio = round(_user_max_rr, 2)
+            # Surface the cap on the card. If the sanity cap already set the
+            # flag, keep the original (pre-any-cap) rr_ratio — which may be
+            # the sanity-cap value — and don't overwrite the reason string.
+            if signal.raw_data is None:
+                signal.raw_data = {}
+            if not signal.raw_data.get('rr_capped'):
+                signal.raw_data['rr_capped'] = True
+                signal.raw_data['rr_original'] = round(float(_rr_before_cap), 2)
+                signal.raw_data['rr_cap_reason'] = 'max_rr'
 
         # ── Resync TP2 after any RR cap ──────────────────────────────────
         # Capping rr_ratio without adjusting TP2 means the exchange receives
@@ -1728,6 +1802,61 @@ class SignalAggregator:
         if signal.raw_data is None:
             signal.raw_data = {}
         signal.raw_data["setup_context"] = signal.setup_context
+
+        # ── 12b. Semantic kill pre-filter ────────────────────
+        # The ExecutionQualityGate in core/engine.py applies the same semantic
+        # kills (HTF-trend mismatch, CHoCH direction mismatch, Wyckoff-phase
+        # opposition) AFTER publish — after the aggregator has already paid
+        # the cost of dedup marking, card generation, Telegram send, and
+        # execution-engine tracking.  These kills are alpha-side (setup_context
+        # is stable tick-to-tick), not microstructure-side, so pre-filtering
+        # them here saves the wasted pipeline work without losing any of the
+        # microstructure checks (spread/trigger/volume/whale) that must stay
+        # at the exec gate.  We reuse the exact same helper so logic stays in
+        # one place; execution_context=None means only the alpha-side checks
+        # fire (the volatility-regime scalp guard correctly short-circuits).
+        try:
+            from analyzers.execution_gate import ExecutionQualityGate
+            _pre_kill = ExecutionQualityGate._check_semantic_kills(
+                direction=_sig_dir,
+                setup_context=signal.setup_context,
+                execution_context=None,
+            )
+        except Exception as _pk_err:
+            logger.debug(f"Semantic pre-kill check skipped: {_pk_err}")
+            _pre_kill = ""
+        if _pre_kill:
+            logger.info(
+                f"⛔ Signal died | {signal.symbol} {_sig_dir} "
+                f"| reason=AGG_SEMANTIC_KILL | {_pre_kill}"
+            )
+            try:
+                from core.diagnostic_engine import diagnostic_engine as _de
+                _de.record_signal_death(
+                    symbol=signal.symbol,
+                    direction=_sig_dir,
+                    strategy=signal.strategy,
+                    kill_reason=f"AGG_SEMANTIC_KILL:{_pre_kill[:60]}",
+                    rr=getattr(signal, 'rr_ratio', 0) or 0,
+                    confidence=final,
+                    regime=scored.regime,
+                    setup_class=getattr(signal, 'setup_class', 'intraday'),
+                )
+            except Exception:
+                pass
+            if _tl:
+                _tl.signal(
+                    symbol=signal.symbol, direction=_sig_dir, grade="?",
+                    confidence=final, entry_low=signal.entry_low,
+                    entry_high=signal.entry_high, stop_loss=signal.stop_loss,
+                    tp1=signal.tp1, tp2=signal.tp2, rr=signal.rr_ratio,
+                    strategy=signal.strategy, regime=scored.regime,
+                    tech=scored.technical_score, vol=scored.volume_score,
+                    flow=scored.orderflow_score, deriv=scored.derivatives_score,
+                    sent=scored.sentiment_score, corr=scored.correlation_score,
+                    result=f"REJECTED(AGG_SEMANTIC_KILL:{_pre_kill[:40]})",
+                )
+            return None
 
         # ── 13a. Post-scoring dedup check (atomic check-and-mark) ────────────
         # DEDUP-FIX (CONFIDENCE CONSISTENCY): Now that we have final_confidence,

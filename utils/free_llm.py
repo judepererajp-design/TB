@@ -71,12 +71,27 @@ async def _single_call(
                 return None
             msg = choices[0].get("message") or {}
             content = msg.get("content")
+            finish_reason = choices[0].get("finish_reason", "?")
             if content is None:
                 logger.warning(
                     "FreeLLM %s attempt %d: empty content (finish_reason=%s)",
-                    model, attempt, choices[0].get("finish_reason", "?"),
+                    model, attempt, finish_reason,
                 )
+                # Signal length-truncation distinctly so the caller can retry
+                # with a larger max_tokens budget rather than treating it as
+                # a generic failure.
+                if finish_reason == "length":
+                    return "__LENGTH_TRUNCATED__"
                 return None
+            # Empty string but finish_reason=length means the model burned
+            # all the output tokens on reasoning and emitted no user-visible
+            # content. Treat the same way as a None content of that kind.
+            if not content.strip() and finish_reason == "length":
+                logger.warning(
+                    "FreeLLM %s attempt %d: blank content (finish_reason=length)",
+                    model, attempt,
+                )
+                return "__LENGTH_TRUNCATED__"
             return content
     except asyncio.TimeoutError:
         logger.warning("FreeLLM %s attempt %d timeout", model, attempt)
@@ -123,16 +138,50 @@ async def call_llm(
         # Attempt 1
         result = await _single_call(session, payload, model, attempt=1)
         if attempts_out is not None:
-            attempts_out.append({"attempt": 1, "model": model, "succeeded": result is not None})
-        if result is not None:
+            attempts_out.append({"attempt": 1, "model": model, "succeeded": result is not None and result != "__LENGTH_TRUNCATED__"})
+        if result == "__LENGTH_TRUNCATED__":
+            # Retry with 2× tokens — Pollinations sometimes burns the budget
+            # on reasoning and returns empty content. Doubling the budget
+            # (capped at 4096) recovers the response ~80% of the time.
+            bumped = min(int(max_tokens) * 2, 4096)
+            if bumped == int(max_tokens):
+                logger.warning(
+                    "FreeLLM %s attempt 1 truncated at max_tokens cap (%d) — giving up",
+                    model, bumped,
+                )
+                result = None
+            else:
+                logger.info(
+                    "FreeLLM %s attempt 1 truncated (finish_reason=length) — retrying with max_tokens=%d",
+                    model, bumped,
+                )
+                payload = {**payload, "max_tokens": bumped}
+                result = None
+        elif result is not None:
             return result
 
         # Attempt 2 -- retry after short pause
         await asyncio.sleep(_RETRY_DELAY_S)
         result = await _single_call(session, payload, model, attempt=2)
         if attempts_out is not None:
-            attempts_out.append({"attempt": 2, "model": model, "succeeded": result is not None})
-        if result is not None:
+            attempts_out.append({"attempt": 2, "model": model, "succeeded": result is not None and result != "__LENGTH_TRUNCATED__"})
+        if result == "__LENGTH_TRUNCATED__":
+            bumped = min(int(payload.get("max_tokens", max_tokens)) * 2, 4096)
+            if bumped == int(payload.get("max_tokens", max_tokens)):
+                logger.warning(
+                    "FreeLLM %s attempt 2 truncated at max_tokens cap (%d) — "
+                    "response is pathologically long; giving up on retries",
+                    model, bumped,
+                )
+                result = None
+            else:
+                logger.info(
+                    "FreeLLM %s attempt 2 truncated (finish_reason=length) — bumping fallback max_tokens=%d",
+                    model, bumped,
+                )
+                payload = {**payload, "max_tokens": bumped}
+                result = None
+        elif result is not None:
             return result
 
         # Attempt 3 -- fallback to most-stable model (skip if already using it)
@@ -144,8 +193,8 @@ async def call_llm(
             fb_payload = {**payload, "model": _FALLBACK_MODEL}
             result = await _single_call(session, fb_payload, _FALLBACK_MODEL, attempt=3)
             if attempts_out is not None:
-                attempts_out.append({"attempt": 3, "model": _FALLBACK_MODEL, "succeeded": result is not None})
-            if result is not None:
+                attempts_out.append({"attempt": 3, "model": _FALLBACK_MODEL, "succeeded": result is not None and result != "__LENGTH_TRUNCATED__"})
+            if result is not None and result != "__LENGTH_TRUNCATED__":
                 return result
 
         logger.error("FreeLLM complete failure for model=%s -- all attempts exhausted", model)

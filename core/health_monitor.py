@@ -275,8 +275,38 @@ class HealthMonitor:
 
         if problems:
             self._ohlcv_failures += 1
+            # Per-(symbol, timeframe, problem-kind) 1h dedup. For newly-listed
+            # symbols like GENIUS/USDT that legitimately have <50 candles,
+            # the same "only 29 candles (min 50)" line was logged on every
+            # scan cycle. Keep the first WARN per hour, subsequent go DEBUG.
+            if not hasattr(self, '_ohlcv_fail_last_log'):
+                self._ohlcv_fail_last_log: Dict[str, float] = {}
+            _ohlcv_now = time.time()
+            # GC
+            if len(self._ohlcv_fail_last_log) > 2048:
+                _cutoff = _ohlcv_now - 3600
+                self._ohlcv_fail_last_log = {
+                    k: t for k, t in self._ohlcv_fail_last_log.items() if t > _cutoff
+                }
             for p in problems:
-                logger.warning(f"📊 OHLCV QUALITY FAIL | {p}")
+                # Classify the failure type so "only N candles" and
+                # "last candle is Xh old" dedup independently.
+                _kind = (
+                    "candles" if "candles (min" in p else
+                    "stale"   if "h old"        in p else
+                    "zero"    if "zero/negative" in p else
+                    "hi_lo"   if "high="         in p else
+                    "ohlc"    if "OHLC inconsistency" in p else
+                    "parse"   if "parse error"   in p else
+                    "other"
+                )
+                _key = f"{symbol}:{timeframe}:{_kind}"
+                _last = self._ohlcv_fail_last_log.get(_key, 0.0)
+                if _ohlcv_now - _last > 3600:
+                    logger.warning(f"📊 OHLCV QUALITY FAIL | {p}")
+                    self._ohlcv_fail_last_log[_key] = _ohlcv_now
+                else:
+                    logger.debug(f"OHLCV fail repeat | {p}")
 
         return len(problems) == 0, problems
 

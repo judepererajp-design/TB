@@ -352,7 +352,21 @@ class TelegramFormatter:
         entry_mid = (sig.entry_low + sig.entry_high) / 2
         tp2_pct = abs(sig.tp2 - entry_mid) / entry_mid * 100 if entry_mid else 0
 
-        grade_emoji, grade_label, grade_action = GRADE_CONFIG.get(grade, GRADE_CONFIG["B"])
+        # ── HIGH CONVICTION banner gating ─────────────────────────────────
+        # The alpha-model grade (or scored.grade) drives the banner, but the
+        # displayed confidence comes from the aggregator. When conf resolves to
+        # 🔴 WEAK or 🔵 OK we should not scream "A SETUP — HIGH CONVICTION" at
+        # the trader. Observed in live flow: a 54/100 signal got the "A"
+        # banner because alpha_score.grade was "A" from structure alone.
+        # Demote display-grade to B+ in that case; downstream gating keeps the
+        # original grade, this only affects the card.
+        _banner_grade = grade
+        try:
+            if grade in ("A", "A+") and float(conf) < 65:
+                _banner_grade = "B+"
+        except (TypeError, ValueError):
+            pass
+        grade_emoji, grade_label, grade_action = GRADE_CONFIG.get(_banner_grade, GRADE_CONFIG["B"])
         conf_label = _confidence_label(conf)
         regime = getattr(regime_analyzer.regime, 'value', 'UNKNOWN')
         regime_readable = {
@@ -392,6 +406,29 @@ class TelegramFormatter:
             warning_lines.append("⚠️ LONG in bear trend — use TP1 as target.")
         if guidance.get("session_warning"):
             warning_lines.append(guidance["session_warning"])
+
+        # ── RR-cap surfacing ──────────────────────────────────────────────
+        # When the aggregator capped rr_ratio via RR_SANITY_CAP or risk.max_rr,
+        # raw_data['rr_capped'] is True. Surface it as a prominent warning so
+        # the trader knows the displayed R/R was truncated and TP levels may
+        # be off — otherwise this info only lived in Tier 3 confluence, which
+        # the card truncates to 3 items and often drops.
+        if raw.get('rr_capped'):
+            _rr_orig = raw.get('rr_original')
+            _rr_reason = raw.get('rr_cap_reason', 'cap')
+            _reason_text = {
+                'sanity': 'TP levels may be miscalculated — verify TP3 before sizing',
+                'max_rr': 'exceeds configured risk.max_rr',
+            }.get(str(_rr_reason), 'capped')
+            if isinstance(_rr_orig, (int, float)) and _rr_orig > 0:
+                warning_lines.append(
+                    f"⚠️ R/R capped at {sig.rr_ratio:.1f}R "
+                    f"(strategy reported {float(_rr_orig):.1f}R — {_reason_text})."
+                )
+            else:
+                warning_lines.append(
+                    f"⚠️ R/R capped at {sig.rr_ratio:.1f}R — {_reason_text}."
+                )
 
         now_utc = datetime.now(timezone.utc).strftime("%H:%M UTC · %d %b %Y")
 
@@ -610,12 +647,48 @@ class TelegramFormatter:
         except Exception:
             pass
 
-        # ── AI Narrative (Nemotron-3-Super) ──────────────────────────────────
-        # If AI analyst generated a narrative for this signal, add it.
-        # Falls back gracefully (no narrative shown) when AI is off or unavailable.
-        _ai_narrative = sig.raw_data.get('ai_narrative')
+        # ── AI Narrative (Nemotron-3-Super) with template fallback ────────────
+        # When ai_narrative is missing/empty (AI off, OpenRouter failed, or
+        # narrative generation disabled), render a short strategy-direction-
+        # regime template so every card carries a human-readable rationale
+        # instead of going silent.
+        _ai_narrative = sig.raw_data.get('ai_narrative') if sig.raw_data else None
         if _ai_narrative and isinstance(_ai_narrative, str) and len(_ai_narrative) > 20:
             msg += f"\n\n🤖 <i>{_ai_narrative.strip()}</i>"
+        else:
+            _dir_word = "upside" if direction == "LONG" else "downside"
+            _strat_theme = {
+                'SmartMoneyConcepts':    "smart-money accumulation / structure",
+                'Ichimoku':              "Ichimoku trend alignment",
+                'IchimokuCloud':         "Ichimoku trend alignment",
+                'ElliottWave':           "Elliott impulse structure",
+                'WyckoffAccDist':        "Wyckoff accumulation/distribution phase",
+                'Wyckoff':               "Wyckoff accumulation/distribution phase",
+                'InstitutionalBreakout': "volume-backed range breakout",
+                'Breakout':              "volume-backed range breakout",
+                'Momentum':              "momentum continuation",
+                'MomentumContinuation':  "momentum continuation",
+                'FundingRateArb':        "funding-rate extreme mean-revert",
+                'FundingRateFade':       "funding-rate extreme mean-revert",
+                'MeanReversion':         "statistical mean-reversion",
+                'PriceAction':           "price-action key-level reaction",
+                'ExtremeReversal':       "oversold/overbought extreme reversal",
+                'RangeScalper':          "range-boundary scalp",
+                'HarmonicPattern':       "harmonic pattern completion",
+                'GeometricPattern':      "chart pattern completion",
+                'Reversal':              "reversal at key structural level",
+            }.get(strategy, "multi-factor confluence")
+            _regime_note = {
+                "BULL_TREND":     "aligned with the bullish regime",
+                "BEAR_TREND":     "aligned with the bearish regime" if direction == "SHORT" else "counter-trend vs the bearish regime — use tight risk",
+                "CHOPPY":         "in a range — favour TP1 and partial exits",
+                "VOLATILE":       "in a volatile regime — reduce size",
+                "VOLATILE_PANIC": "during risk-off conditions — reduce size",
+            }.get(regime, "under current conditions")
+            msg += (
+                f"\n\n🤖 <i>{_strat_theme.capitalize()} pointing to {_dir_word}, "
+                f"{_regime_note}.</i>"
+            )
 
         # ── CTX-2: Funding rate context (perpetuals only) ─────────────────────
         # Shows funding rate when it's meaningful (>0.03%/8h or negative).
@@ -959,16 +1032,24 @@ class TelegramFormatter:
                              fill_price: float, signal_id: int,
                              scored=None) -> str:
         """
-        IN TRADE card — levels always visible so you never have to hunt for them.
+        PRICE AT ENTRY ZONE card — levels always visible so you never have to hunt for them.
+
+        NOTE: This is emitted when price TOUCHES the entry zone, not when an order is
+        actually filled. A true fill only happens after the execution engine confirms
+        triggers and publishes "⚡ EXECUTION CONFIRMED" (see core.engine EXECUTE branch).
+        The headline and price label reflect that — do NOT call this "IN TRADE" or
+        "Filled" here because the subsequent WATCHING → ALMOST → EXPIRED lifecycle
+        would contradict it for the same signal id.
+
         scored: optional ScoredSignal — used to show entry zone / SL / TP levels.
         """
         dir_emoji = "🟢" if direction == "LONG" else "🔴"
         dir_label = "LONG ▲" if direction == "LONG" else "SHORT ▼"
         now_utc = datetime.now(timezone.utc).strftime("%H:%M UTC · %d %b %Y")
         msg = (
-            f"✅ <b>IN TRADE</b>  ·  {dir_emoji} <b>{dir_label}  {symbol}</b>\n"
+            f"📍 <b>PRICE AT ENTRY ZONE</b>  ·  {dir_emoji} <b>{dir_label}  {symbol}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Filled:  <code>{fmt_price(fill_price)}</code>\n"
+            f"Price:   <code>{fmt_price(fill_price)}</code>\n"
         )
         if scored:
             sig = scored.base_signal

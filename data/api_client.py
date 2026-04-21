@@ -118,6 +118,19 @@ class APIClient:
             self._latency_max: float = 0.0
             self._cache_hits: int = 0
 
+            # Symbols that the exchange has reported as delisted / settling /
+            # pre-trading (binance error -4108). Populated by _fetch_with_retry
+            # on first failure; callers (scanner.build_universe) filter against
+            # this to stop re-requesting dead symbols. Logged set tracks which
+            # have already produced a user-visible warning so repeats are DEBUG.
+            self._delisted_symbols: set = set()
+            self._delisted_logged: set = set()
+
+    def is_delisted(self, symbol: str) -> bool:
+        """Return True if the symbol has been flagged delisted by the
+        exchange (binance -4108 or equivalent).  Safe to call at any time."""
+        return symbol in self._delisted_symbols
+
     def get_request_stats(self) -> Dict:
         """Get API request telemetry for heartbeat display"""
         avg_lat = (self._latency_sum / self._total_requests * 1000
@@ -364,10 +377,25 @@ class APIClient:
                 self._latency_sum += 12.0
                 if 12.0 > self._latency_max:
                     self._latency_max = 12.0
-                logger.warning(
-                    f"API timeout (attempt {attempt+1}/{max_retries}) — "
-                    f"call hung >12s, releasing worker"
-                )
+                # Dedup log: when the exchange is consistently slow, this same
+                # warning repeated 100+ times/10h in production. Throttle to
+                # 1/min per attempt bucket so trend (attempt1 spike vs attempt5
+                # spike) is still visible but line-count is ~10× smaller.
+                if not hasattr(self, '_timeout_last_log'):
+                    self._timeout_last_log: Dict[int, float] = {}
+                _now_t = time.time()
+                _last_t = self._timeout_last_log.get(attempt, 0.0)
+                if _now_t - _last_t > 60:
+                    logger.warning(
+                        f"API timeout (attempt {attempt+1}/{max_retries}) — "
+                        f"call hung >12s, releasing worker"
+                    )
+                    self._timeout_last_log[attempt] = _now_t
+                else:
+                    logger.debug(
+                        f"API timeout (attempt {attempt+1}/{max_retries}) — "
+                        f"call hung >12s (suppressed, throttled 1/min)"
+                    )
                 if attempt < max_retries - 1:
                     await asyncio.sleep(base_delay)
                 continue
@@ -396,6 +424,40 @@ class APIClient:
 
             except ccxt.ExchangeError as e:
                 self._total_errors += 1
+                _err_str = str(e)
+                # Binance -4108 = "Symbol is on delivering or delivered or
+                # settling or closed or pre-trading" — the symbol has been
+                # delisted from perps or hasn't started trading yet. Keep a
+                # per-symbol exclusion set so the scanner can skip it and we
+                # stop re-requesting every cycle. We don't mark the whole
+                # client unhealthy for this — it's symbol-scoped, not global.
+                if '-4108' in _err_str or 'delivering or delivered' in _err_str:
+                    # Strict symbol detection: require "BASE/QUOTE" with no
+                    # path separator characters — avoids false-positive on
+                    # any URL or fs path that happens to be passed as args.
+                    import re as _re
+                    _sym = ''
+                    for _a in args:
+                        if (
+                            isinstance(_a, str)
+                            and _re.fullmatch(r'[A-Z0-9]+/[A-Z0-9]+', _a.upper())
+                        ):
+                            _sym = _a
+                            break
+                    if _sym:
+                        self._delisted_symbols.add(_sym)
+                        if _sym not in self._delisted_logged:
+                            logger.warning(
+                                f"Symbol delisted/settling on exchange: {_sym} "
+                                f"— adding to skip list (will not retry). "
+                                f"Error: {_err_str[:100]}"
+                            )
+                            self._delisted_logged.add(_sym)
+                        else:
+                            logger.debug(f"Delisted symbol call (suppressed): {_sym}")
+                    else:
+                        logger.error(f"Exchange error: {e}")
+                    return None
                 logger.error(f"Exchange error: {e}")
                 self._healthy = False
                 return None

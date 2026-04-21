@@ -431,6 +431,15 @@ class Scanner:
                            if isinstance(cfg.exchange.get('excluded_symbols', []), list)
                            else [])
             excluded.update(self._perma_excluded_symbols)
+            # Also exclude symbols flagged as delisted/settling by the exchange
+            # via the APIClient's delisted-set (binance error -4108 etc).
+            try:
+                from data.api_client import api as _api
+                _delisted = getattr(_api, '_delisted_symbols', None)
+                if _delisted:
+                    excluded.update(_delisted)
+            except Exception:
+                pass
 
             # Sort by volume descending
             qualified = []

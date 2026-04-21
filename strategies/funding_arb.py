@@ -26,6 +26,45 @@ from utils.risk_params import rp, compute_vol_percentile
 
 logger = logging.getLogger(__name__)
 
+# Module-level cooldown for the `abnormal funding value` warning.  When a
+# symbol has a legitimately stuck extreme funding rate (observed: EDU/USDT
+# holding -1.0% for hours), the warning fired on every scan cycle — 56x in
+# 10h in production logs. Keep per-(symbol, sign) last-log timestamp and
+# only re-warn every 30 min. Opportunistically GC when the dict exceeds 1024
+# entries. Trivially bounded — stdlib dict, stateless across symbol churn.
+_ABNORMAL_FUNDING_LOG_COOLDOWN_SEC: float = 1800.0
+_abnormal_funding_last_log: Dict[str, float] = {}
+
+
+def _maybe_log_abnormal_funding(symbol: str, funding_rate_pct: float) -> None:
+    """Rate-limited WARNING for abnormal funding values (≥1% per 8h).
+
+    Emits WARNING once per (symbol, sign) per 30min; otherwise DEBUG.
+    """
+    _sign = "+" if funding_rate_pct >= 0 else "-"
+    _key = f"{symbol}:{_sign}"
+    _now = time.time()
+    _last = _abnormal_funding_last_log.get(_key, 0.0)
+    # Bounded-growth safeguard — a long-running scanner with a rotating
+    # universe could grow this dict slowly. GC entries older than 24h.
+    if len(_abnormal_funding_last_log) > 1024:
+        _cutoff = _now - 86400
+        _abnormal_funding_last_log.clear()
+        _abnormal_funding_last_log.update(
+            {k: t for k, t in list(_abnormal_funding_last_log.items()) if t > _cutoff}
+        )
+    if _now - _last > _ABNORMAL_FUNDING_LOG_COOLDOWN_SEC:
+        logger.warning(
+            "FundingRateArb: abnormal funding value for %s: %s%% (skipping)",
+            symbol, funding_rate_pct,
+        )
+        _abnormal_funding_last_log[_key] = _now
+    else:
+        logger.debug(
+            "FundingRateArb: abnormal funding (repeat) %s: %s%% (skipping)",
+            symbol, funding_rate_pct,
+        )
+
 
 def _normalize_threshold_pct(value: float) -> float:
     """
@@ -161,11 +200,7 @@ class FundingRateArb(BaseStrategy):
         # anything above that is almost certainly a unit-conversion bug
         # (fractional rate treated as percentage or similar).
         if abs(funding_rate_pct) > 1.0:
-            logger.warning(
-                "FundingRateArb: abnormal funding value for %s: %s%% (skipping)",
-                symbol,
-                funding_rate_pct,
-            )
+            _maybe_log_abnormal_funding(symbol, funding_rate_pct)
             return None
         if funding_age_sec is not None and funding_age_sec > max_funding_age_sec:
             logger.debug(

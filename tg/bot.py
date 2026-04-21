@@ -143,6 +143,11 @@ class TelegramBot(CommandsMixin, CallbacksMixin):
         # Control panel
         self._panel_message_id: Optional[int] = None
 
+        # News-risk alert dedup — key=(event_type, headline_hash) → last send ts.
+        # Prevents the same geopolitical story (e.g. multiple US-Iran / Hormuz
+        # headlines within an hour) from firing 5× in a row.
+        self._news_alert_dedup: Dict[str, float] = {}
+
         # Multi-step state for text input
         self._awaiting_entry:   dict = {}
         self._awaiting_outcome: dict = {}
@@ -862,6 +867,36 @@ class TelegramBot(CommandsMixin, CallbacksMixin):
         Called via btc_news_intelligence.on_risk_event callback when a
         MACRO_RISK_OFF or other bearish event context is created.
         """
+        # ── Topic dedup ──────────────────────────────────────────────────
+        # Within a 45-min window, collapse alerts that share both the event
+        # type *and* a normalized headline signature (lowercase, alphanumeric,
+        # truncated). Without this, overlapping US-Iran / Strait-of-Hormuz
+        # headlines arriving minutes apart each fire their own push alert
+        # (observed: 5× in a row with identical severity).
+        try:
+            import re as _re_news
+            _TTL_SEC = 45 * 60
+            _now_ts = time.time()
+            _ev_type = getattr(getattr(ctx, 'event_type', None), 'value', '') or ''
+            _headline = (getattr(ctx, 'headline', '') or '')[:200].lower()
+            _norm = _re_news.sub(r'[^a-z0-9]+', '', _headline)[:80]
+            _topic_key = f"{_ev_type}::{_norm}"
+            # GC stale entries (bounded dict growth).
+            _stale = [k for k, t in self._news_alert_dedup.items() if _now_ts - t > _TTL_SEC]
+            for k in _stale:
+                self._news_alert_dedup.pop(k, None)
+            _last = self._news_alert_dedup.get(_topic_key, 0.0)
+            if _last and _now_ts - _last < _TTL_SEC:
+                logger.info(
+                    f"🔕 Suppressed duplicate news alert (topic='{_ev_type}', "
+                    f"headline={_headline[:60]!r}, last fired {int(_now_ts - _last)}s ago)"
+                )
+                return
+            self._news_alert_dedup[_topic_key] = _now_ts
+        except Exception as _dedup_err:
+            # Dedup must never prevent a genuine alert — log and fall through.
+            logger.debug(f"news alert dedup failed (non-fatal): {_dedup_err}")
+
         try:
             # Build event header
             _severity_emoji = {"EXTREME": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "⚪"}.get(
@@ -900,30 +935,50 @@ class TelegramBot(CommandsMixin, CallbacksMixin):
                 lines.extend(f"  {a}" for a in actions)
                 lines.append("")
 
-            # List active LONG trades at risk
+            # List pending LONG setups at risk.
+            # NOTE: execution_engine._tracked contains setups in WATCHING / ENTRY_ZONE /
+            # ALMOST / EXECUTE / FILLED states — only FILLED is a real active trade.
+            # Don't call the others "Active LONG trades" because they haven't been
+            # filled yet and "tighten SL / take partial profit" isn't actionable for
+            # a not-yet-entered limit setup.
             try:
-                from core.execution_engine import execution_engine
+                from core.execution_engine import execution_engine, SignalState
                 _tracked = execution_engine._tracked
-                _at_risk = [
+                _long_items = [
                     s for s in _tracked.values()
                     if getattr(s, 'direction', '') == 'LONG'
                 ]
-                if _at_risk:
-                    lines.append(f"⚠️ <b>Active LONG trades at risk ({len(_at_risk)}):</b>")
-                    for sig in _at_risk[:5]:  # Max 5 to avoid message overflow
+                _filled = [s for s in _long_items if getattr(s, 'state', None) == SignalState.FILLED]
+                _pending = [s for s in _long_items if getattr(s, 'state', None) != SignalState.FILLED]
+                if _filled or _pending:
+                    def _fmt_line(sig):
                         _state = getattr(sig, 'state', '?')
                         _state_str = _state.value if hasattr(_state, 'value') else str(_state)
-                        lines.append(
+                        return (
                             f"  • <b>{sig.symbol}</b> — {_state_str} "
                             f"(entry: {sig.entry_low:.4g}–{sig.entry_high:.4g}, "
                             f"SL: {sig.stop_loss:.4g})"
                         )
-                    if len(_at_risk) > 5:
-                        lines.append(f"  ... and {len(_at_risk) - 5} more")
-                    lines.append("")
-                    lines.append("💡 <b>Consider:</b> tightening stop-losses, taking partial profit, or closing LONGs manually.")
+                    if _filled:
+                        lines.append(f"⚠️ <b>Active LONG trades at risk ({len(_filled)}):</b>")
+                        for sig in _filled[:5]:
+                            lines.append(_fmt_line(sig))
+                        if len(_filled) > 5:
+                            lines.append(f"  ... and {len(_filled) - 5} more")
+                        lines.append("")
+                        lines.append("💡 <b>Consider:</b> tightening stop-losses, taking partial profit, or closing LONGs manually.")
+                    if _pending:
+                        if _filled:
+                            lines.append("")
+                        lines.append(f"🟠 <b>Pending LONG setups at risk ({len(_pending)}):</b>")
+                        for sig in _pending[:5]:
+                            lines.append(_fmt_line(sig))
+                        if len(_pending) > 5:
+                            lines.append(f"  ... and {len(_pending) - 5} more")
+                        lines.append("")
+                        lines.append("💡 <b>Consider:</b> standing aside on pending LONG setups — limit orders can still be pulled before fill.")
                 else:
-                    lines.append("✅ No active LONG trades currently at risk.")
+                    lines.append("✅ No active LONG trades or pending LONG setups at risk.")
             except Exception:
                 pass  # execution_engine not available yet — skip trade listing
 
@@ -1093,13 +1148,27 @@ class TelegramBot(CommandsMixin, CallbacksMixin):
                             "momentum","ichimoku","elliott_wave","funding_arb","wyckoff",
                             "harmonic","geometric","range_scalper"]
             _n_strats = sum(1 for s in _strat_names if cfg.is_strategy_enabled(s))
+            # Use the live adaptive floor (matches what the aggregator gate
+            # actually enforces) instead of the static config value, so the
+            # banner doesn't claim "Min conf 60/100" while the real gate sits
+            # at ~66 because the 40th-percentile adaptive floor kicked in.
+            try:
+                from signals.aggregator import signal_aggregator as _agg
+                _eff_min = float(_agg.get_effective_min_confidence())
+            except Exception:
+                _eff_min = float(cfg.aggregator.get('min_confidence', 70))
+            _raw_min = float(cfg.aggregator.get('min_confidence', 70))
+            if _eff_min > _raw_min + 0.5:
+                _min_conf_line = f"Min conf   {_eff_min:.0f}/100 (adaptive · cfg {int(_raw_min)})\n\n"
+            else:
+                _min_conf_line = f"Min conf   {int(_eff_min)}/100\n\n"
             text = (
                 f"⚡ <b>TitanBot Pro v{version} — Online</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"Mode       {mode}\n"
                 f"Regime     {r_emoji} <b>{regime}</b>\n"
                 f"Universe   {universe} symbols · {_n_strats} strategies\n"
-                f"Min conf   {cfg.aggregator.get('min_confidence', 70)}/100\n\n"
+                f"{_min_conf_line}"
                 f"<b>Channels</b>\n"
                 f"📊 Signals channel  — Executable setups\n"
                 f"📡 Market channel   — Digests every 4h\n"

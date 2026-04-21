@@ -350,9 +350,78 @@ class ParamTuner:
             logger.info("⚙️  param_tuner: all states in-range — no changes (stable=%d)", self._stable_cycles)
 
         result = changes + ([explore_msg] if explore_msg else []) + ([rollback_msg] if rollback_msg else [])
+
+        # ── Gap 6 — ALMOST-expired bucket feedback ────────────────────────
+        # The execution engine reports every ALMOST→EXPIRED event to the
+        # diagnostic engine.  Buckets that chronically stall (≥ 15 events with
+        # median fill_ratio ≥ 0.60 — i.e. very close to triggering but timing
+        # out) are candidates for a 1-step min_triggers discount.  Proposals
+        # emerge as LOW-risk (Option B will auto-apply them after the veto
+        # window).  The actual min_triggers table lives in the execution
+        # engine's _STRATEGY_MIN_TRIGGERS; this proposal is advisory and
+        # logged via DiagnosticEngine.propose_change so the user can see /
+        # audit what's being adapted.
+        try:
+            await self._propose_almost_expired_discounts()
+        except Exception as _ae_err:
+            logger.debug("param_tuner: almost-expired feedback error: %s", _ae_err)
+
         return result
 
     # ── Internal helpers ───────────────────────────────────────────────────
+
+    _ALMOST_MIN_EVENTS: int = 15
+    _ALMOST_FILL_RATIO_THRESHOLD: float = 0.60
+
+    async def _propose_almost_expired_discounts(self) -> None:
+        """Inspect almost-expired buckets and emit LOW-risk tuning proposals.
+
+        The diagnostic engine stores events per (strategy, regime, setup_class)
+        bucket.  A "chronic stall" is ≥ MIN_EVENTS events with median fill
+        ratio ≥ THRESHOLD — the triggers were almost always *almost* there,
+        suggesting the min_triggers bar for this bucket is slightly too high.
+        We submit a LOW-risk proposal to lower the threshold by one; Option B
+        auto-apply then applies it after the veto window.
+        """
+        try:
+            from core.diagnostic_engine import diagnostic_engine as _de
+        except Exception:
+            return
+        buckets = _de.get_almost_expired_buckets() or {}
+        if not buckets:
+            return
+
+        for key, stats in buckets.items():
+            if stats.get("count", 0) < self._ALMOST_MIN_EVENTS:
+                continue
+            if stats.get("median_fill_ratio", 0.0) < self._ALMOST_FILL_RATIO_THRESHOLD:
+                continue
+            try:
+                strategy, regime, setup_class = key.split("|", 2)
+            except ValueError:
+                continue
+            desc = (
+                f"Lower min_triggers for {strategy} in {regime}/{setup_class}"
+            )
+            reason = (
+                f"{stats['count']} ALMOST→EXPIRED events, median fill "
+                f"ratio {stats['median_fill_ratio']:.2f} ≥ "
+                f"{self._ALMOST_FILL_RATIO_THRESHOLD:.2f} — bucket is "
+                f"chronically stalling near the threshold"
+            )
+            try:
+                await _de.propose_change(
+                    change_type="execution_config",
+                    description=desc,
+                    old_value={"bucket": key, "min_triggers_delta": 0},
+                    new_value={"bucket": key, "min_triggers_delta": -1},
+                    reason=reason,
+                    risk_level="LOW",
+                    estimated_impact="Allow borderline setups in this bucket to fire",
+                )
+            except Exception as _pe:
+                logger.debug("param_tuner: propose_change failed: %s", _pe)
+
 
     async def _fetch_stats(self) -> Tuple[List[Dict], List[Dict]]:
         """Fetch 7-day and 30-day market-state performance stats."""

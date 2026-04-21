@@ -126,6 +126,15 @@ class LiquidationHeatmap:
         }
         self._exchange_fail_cooldown = 300.0  # 5 min cooldown after failure
 
+        # Per-(symbol, exchange) negative cache. Some tokens are simply not
+        # listed on a given venue's liquidation endpoint (e.g. MON, PNUT,
+        # GIGGLE, ENJ, FET on okx/bybit/binance). Without this we kept hitting
+        # all three venues every cycle, producing ~190 log lines over 1 day
+        # for tokens that will NEVER return data. Entries TTL out after 1h so
+        # newly-listed symbols recover on their own.
+        self._symbol_negcache: Dict[Tuple[str, str], float] = {}
+        self._symbol_negcache_ttl: float = 3600.0
+
     # ── Public API ────────────────────────────────────────────
 
     async def get_clusters(
@@ -493,14 +502,21 @@ class LiquidationHeatmap:
 
         now = time.time()
 
-        # Only attempt exchanges that aren't in their failure cooldown
+        # Only attempt exchanges that aren't in their failure cooldown AND
+        # aren't in the per-(symbol, exchange) negative cache.
         tasks = {}
-        if now - self._exchange_health.get("binance", 0) > self._exchange_fail_cooldown:
-            tasks["binance"] = self._fetch_binance(symbol)
-        if now - self._exchange_health.get("bybit", 0) > self._exchange_fail_cooldown:
-            tasks["bybit"] = self._fetch_bybit(symbol)
-        if now - self._exchange_health.get("okx", 0) > self._exchange_fail_cooldown:
-            tasks["okx"] = self._fetch_okx(symbol)
+        for _ex in ("binance", "bybit", "okx"):
+            if now - self._exchange_health.get(_ex, 0) <= self._exchange_fail_cooldown:
+                continue  # global cooldown
+            _neg = self._symbol_negcache.get((symbol, _ex), 0.0)
+            if _neg and now - _neg < self._symbol_negcache_ttl:
+                continue  # per-symbol negcache still valid
+            if _ex == "binance":
+                tasks[_ex] = self._fetch_binance(symbol)
+            elif _ex == "bybit":
+                tasks[_ex] = self._fetch_bybit(symbol)
+            else:
+                tasks[_ex] = self._fetch_okx(symbol)
 
         if not tasks:
             # All exchanges in cooldown — return stale cache if any
@@ -510,11 +526,51 @@ class LiquidationHeatmap:
         all_events: List[LiquidationEvent] = []
         for exchange, result in zip(tasks.keys(), results):
             if isinstance(result, Exception):
-                logger.warning(f"Liquidation fetch failed [{exchange}] {symbol}: {result}")
-                self._exchange_health[exchange] = now  # start cooldown
+                # Per-(symbol, exchange) negative cache entry. We still log
+                # the first failure per hour so operators see real outages,
+                # but subsequent identical failures go to DEBUG.
+                _neg_key = (symbol, exchange)
+                _prev_fail = self._symbol_negcache.get(_neg_key, 0.0)
+                if now - _prev_fail > self._symbol_negcache_ttl:
+                    logger.warning(
+                        f"Liquidation fetch failed [{exchange}] {symbol}: {result}"
+                    )
+                else:
+                    logger.debug(
+                        f"Liquidation fetch failed [{exchange}] {symbol}: {result} (suppressed, in negcache)"
+                    )
+                self._symbol_negcache[_neg_key] = now
+                # Global exchange cooldown is only appropriate for network-
+                # level failures (timeouts, 5xx). Per-symbol 400/404 (symbol
+                # not listed there) must NOT pause the whole endpoint for
+                # unrelated symbols — which was happening before and stopped
+                # ~1/3 of symbols from reaching a healthy venue for 5 min.
+                _err_text = str(result).lower()
+                # Proper HTTP 5xx detector — looks for "http 5XX" or " 5XX "
+                # as a status token rather than matching any " 5" substring
+                # which would have false-matched things like "volume 5000".
+                import re as _re
+                _is_5xx = bool(_re.search(r'\b5\d\d\b', _err_text))
+                _is_network = (
+                    isinstance(result, (asyncio.TimeoutError,)) or
+                    'timeout' in _err_text or
+                    'connection' in _err_text or
+                    _is_5xx
+                )
+                if _is_network:
+                    self._exchange_health[exchange] = now  # start global cooldown
             else:
                 all_events.extend(result)
                 self._exchange_health[exchange] = 0.0  # mark healthy
+                # Symbol succeeded on this exchange → clear any negcache entry
+                self._symbol_negcache.pop((symbol, exchange), None)
+
+        # GC stale negcache entries occasionally (bounded dict growth).
+        if len(self._symbol_negcache) > 4096:
+            self._symbol_negcache = {
+                k: t for k, t in self._symbol_negcache.items()
+                if now - t < self._symbol_negcache_ttl
+            }
 
         if all_events:
             self._cache[cache_key] = (all_events, now)

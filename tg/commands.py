@@ -891,17 +891,18 @@ class CommandsMixin:
 
     async def _cmd_ai(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
-        /ai                  — show AI status panel
-        /ai on               — set mode to full
-        /ai off              — disable AI completely
-        /ai diagnosis        — diagnosis only (no signal AI)
-        /ai report           — trigger immediate diagnostic report
-        /ai approve          — show pending approvals
-        /ai why SYMBOL       — explain why SYMBOL signals keep dying
-        /ai history          — last applied overrides
-        /ai audit            — run Sentinel audit now (fast tier, Llama)
-        /ai audit deep       — run deep audit (Nemotron, max 1x/24h)
-        /ai audit status     — show last audit time + session stats
+        /ai                      — show AI status panel
+        /ai on                   — set mode to full
+        /ai off                  — disable AI completely
+        /ai diagnosis            — diagnosis only (no signal AI)
+        /ai report               — trigger immediate diagnostic report
+        /ai approve              — show pending approvals
+        /ai approve_all_low      — batch-apply every LOW-risk pending approval
+        /ai why SYMBOL           — explain why SYMBOL signals keep dying
+        /ai history              — last applied overrides
+        /ai audit                — run Sentinel audit now (fast tier, Llama)
+        /ai audit deep           — run deep audit (Nemotron, max 1x/24h)
+        /ai audit status         — show last audit time + session stats
         """
         if not self._auth(update):
             return
@@ -960,6 +961,27 @@ class CommandsMixin:
                 return
             for a in pending[:5]:
                 await self.send_approval_request(a)
+            return
+
+        # Option B — batch-apply every pending LOW-risk proposal at once.
+        # MEDIUM and HIGH are never touched by this command; they still need
+        # individual taps.  Each applied change gets its own rollback snapshot
+        # so /undo <id> remains available per item.
+        if sub in ("approve_all_low", "approve-all-low", "approveall"):
+            pending = diagnostic_engine.get_pending_approvals()
+            low = [a for a in pending if str(a.risk_level or "").upper() == "LOW"]
+            if not low:
+                await update.message.reply_text(
+                    "✅ No LOW-risk approvals pending.", parse_mode=ParseMode.HTML
+                )
+                return
+            applied = await diagnostic_engine.apply_all_low_risk()
+            await update.message.reply_text(
+                f"✅ <b>Applied {len(applied)} LOW-risk change(s)</b>\n"
+                f"IDs: <code>{', '.join(applied) if applied else '—'}</code>\n"
+                f"Use /ai history to review or tap UNDO on the per-item cards.",
+                parse_mode=ParseMode.HTML,
+            )
             return
 
         if sub == "history":
@@ -1183,6 +1205,19 @@ class CommandsMixin:
         # HTML-escape all dynamic fields to prevent parse errors
         # (values may contain <, >, & characters e.g. "1.0 < x < 2.0")
         from html import escape as _he
+        # Option B — hint at auto-apply countdown for LOW risk.
+        _auto_line = ""
+        try:
+            _auto_at = float(getattr(approval, 'auto_apply_at', 0) or 0)
+            if _auto_at > 0:
+                import time as _t
+                _mins = max(0, int((_auto_at - _t.time()) / 60))
+                _auto_line = (
+                    f"\n<i>🤖 Auto-applies in ~{_mins} min unless you tap NO "
+                    f"(LOW risk + reversible)</i>"
+                )
+        except Exception:
+            pass
         text = (
             f"⚠️ <b>Self-Healing Approval Required</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1192,7 +1227,8 @@ class CommandsMixin:
             f"Reason: {_he(str(approval.reason))}\n\n"
             f"Risk: {risk_emoji} {_he(str(approval.risk_level))}\n"
             f"Impact: {_he(str(approval.estimated_impact))}\n"
-            f"Reversible: ✅ UNDO button always available\n"
+            f"Reversible: ✅ UNDO button always available"
+            f"{_auto_line}\n"
             f"\n<i>ID: {_he(str(approval.approval_id))}</i>"
         )
         keyboard = InlineKeyboardMarkup([

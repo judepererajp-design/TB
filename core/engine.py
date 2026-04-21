@@ -608,6 +608,7 @@ class Engine:
                             tp1=signal.tp1, tp2=signal.tp2, tp3=signal.tp3,
                             rr_ratio=signal.rr_ratio, message_id=msg_id, grade="A",
                             setup_class=getattr(signal, 'setup_class', 'intraday'),
+                            raw_data=getattr(signal, 'raw_data', None),
                         )
                     else:
                         logger.info(f"⚡ A+ signal #{signal_id} — bypassing execution engine (immediate entry)")
@@ -651,6 +652,7 @@ class Engine:
                             message_id=msg_id,
                             grade=alpha_score.grade,
                             setup_class=getattr(signal, 'setup_class', 'intraday'),
+                            raw_data=getattr(signal, 'raw_data', None),
                         )
                     pass
         except Exception as e:
@@ -2950,7 +2952,26 @@ class Engine:
                                     detail=_pd_reason,
                                     extra=_pd_debug,
                                 )
-                                logger.warning("🚫 %s suppressed by pump/dump guard | %s", symbol, _pd_reason)
+                                # Dedup guard log — 15 min per (symbol, risk_level, direction).
+                                # The underlying pump/dump analyzer already dedups its 🚨
+                                # log on the same signature; suppress this engine-side
+                                # mirror the same way to stop doubling the noise.
+                                if not hasattr(self, '_pd_guard_last_log'):
+                                    self._pd_guard_last_log: Dict[str, float] = {}
+                                _pd_key = f"{symbol}:{_pd_alert.direction}:{_pd_alert.risk_level}"
+                                _pd_now = time.time()
+                                _pd_last = self._pd_guard_last_log.get(_pd_key, 0.0)
+                                if len(self._pd_guard_last_log) > 1024:
+                                    _pd_cutoff = _pd_now - 3600
+                                    self._pd_guard_last_log = {
+                                        k: t for k, t in self._pd_guard_last_log.items()
+                                        if t > _pd_cutoff
+                                    }
+                                if _pd_now - _pd_last > 900:
+                                    logger.warning("🚫 %s suppressed by pump/dump guard | %s", symbol, _pd_reason)
+                                    self._pd_guard_last_log[_pd_key] = _pd_now
+                                else:
+                                    logger.debug("🚫 %s suppressed by pump/dump guard (repeat) | %s", symbol, _pd_reason)
                                 return
 
                     _fear_greed_adj = (
@@ -4921,6 +4942,25 @@ class Engine:
             from core.execution_engine import execution_engine
             exec_summary = execution_engine.get_status_summary()
             logger.info(f"║  Execution  : {exec_summary:<28}║")
+            # Signal funnel (last 1h): top kill reasons from diagnostic engine.
+            # Gives visibility into why approved signals aren't becoming fills —
+            # e.g. "6× AGG_SEMANTIC_KILL, 3× EXECUTION_GATE" points the operator
+            # straight at the upstream cause without needing to grep the logs.
+            try:
+                from core.diagnostic_engine import diagnostic_engine as _de
+                from collections import Counter as _Cnt
+                _now = time.time()
+                _recent = [d for d in _de._death_log if _now - d.get("ts", 0) < 3600]
+                if _recent:
+                    _top = _Cnt(
+                        (d.get("kill_reason", "?") or "?").split(":", 1)[0]
+                        for d in _recent
+                    ).most_common(3)
+                    _kill_str = " ".join(f"{n}×{r[:14]}" for r, n in _top)
+                    logger.info(f"║  Kills/1h   : {len(_recent):<3} ({_kill_str})"
+                                f"{'':<{max(0, 10 - len(_kill_str))}}║")
+            except Exception:
+                pass
             logger.info(f"║  Positions  : {pf_state.position_count} ({pf_state.net_exposure:+,.0f} net){'':<10}║")
             logger.info(f"║  Learning   : {ll_stats.get('total_trades', 0)} trades recorded{'':<12}║")
             if ll_stats.get('total_trades', 0) > 0:

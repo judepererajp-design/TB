@@ -184,6 +184,41 @@ def _get_trigger_window_secs(setup_class: str) -> int:
     )
 
 
+# Gap 6 feedback loop — per-(strategy|regime|setup_class) min_triggers deltas
+# applied by track() on top of the static _STRATEGY_MIN_TRIGGERS table.
+# Populated by DiagnosticEngine._apply_known_change when an "execution_config"
+# LOW-risk proposal is approved (manually or via auto-apply).  Deltas are
+# clamped to [-2, +2] so a runaway tuner can't drive min_triggers negative
+# or absurdly high.  The floor at 1 trigger is re-applied at read time.
+_MIN_TRIG_BUCKET_DELTAS: Dict[str, int] = {}
+_MIN_TRIG_BUCKET_DELTA_CLAMP: int = 2
+
+
+def set_min_triggers_bucket_delta(bucket: str, delta: int) -> int:
+    """Record a clamped delta for (strategy|regime|setup_class) bucket.
+
+    Returns the clamped value actually stored.  A delta of 0 removes the
+    entry so lookups fall back to the static table cleanly.
+    """
+    try:
+        d = int(delta)
+    except (TypeError, ValueError):
+        return 0
+    d = max(-_MIN_TRIG_BUCKET_DELTA_CLAMP,
+            min(_MIN_TRIG_BUCKET_DELTA_CLAMP, d))
+    if not bucket:
+        return 0
+    if d == 0:
+        _MIN_TRIG_BUCKET_DELTAS.pop(bucket, None)
+    else:
+        _MIN_TRIG_BUCKET_DELTAS[bucket] = d
+    return d
+
+
+def get_min_triggers_bucket_delta(bucket: str) -> int:
+    return int(_MIN_TRIG_BUCKET_DELTAS.get(bucket or "", 0))
+
+
 def _distance_to_entry_zone(sig, price: float) -> float:
     if price <= 0:
         return 1.0
@@ -233,6 +268,16 @@ class TrackedExecution:
     has_momentum_expansion: bool = False
     has_liquidity_reaction: bool = False
 
+    # Gap 5 — per-trigger magnitude multipliers (populated by _check_triggers).
+    # Each defaults to 1.0 (no scaling) and is clamped to [0.5, 2.0] by
+    # core._exec_helpers.magnitude_multiplier.  A small wick on a thin alt
+    # gets 0.5; a $5M whale sweep vs a $500K median gets 2.0.  The multiplier
+    # is applied to the fixed nominal weight in ``triggers_met``.
+    rejection_magnitude: float = 1.0
+    structure_magnitude: float = 1.0
+    momentum_magnitude:  float = 1.0
+    liquidity_magnitude: float = 1.0
+
     # FIX STICKY-TRIGGERS: record when trigger accumulation window started.
     # Triggers older than TRIGGER_WINDOW_SECS are stale and must be reset —
     # a rejection candle from 2 hours ago + structure shift from now is NOT
@@ -248,6 +293,18 @@ class TrackedExecution:
     min_triggers: int = 2              # V11: triggers needed (grade-dependent)
     setup_class: str = "intraday"      # FIX #31: scalp/intraday/swing/positional
     staleness_data: Optional[dict] = None  # BUG-13: conditions at signal creation time
+
+    # Gap 7 — cached raw_data snapshot from the signal so the pre-fill
+    # semantic-kill pass can evaluate CHoCH/BOS/Wyckoff/sweep fields that live
+    # only in raw_data.  Optional; falls back to {} when absent.
+    raw_data: Optional[dict] = None
+
+    # Gap 5 — effective required triggers at the most recent _check_triggers
+    # evaluation.  Starts at min_triggers and is raised by HTF-bear, low
+    # confidence, and decay adjustments in the watch loop.  Used when
+    # recording ALMOST→EXPIRED so tuner stats reflect the actual bar, not
+    # the nominal floor.  None until first evaluation.
+    last_required_triggers: Optional[int] = None
 
     # FIX #32: Trigger quality weights — structure_shift outweighs rejection_candle
     TRIGGER_WEIGHTS: dict = None  # set as class var below (dataclass limitation)
@@ -275,10 +332,20 @@ class TrackedExecution:
         New weights make liquidity alone (score=1.0) insufficient to trigger entry.
         """
         score = 0.0
-        if self.has_structure_shift:    score += 2.0  # Real structural break
-        if self.has_momentum_expansion: score += 2.0  # Real buyer/seller participation
-        if self.has_liquidity_reaction: score += 1.0  # Valid but not standalone
-        if self.has_rejection_candle:   score += 1.0  # Valid but not standalone
+        # Gap 5 — magnitude multiplier scales each trigger's nominal weight
+        # by how decisively it fired relative to its own baseline.  A full
+        # structural break on real volume counts 2.0; a marginal break on
+        # thin volume counts 1.0 (multiplier clamped to floor 0.5 at the
+        # magnitude source).  This prevents a threshold-grazing shift from
+        # carrying the same weight as a decisive one.
+        if self.has_structure_shift:
+            score += 2.0 * float(self.structure_magnitude or 1.0)
+        if self.has_momentum_expansion:
+            score += 2.0 * float(self.momentum_magnitude or 1.0)
+        if self.has_liquidity_reaction:
+            score += 1.0 * float(self.liquidity_magnitude or 1.0)
+        if self.has_rejection_candle:
+            score += 1.0 * float(self.rejection_magnitude or 1.0)
         return score
 
 
@@ -347,7 +414,8 @@ class ExecutionEngine:
               entry_low, entry_high, stop_loss, confidence,
               tp1=0.0, tp2=0.0, tp3=None, rr_ratio=0.0, message_id=None,
               grade: str = "B", staleness_data: Optional[dict] = None,
-              setup_class: str = "intraday"):
+              setup_class: str = "intraday",
+              raw_data: Optional[dict] = None):
         # Stop-loss / take-profit side sanity check: catches corrupted records
         # before they enter the tracker (e.g. SHORT with stop below entry would
         # silently lose the entire move once price moves the "wrong" way).
@@ -421,19 +489,55 @@ class ExecutionEngine:
         else:
             _min_trig = _grade_trig
 
-        # FIX: Counter-trend signals in bear/choppy regimes require +1 trigger
-        # Evidence: AAVE LONG entered on 1.3/1 score (liquidity reaction only) — lost $193
-        # KITE LONG entered on 2.2/1 score — lost $638. Both counter-trend in BEAR_TREND.
+        # FIX: Symmetric regime-aware trigger adjustment.
+        # Previously we only *ratcheted up* for counter-trend (AAVE / KITE losses
+        # at 1.3–2.2/1 score in BEAR_TREND).  The inverse is equally valid: a
+        # LONG in a confirmed BULL_TREND with weekly ADX≥25 is buying dips in a
+        # trending market, and should be allowed to fire on one fewer trigger
+        # (floored at 1).  core/_exec_helpers.trigger_adjustment_for_regime
+        # encapsulates both sides so the rule is testable and symmetric.
         try:
             from analyzers.regime import regime_analyzer as _ee_ra
             from analyzers.htf_guardrail import htf_guardrail as _ee_htf
+            from core._exec_helpers import trigger_adjustment_for_regime as _ee_adj
             _ee_regime = _ee_ra.regime.value
-            _is_counter = (
-                (direction == "LONG" and _ee_htf._weekly_bias == "BEARISH") or
-                (direction == "SHORT" and _ee_htf._weekly_bias == "BULLISH")
+            _adj_min, _adj_note = _ee_adj(
+                direction=direction,
+                regime=_ee_regime,
+                weekly_bias=_ee_htf._weekly_bias,
+                weekly_adx=_ee_htf._weekly_adx,
+                base_min_triggers=_min_trig,
             )
-            if _is_counter and _ee_regime in ("BEAR_TREND", "CHOPPY") and _ee_htf._weekly_adx >= 25:
-                _min_trig = max(_min_trig, 2)  # Always need at least 2 triggers for counter-trend
+            if _adj_note:
+                _min_trig = _adj_min
+                logger.info(
+                    f"ExecutionEngine: #{signal_id} {symbol} {direction} "
+                    f"min_triggers adjusted — {_adj_note}"
+                )
+        except Exception:
+            pass
+
+        # Gap 6 feedback application — if the param-tuner has accepted a
+        # LOW-risk proposal for this (strategy|regime|setup_class) bucket,
+        # apply the clamped delta on top.  Floored at 1 so a bucket can never
+        # fire on 0 triggers (that's still reserved for immediate-entry
+        # strategies, which already have _min_trig=0 from the static table —
+        # and we intentionally skip the delta when _min_trig == 0 to preserve
+        # that intent).
+        try:
+            from analyzers.regime import regime_analyzer as _ee_ra2
+            _bkt_regime = getattr(_ee_ra2.regime, 'value', 'UNKNOWN')
+            _bkt_key = f"{strategy}|{_bkt_regime}|{setup_class or 'intraday'}"
+            _bkt_delta = get_min_triggers_bucket_delta(_bkt_key)
+            if _bkt_delta != 0 and _min_trig > 0:
+                _pre = _min_trig
+                _min_trig = max(1, int(_min_trig) + int(_bkt_delta))
+                if _min_trig != _pre:
+                    logger.info(
+                        f"ExecutionEngine: #{signal_id} {symbol} min_triggers "
+                        f"tuned {_pre}→{_min_trig} for bucket {_bkt_key} "
+                        f"(delta={_bkt_delta:+d})"
+                    )
         except Exception:
             pass
 
@@ -463,6 +567,7 @@ class ExecutionEngine:
             grade=grade, min_triggers=_min_trig,
             staleness_data=staleness_data,
             setup_class=setup_class,
+            raw_data=(dict(raw_data) if isinstance(raw_data, dict) else None),
         )
         self._tracked[signal_id].TRIGGER_WINDOW_SECS = _get_trigger_window_secs(setup_class)
         price_cache.subscribe(symbol)
@@ -733,6 +838,44 @@ class ExecutionEngine:
                     f"ExecutionEngine: #{sig.signal_id} {sig.symbol} EXPIRED "
                     f"(in ALMOST for {(now - sig.almost_since)/3600:.1f}h)"
                 )
+                # Gap 6: feed ALMOST→EXPIRED into the diagnostic / param tuner.
+                # Chronic "zone reached, triggers never confluenced" means the
+                # trigger threshold for this (strategy, regime, setup_class)
+                # bucket may be too strict — the tuner accumulates these events
+                # and can propose lowering require_triggers for that bucket.
+                try:
+                    from core.diagnostic_engine import diagnostic_engine as _de
+                    from analyzers.regime import regime_analyzer as _ra
+                    _regime = getattr(_ra.regime, 'value', 'UNKNOWN')
+                    _de.record_almost_expired(
+                        strategy=sig.strategy,
+                        regime=_regime,
+                        setup_class=getattr(sig, 'setup_class', 'intraday'),
+                        score=sig.triggers_met,
+                        min_triggers=(
+                            sig.last_required_triggers
+                            if sig.last_required_triggers is not None
+                            else sig.min_triggers
+                        ),
+                    )
+                except Exception:
+                    pass
+
+        # Gap 3: expire signals whose live RR has decayed below 1.0 after
+        # SL tightening.  We only fire this in pre-fill states because once the
+        # signal has fired we're in the outcome monitor's domain.
+        if (
+            sig.state in (SignalState.APPROVED, SignalState.PREPARING,
+                          SignalState.WATCHING, SignalState.ENTRY_ZONE,
+                          SignalState.ALMOST)
+            and getattr(sig, '_rr_decay_flag', False)
+        ):
+            _live_rr = getattr(sig, '_live_rr', 0.0)
+            sig.state = SignalState.EXPIRED
+            logger.info(
+                f"ExecutionEngine: #{sig.signal_id} {sig.symbol} EXPIRED "
+                f"(RR_DECAY live_rr={_live_rr:.2f} < 1.0 after SL tightening)"
+            )
 
         if (
             decayed_confidence <= 50.0
@@ -812,6 +955,11 @@ class ExecutionEngine:
                 _required_triggers += 1
             if decayed_confidence <= sig.confidence - DECAY_TRIGGER_INCREMENT_THRESHOLD and _required_triggers < 4:
                 _required_triggers += 1
+
+            # Gap 5 — remember the effective (post-HTF / post-decay) trigger
+            # bar so ALMOST→EXPIRED feedback doesn't understate what was
+            # actually required at the moment of evaluation.
+            sig.last_required_triggers = _required_triggers
 
             if sig.triggers_met >= _required_triggers:
                 # BUG-13: Pre-fill staleness validation.
@@ -971,6 +1119,54 @@ class ExecutionEngine:
             baseline = sig.staleness_data or {}
             signal_age_hours = (time.time() - sig.created_at) / 3600
             ohlcv_1h = None
+
+            # ── Gap 4: re-run semantic kills against live context ──────
+            # setup_context on the signal was built at creation.  By fill time,
+            # a CHoCH may have formed, the weekly trend may have flipped, or
+            # Wyckoff phase may have rolled — all things _check_semantic_kills
+            # already knows how to detect, and all things that should block an
+            # execution regardless of microstructure triggers lining up.
+            # This is the second call of the same helper (aggregator already
+            # runs it at publish time), this time with a freshly rebuilt
+            # setup_context so the semantic read is current.
+            try:
+                from analyzers.execution_gate import ExecutionQualityGate
+                from signals.context_contracts import build_setup_context as _bsc
+
+                class _SignalContextShim:
+                    """Minimal SignalResult-shaped adapter for build_setup_context().
+
+                    build_setup_context reads a handful of attributes off the
+                    signal object to construct the structure/pattern/location
+                    dicts.  We rebuild it here from the live TrackedExecution
+                    so Wyckoff-phase flips, CHoCH formations, and trend
+                    reversals since publication are visible to the semantic
+                    kill pass.
+                    """
+                    symbol = sig.symbol
+                    direction = sig.direction
+                    strategy = sig.strategy
+                    entry_low = sig.entry_low
+                    entry_high = sig.entry_high
+                    stop_loss = sig.stop_loss
+                    tp1 = sig.tp1
+                    tp2 = sig.tp2
+                    tp3 = sig.tp3
+                    confidence = sig.confidence
+                    setup_class = getattr(sig, 'setup_class', 'intraday')
+                    raw_data = sig.raw_data if isinstance(sig.raw_data, dict) else {}
+                _live_ctx = _bsc(_SignalContextShim())
+                _sem_reason = ExecutionQualityGate._check_semantic_kills(
+                    direction=sig.direction,
+                    setup_context=_live_ctx,
+                    execution_context=None,
+                )
+                if _sem_reason:
+                    return f"PRE_FILL_SEMANTIC_KILL: {_sem_reason[:100]}"
+            except Exception as _sk_err:
+                logger.debug(
+                    f"Pre-fill semantic kill check skipped (non-fatal): {_sk_err}"
+                )
 
             # ── Check 0: local-range drift before execute ──────────────
             # A setup can be valid at publish time but become a bad live trade if
@@ -1154,6 +1350,12 @@ class ExecutionEngine:
                 sig.has_structure_shift    = False
                 sig.has_momentum_expansion = False
                 sig.has_liquidity_reaction = False
+                # Gap 5: clear magnitudes too so stale multipliers don't leak
+                # into the next window's fresh trigger detections.
+                sig.rejection_magnitude = 1.0
+                sig.structure_magnitude = 1.0
+                sig.momentum_magnitude  = 1.0
+                sig.liquidity_magnitude = 1.0
                 sig.trigger_window_since   = now
                 if any(_was):
                     logger.info(
@@ -1194,6 +1396,74 @@ class ExecutionEngine:
             atr_14 = rng * 0.5
         avg_vol = float(np.mean(vols[-10:])) if len(vols) >= 10 else float(vols[-1])
 
+        # ── Gap 1: Vol-aware trigger window refresh ─────────────────────────
+        # Recompute TRIGGER_WINDOW_SECS from live ATR %.  Compare recent ATR %
+        # (last 5 bars) to baseline ATR % (last 20 bars).  In fast vol the
+        # confluence window shortens; in quiet markets it stretches.  We scale
+        # off the setup-class-derived base so the original 4-bar heuristic is
+        # preserved as the neutral point.
+        try:
+            if len(closes) >= 5 and len(_tr) >= 20 and c > 0:
+                atr_pct_recent = float(np.mean(_tr[-5:])) / c
+                atr_pct_baseline = float(np.mean(_tr[-20:])) / c
+                if atr_pct_recent > 0 and atr_pct_baseline > 0:
+                    from core._exec_helpers import scale_trigger_window as _vscale
+                    _base_w = _get_trigger_window_secs(
+                        getattr(sig, 'setup_class', 'intraday')
+                    )
+                    sig.TRIGGER_WINDOW_SECS = _vscale(
+                        _base_w, atr_pct_recent, atr_pct_baseline,
+                        min_secs=TRIGGER_WINDOW_MIN_SECS,
+                        max_secs=TRIGGER_WINDOW_MAX_SECS,
+                    )
+        except Exception:
+            pass
+
+        # ── Gap 3: SL refresh against newest swing pivot + RR decay check ───
+        # Between publication and fill, a new swing pivot may have formed closer
+        # to entry.  Tightening SL to that pivot preserves RR integrity and
+        # avoids giving away an entire leg of stop distance that the original
+        # computation left behind.  Never loosens (max/min with original).
+        #
+        # After tightening, if the resulting RR to TP1 has decayed below 1.0,
+        # we mark the signal RR_DECAY and let the top-level _check expire it.
+        try:
+            from core._exec_helpers import (
+                tightened_sl as _tsl, compute_rr as _crr,
+            )
+            # Nearest opposite-side pivot in the last ~12 bars of the confirm TF.
+            if len(closes) >= 12:
+                window = closes[-12:]
+                if sig.direction == "LONG":
+                    pivot = float(np.min(lows[-12:]))
+                    new_sl = _tsl(sig.direction, sig.stop_loss, pivot)
+                elif sig.direction == "SHORT":
+                    pivot = float(np.max(highs[-12:]))
+                    new_sl = _tsl(sig.direction, sig.stop_loss, pivot)
+                else:
+                    new_sl = sig.stop_loss
+                if new_sl != sig.stop_loss:
+                    _old = sig.stop_loss
+                    sig.stop_loss = float(new_sl)
+                    logger.info(
+                        f"🎯 SL tightened | #{sig.signal_id} {sig.symbol} "
+                        f"{sig.direction} | {_old:.6g} → {sig.stop_loss:.6g} "
+                        f"(pivot={pivot:.6g})"
+                    )
+                # Recompute RR to TP1 from current mid-entry.  If RR floor
+                # collapses below 1.0 after repricing, stamp rr_decay so the
+                # top-level _check path can expire the signal cleanly.
+                if sig.tp1 and sig.entry_mid > 0:
+                    _live_rr = _crr(
+                        sig.direction, sig.entry_mid, sig.stop_loss, sig.tp1,
+                    )
+                    sig._live_rr = _live_rr  # exposed for logging / expire
+                    if _live_rr > 0 and _live_rr < 1.0:
+                        sig._rr_decay_flag = True
+        except Exception:
+            pass
+
+
         # Trigger 1: rejection candle — wick-heavy candle with meaningful size
         #
         # OLD: body/rng < 0.4 AND body > 0
@@ -1210,6 +1480,14 @@ class ExecutionEngine:
                 sig.has_rejection_candle = True
             elif sig.direction == "SHORT" and c < o:
                 sig.has_rejection_candle = True
+        # Gap 5: magnitude — wick-size relative to ATR.  A rejection on a
+        # 2×ATR bar carries more information than one on a 0.5×ATR bar.
+        if sig.has_rejection_candle and atr_14 > 0:
+            try:
+                from core._exec_helpers import magnitude_multiplier as _mm
+                sig.rejection_magnitude = _mm(rng, atr_14)
+            except Exception:
+                pass
 
         # Fix E2: momentum expansion — requires volume spike AND large body
         vol_spike = float(vols[-1]) > avg_vol * 1.3
@@ -1220,6 +1498,18 @@ class ExecutionEngine:
                 sig.has_momentum_expansion = True
             elif sig.direction == "SHORT" and c < o:
                 sig.has_momentum_expansion = True
+        # Gap 5: magnitude — body size * vol ratio, normalized by ATR & avg vol.
+        # A 2×ATR candle on 3× volume is a much stronger signal than a
+        # 0.6×ATR candle on 1.3× volume (the threshold floor).
+        if sig.has_momentum_expansion and atr_14 > 0 and avg_vol > 0:
+            try:
+                from core._exec_helpers import magnitude_multiplier as _mm
+                body_mag = _mm(body, atr_14 * 0.6)
+                vol_mag = _mm(float(vols[-1]), avg_vol * 1.3)
+                # Combined magnitude is the geometric-ish mean, clamped.
+                sig.momentum_magnitude = max(0.5, min(2.0, (body_mag * vol_mag) ** 0.5))
+            except Exception:
+                pass
 
         # STRATEGIST FIX E: structure shift with volume validation
         # "Structure shift = break of structure (real demand/supply)" → score=2
@@ -1243,10 +1533,24 @@ class ExecutionEngine:
                 recent_swing_high = float(np.max(swing_lookback))
                 if c > recent_swing_high * 1.002 and _vol_confirms_structure:
                     sig.has_structure_shift = True
+                    # Gap 5: magnitude — how far past the swing high we broke.
+                    # 0.2% clearance = baseline (floor 0.5); 1%+ clearance = 2.0.
+                    try:
+                        from core._exec_helpers import magnitude_multiplier as _mm
+                        clearance_pct = (c - recent_swing_high) / recent_swing_high
+                        sig.structure_magnitude = _mm(clearance_pct, 0.002)
+                    except Exception:
+                        pass
             elif sig.direction == "SHORT":
                 recent_swing_low = float(np.min(swing_lookback))
                 if c < recent_swing_low * 0.998 and _vol_confirms_structure:
                     sig.has_structure_shift = True
+                    try:
+                        from core._exec_helpers import magnitude_multiplier as _mm
+                        clearance_pct = (recent_swing_low - c) / recent_swing_low
+                        sig.structure_magnitude = _mm(clearance_pct, 0.002)
+                    except Exception:
+                        pass
 
         # Trigger 4: liquidity reaction — use pre-computed market_state (Fix E3: no double fetch)
         if market_state is None:
@@ -1254,6 +1558,18 @@ class ExecutionEngine:
 
         if detect_liquidity_reaction({"direction": sig.direction}, market_state):
             sig.has_liquidity_reaction = True
+            # Gap 5: magnitude — sweep USD relative to per-symbol baseline.
+            # build_market_state typically exposes `liquidity_sweep_usd` in the
+            # liquidity block; we fall back gracefully if absent.
+            try:
+                from core._exec_helpers import magnitude_multiplier as _mm
+                liq_block = dict((market_state or {}).get('liquidity') or {})
+                sweep_usd = float(liq_block.get('sweep_usd') or 0.0)
+                median_usd = float(liq_block.get('median_sweep_usd') or 0.0)
+                if sweep_usd > 0 and median_usd > 0:
+                    sig.liquidity_magnitude = _mm(sweep_usd, median_usd)
+            except Exception:
+                pass
 
         # Persist trigger flags whenever any of them is now set.
         # This is a cheap UPDATE (only touched if at least one flag is True) so

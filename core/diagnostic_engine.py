@@ -60,6 +60,12 @@ class PendingApproval:
     # Personalised AI verdict generated at proposal time using live bot metrics
     user_verdict: str = ""    # "Your win rate is X%. AI says: approve/wait because..."
     verdict_approve: bool = True  # True=lean approve, False=lean reject/wait
+    # Option B — tiered auto-approval.  LOW risk proposals set this to now+VETO;
+    # the diagnostic watch loop applies them automatically if the user has not
+    # tapped NO by then.  MEDIUM and HIGH keep auto_apply_at = 0 (manual only).
+    # Rollback snapshot is always captured on auto-apply so a bad change can be
+    # reverted via /undo <approval_id>.
+    auto_apply_at: float = 0.0
 
 
 @dataclass
@@ -103,6 +109,14 @@ class DiagnosticEngine:
 
         # Scan stats (per-report cycle — reset after each 6h diagnostic report)
         self._scan_count: int = 0
+
+        # Errors.log ingestion — tail-read the shared log file so errors
+        # logged via the root logger (not via explicit record_error calls)
+        # still surface in diagnostic reports. Offset persists across loop
+        # iterations so we only ever read the tail since last poll.
+        self._errors_log_path: str = "logs/errors.log"
+        self._errors_log_offset: int = 0
+        self._errors_log_last_poll: float = 0.0
         self._signals_generated: int = 0
         # Cumulative totals (never reset — true uptime stats for dashboard)
         self._total_scan_count: int = 0
@@ -159,6 +173,83 @@ class DiagnosticEngine:
 
     # ── Observation feeds (called by engine.py) ───────────────
 
+    _ERRORS_LOG_MAX_BYTES = 2_000_000   # read at most 2 MB per poll
+    _ERRORS_LOG_MIN_INTERVAL = 60.0     # don't re-poll more than once/min
+    _ERRORS_LOG_MAX_LINES = 400         # cap per-poll ingest
+
+    def _ingest_errors_log(self) -> None:
+        """Tail-read logs/errors.log and feed new ERROR/CRITICAL lines
+        into ``record_error``.
+
+        Many modules log via the root logger (which fans out to errors.log
+        through the configured file handler) but never call record_error
+        explicitly. Without ingestion, those errors never surface in the 6h
+        diagnostic report. The poll is cheap (seek to last offset) and
+        rate-limited to at most once per minute.
+        """
+        try:
+            now = time.time()
+            if now - self._errors_log_last_poll < self._ERRORS_LOG_MIN_INTERVAL:
+                return
+            self._errors_log_last_poll = now
+
+            import os
+            path = self._errors_log_path
+            if not os.path.exists(path):
+                return
+            size = os.path.getsize(path)
+
+            # Log rotation / truncation: reset offset if file shrank.
+            if size < self._errors_log_offset:
+                self._errors_log_offset = 0
+
+            # Cap how far we seek back on first read so we don't ingest the
+            # entire historical file on startup.
+            if self._errors_log_offset == 0 and size > self._ERRORS_LOG_MAX_BYTES:
+                self._errors_log_offset = size - self._ERRORS_LOG_MAX_BYTES
+
+            if size <= self._errors_log_offset:
+                return  # nothing new
+
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                fh.seek(self._errors_log_offset)
+                chunk = fh.read(self._ERRORS_LOG_MAX_BYTES)
+                self._errors_log_offset = fh.tell()
+
+            # Parse lines of the form:
+            #   YYYY-MM-DD HH:MM:SS ... - <module> - ERROR - <message>
+            #   YYYY-MM-DD HH:MM:SS ... - <module> - CRITICAL - <message>
+            import re as _re_log
+            pattern = _re_log.compile(
+                r" - (?P<module>[\w\.]+) - (?P<level>ERROR|CRITICAL) - (?P<msg>.+)"
+            )
+            count = 0
+            for line in chunk.splitlines():
+                if count >= self._ERRORS_LOG_MAX_LINES:
+                    break
+                m = pattern.search(line)
+                if not m:
+                    continue
+                module = m.group("module") or "unknown"
+                msg = (m.group("msg") or "").strip()
+                # Derive a coarse error_type from the message (first 1-3 words)
+                # so repeated errors aggregate on the ErrorRecord counter.
+                first = msg.split(":", 1)[0].strip()
+                error_type = (first[:40] if first else m.group("level")) or "ERROR"
+                try:
+                    # Skip lines we already recorded via explicit record_error
+                    # to avoid double-counting. We cannot reliably distinguish
+                    # them, but the keyed aggregation in record_error merges
+                    # duplicates into a single ErrorRecord by count, so the
+                    # effect is just a slightly higher count — acceptable.
+                    self.record_error(module, error_type, msg[:240])
+                except Exception:
+                    pass
+                count += 1
+        except Exception as _ingest_err:
+            # Never let log ingestion break the watch loop.
+            logger.debug(f"errors.log ingestion failed (non-fatal): {_ingest_err}")
+
     def record_error(self, module: str, error_type: str, message: str, symbol: str = ""):
         """Called by engine whenever an error occurs."""
         key = f"{module}:{error_type}"
@@ -208,6 +299,73 @@ class DiagnosticEngine:
             )
         except Exception:
             pass
+
+    # Gap 6 — ALMOST→EXPIRED feedback for the param tuner.
+    # Accumulated in a per-bucket counter so the tuner can propose lowering
+    # require_triggers for (strategy, regime, setup_class) combinations that
+    # chronically stall in ALMOST without firing.  Bucket keys expire after
+    # 14 days so an old regime's data doesn't bias tuning forever.
+    _ALMOST_EXPIRED_BUCKET_TTL_SEC: float = 14 * 86400
+
+    def record_almost_expired(self, *, strategy: str, regime: str,
+                               setup_class: str, score: float,
+                               min_triggers: float) -> None:
+        """Record a signal that reached ALMOST but timed out without firing.
+
+        The param tuner inspects the resulting bucket counters in its 24h
+        cycle: if a single bucket has ≥ MIN_TRADES * 3 almost-expired events
+        with median (score / min_triggers) ≥ 0.6, the bucket is a candidate
+        for a 1-step trigger-threshold relaxation.  The relaxation flows
+        through the normal LOW-risk auto-approval path (Option B).
+        """
+        if not hasattr(self, '_almost_expired_log'):
+            self._almost_expired_log: List[dict] = []
+        now = time.time()
+        # Prune stale entries in-line (cheap; bounded log size).
+        cutoff = now - self._ALMOST_EXPIRED_BUCKET_TTL_SEC
+        if self._almost_expired_log and self._almost_expired_log[0]['ts'] < cutoff:
+            self._almost_expired_log = [
+                e for e in self._almost_expired_log if e['ts'] >= cutoff
+            ]
+        self._almost_expired_log.append({
+            'ts': now,
+            'strategy': strategy or 'UNKNOWN',
+            'regime': regime or 'UNKNOWN',
+            'setup_class': setup_class or 'intraday',
+            'score': float(score or 0.0),
+            'min_triggers': float(min_triggers or 0.0),
+        })
+        # Hard cap on log length so it never grows pathologically.
+        if len(self._almost_expired_log) > 5000:
+            self._almost_expired_log = self._almost_expired_log[-5000:]
+
+    def get_almost_expired_buckets(self) -> Dict[str, dict]:
+        """Aggregate almost-expired events into (strategy|regime|setup_class) buckets.
+
+        Returns a dict keyed by bucket string with stats:
+          {'count', 'median_fill_ratio', 'sample_size'}
+        where fill_ratio = score / min_triggers for each event.
+
+        The tuner reads this to decide whether to propose a threshold change.
+        """
+        if not hasattr(self, '_almost_expired_log'):
+            return {}
+        buckets: Dict[str, List[float]] = {}
+        for e in self._almost_expired_log:
+            key = f"{e['strategy']}|{e['regime']}|{e['setup_class']}"
+            mt = e['min_triggers']
+            ratio = (e['score'] / mt) if (mt and mt > 0) else 0.0
+            buckets.setdefault(key, []).append(ratio)
+        out: Dict[str, dict] = {}
+        import statistics as _stats
+        for key, ratios in buckets.items():
+            median = _stats.median(ratios) if ratios else 0.0
+            out[key] = {
+                'count': len(ratios),
+                'median_fill_ratio': median,
+                'sample_size': len(ratios),
+            }
+        return out
 
     def record_scan(self):
         self._scan_count += 1
@@ -354,6 +512,29 @@ class DiagnosticEngine:
 
     # ── Approval system ───────────────────────────────────────
 
+    @staticmethod
+    def _proposal_target_key(change_type: str, new_value) -> str:
+        """
+        Build a stable key identifying the TARGET of a proposal (not its value),
+        so two proposals that mutate the same knob (e.g., swing RR floor 1.75 vs
+        1.77) collapse to one pending approval instead of stacking.
+        """
+        try:
+            if isinstance(new_value, dict):
+                if change_type == "rr_floor":
+                    return f"rr_floor:{new_value.get('setup_class', '_')}"
+                if change_type == "suppress_strategy":
+                    return f"suppress_strategy:{new_value.get('strategy', '_')}"
+                if change_type == "exclude_symbol":
+                    return f"exclude_symbol:{new_value.get('symbol', '_')}"
+                if change_type == "execution_config":
+                    # Bucket-aware key so per-(strategy|regime|setup_class)
+                    # proposals don't overwrite each other.
+                    return f"execution_config:{new_value.get('bucket', '_')}"
+        except Exception:
+            pass
+        return change_type
+
     async def propose_change(self, change_type: str, description: str,
                               old_value, new_value, reason: str,
                               risk_level: str = "LOW",
@@ -362,8 +543,61 @@ class DiagnosticEngine:
         Propose a runtime config change. Sends Telegram approval request.
         Does NOT apply anything until user taps YES.
         """
-        # ── Global rate cap — prevent more than N proposals per hour ──────────
+        # ── Dedup against existing non-expired pending approvals ─────────────
+        # Without this, if the user never taps YES/NO, the diagnostic loop keeps
+        # firing a new approval every 30 min (value-specific time dedup at the
+        # call site only prevents *call* frequency, not queue buildup).
+        # Result seen in the field: 6 identical "Lower swing RR floor: 2.0 → 1.x"
+        # proposals piled up with 5 still pending, all showing From: 2.0.
+        # Instead of creating a new approval, update the existing one in place
+        # with the fresher proposed value/reason and keep the same approval_id
+        # so the Telegram card can be edited rather than duplicated.
         now = time.time()
+        try:
+            _target_key = self._proposal_target_key(change_type, new_value)
+        except Exception:
+            _target_key = None
+        if _target_key:
+            for _existing in list(self._pending_approvals.values()):
+                if _existing.change_type != change_type:
+                    continue
+                if _existing.expires_at and _existing.expires_at <= now:
+                    continue
+                try:
+                    _existing_key = self._proposal_target_key(
+                        _existing.change_type, _existing.new_value
+                    )
+                except Exception:
+                    _existing_key = None
+                if _existing_key != _target_key:
+                    continue
+                # Found a matching pending proposal — refresh it in place.
+                _existing.description = description
+                _existing.new_value = new_value
+                _existing.reason = reason
+                _existing.risk_level = risk_level
+                _existing.estimated_impact = estimated_impact
+                # Refresh the auto-apply timer so a LOW-risk proposal always
+                # gets its full veto window from the most recent refresh, and
+                # a risk-level change (e.g. MEDIUM→LOW or LOW→HIGH) is
+                # reflected in the timer rather than inheriting the stale one.
+                try:
+                    from core._exec_helpers import auto_apply_at_for_risk as _aaar_refresh
+                    _existing.auto_apply_at = _aaar_refresh(risk_level, time.time())
+                except Exception:
+                    pass
+                logger.info(
+                    f"🔬 Approval refreshed [{_existing.approval_id}] "
+                    f"(duplicate suppressed): {description}"
+                )
+                if self.on_send_approval:
+                    try:
+                        await self.on_send_approval(_existing)
+                    except Exception as _e:
+                        logger.debug(f"on_send_approval on refresh failed: {_e}")
+                return
+
+        # ── Global rate cap — prevent more than N proposals per hour ──────────
         cutoff = now - 3600
         recent_proposals = [t for t in self._proposal_timestamps if t > cutoff]
         if len(recent_proposals) >= self._max_proposals_per_hour:
@@ -376,6 +610,14 @@ class DiagnosticEngine:
 
         import uuid
         approval_id = str(uuid.uuid4())[:8]
+        # Option B — tiered auto-approval window: LOW risk proposals auto-apply
+        # after the veto window; MEDIUM/HIGH require manual tap.  Computed once
+        # at proposal time so the watch loop only needs cheap comparisons.
+        try:
+            from core._exec_helpers import auto_apply_at_for_risk as _aaar
+            _auto_at = _aaar(risk_level, time.time())
+        except Exception:
+            _auto_at = 0.0
         approval = PendingApproval(
             approval_id=approval_id,
             change_type=change_type,
@@ -386,6 +628,7 @@ class DiagnosticEngine:
             risk_level=risk_level,
             estimated_impact=estimated_impact,
             expires_at=time.time() + 86400,  # Expires in 24h
+            auto_apply_at=_auto_at,
         )
         # ── Generate personalised "should you approve?" verdict ──────────────
         # Pull live bot metrics and ask AI to give a specific recommendation
@@ -464,6 +707,69 @@ In 1-2 sentences: should they approve or wait? Start with "Approve" or "Wait —
             logger.error(f"Failed to apply approval {approval_id}: {e}")
             return False
 
+    async def apply_all_low_risk(self) -> List[str]:
+        """Option B — batch-apply every currently pending LOW-risk proposal.
+
+        Returns the list of approval_ids that were successfully applied.
+        Intended for /approve_all_low in Telegram.  MEDIUM and HIGH are
+        deliberately excluded — they always require per-item review.
+        """
+        applied: List[str] = []
+        for approval_id, approval in list(self._pending_approvals.items()):
+            if str(approval.risk_level or "").upper() != "LOW":
+                continue
+            try:
+                if await self.apply_approval(approval_id):
+                    applied.append(approval_id)
+            except Exception as e:
+                logger.error(
+                    f"apply_all_low_risk: failed #{approval_id}: {e}"
+                )
+        if applied:
+            logger.info(
+                f"✅ Batch-applied {len(applied)} LOW-risk approval(s): "
+                f"{', '.join(applied)}"
+            )
+        return applied
+
+    async def _process_auto_apply(self) -> None:
+        """Option B — auto-apply mature LOW-risk proposals whose veto window elapsed.
+
+        Called from the watch loop.  For each pending approval with a non-zero
+        auto_apply_at ≤ now, we fire apply_approval() and emit a brief
+        notification via on_send_report so the user knows to tap /undo if
+        they disagree.  Rollback snapshot is the standard _applied_overrides
+        entry, so /undo works identically for manual and auto-applied changes.
+        """
+        now = time.time()
+        mature: List[PendingApproval] = []
+        for a in list(self._pending_approvals.values()):
+            if a.auto_apply_at and a.auto_apply_at <= now:
+                if a.expires_at and a.expires_at <= now:
+                    # Also-expired — let the normal expiry path handle it.
+                    continue
+                mature.append(a)
+
+        for a in mature:
+            try:
+                ok = await self.apply_approval(a.approval_id)
+            except Exception as e:
+                logger.error(
+                    f"_process_auto_apply: failed #{a.approval_id}: {e}"
+                )
+                continue
+            if ok and self.on_send_report:
+                try:
+                    _desc = (a.description or "")[:100]
+                    await self.on_send_report(
+                        f"🤖 <b>Auto-applied LOW-risk change</b>\n"
+                        f"[{a.approval_id}] {_desc}\n"
+                        f"Reason: {(a.reason or '')[:120]}\n"
+                        f"Use /undo {a.approval_id} to revert."
+                    )
+                except Exception:
+                    pass
+
     async def undo_change(self, approval_id: str) -> bool:
         """Revert an applied change."""
         override = self._applied_overrides.get(approval_id)
@@ -511,9 +817,34 @@ In 1-2 sentences: should they approve or wait? Start with "Approve" or "Wait —
                 logger.info(f"  → Symbol excluded: {value['symbol']}")
 
             elif change_type == "execution_config":
-                # Execution funnel proposals are advisory — log that user acknowledged.
-                # The actual config change description is stored in the approval for audit.
-                logger.info(f"  → Execution config acknowledged: {str(value)[:120]}")
+                # Gap 6 wiring: LOW-risk proposals from governance.param_tuner
+                # for chronic ALMOST→EXPIRED buckets carry the target bucket
+                # and a clamped min_triggers delta. Apply it to the runtime
+                # override so track() reflects the tuner's verdict.
+                try:
+                    from core.execution_engine import set_min_triggers_bucket_delta
+                    if isinstance(value, dict):
+                        _bkt = value.get("bucket")
+                        _delta = value.get("min_triggers_delta", 0)
+                        if _bkt:
+                            _applied = set_min_triggers_bucket_delta(_bkt, _delta)
+                            logger.info(
+                                f"  → Execution config applied: "
+                                f"{_bkt} min_triggers_delta={_applied:+d}"
+                            )
+                        else:
+                            logger.info(
+                                f"  → Execution config acknowledged (no bucket): "
+                                f"{str(value)[:120]}"
+                            )
+                    else:
+                        logger.info(
+                            f"  → Execution config acknowledged: {str(value)[:120]}"
+                        )
+                except Exception as _exec_cfg_err:
+                    logger.warning(
+                        f"execution_config apply failed: {_exec_cfg_err}"
+                    )
 
         except Exception as e:
             logger.warning(f"In-memory apply failed ({change_type}): {e}")
@@ -543,10 +874,20 @@ In 1-2 sentences: should they approve or wait? Start with "Approve" or "Wait —
         await asyncio.sleep(30)  # Let bot warm up first
         while self._running:
             try:
+                self._ingest_errors_log()
                 await self._check_error_rate()
                 await self._check_signal_drought()
                 await self._check_edge_cases()
                 await self._check_performance_gaps()
+
+                # Option B — auto-apply mature LOW-risk proposals.  Runs every
+                # watch cycle; individual proposals are only applied once their
+                # auto_apply_at timestamp has passed.  MEDIUM/HIGH are never
+                # auto-applied regardless of age.
+                try:
+                    await self._process_auto_apply()
+                except Exception as _aa_err:
+                    logger.debug(f"_process_auto_apply error: {_aa_err}")
 
                 # Run AI dead signal analysis (V2.09: every 2h, was 30min — saves ~36 calls/day)
                 try:
@@ -953,6 +1294,56 @@ In 1-2 sentences: should they approve or wait? Start with "Approve" or "Wait —
                             )
                 except Exception:
                     pass
+
+        # ── Per-symbol underperformance auto-exclude ─────────────────────
+        # Parallel to the per-strategy suppression above. Symbols that keep
+        # generating losing signals should be auto-excluded via the same
+        # approval flow so the user remains in control. Threshold is stricter
+        # than per-strategy: 8+ closed trades and < 25% win rate over 72h
+        # (longer window since per-symbol sample size is smaller).
+        recent_72h = [o for o in self._outcome_log if now - o["ts"] < 72 * 3600]
+        sym_outcomes: Dict[str, List[bool]] = defaultdict(list)
+        for o in recent_72h:
+            _sym = o.get("symbol") or ""
+            if _sym:
+                sym_outcomes[_sym].append(o["outcome"] == "WIN")
+        for sym, results in sym_outcomes.items():
+            if len(results) < 8:
+                continue
+            swr = sum(results) / len(results)
+            if swr >= 0.25:
+                continue
+            try:
+                from scanner.scanner import scanner as _sc
+                # Already excluded?  scanner exposes an _excluded set; skip in
+                # that case to avoid noisy re-proposal. Defensive — attribute
+                # names may vary across builds.
+                _already = False
+                for _attr in ("_excluded_symbols", "_excluded", "excluded_symbols"):
+                    _cont = getattr(_sc, _attr, None)
+                    if _cont and sym in _cont:
+                        _already = True
+                        break
+                if _already:
+                    continue
+            except Exception:
+                pass
+            _dedup_key = f"perf_exclude:{sym}"
+            if now - self._last_proposals.get(_dedup_key, 0) > 24 * 3600:
+                self._last_proposals[_dedup_key] = now
+                try:
+                    await self.propose_change(
+                        change_type="exclude_symbol",
+                        description=f"Exclude {sym} for 24h (win rate: {swr:.0%} over {len(results)} trades)",
+                        old_value={"symbol": sym, "excluded": False},
+                        new_value={"symbol": sym, "duration_mins": 1440},
+                        reason=(f"{sym} win rate: {swr:.0%} over {len(results)} closed trades "
+                                f"in last 72h. Below 25% threshold — auto-exclude recommended."),
+                        risk_level="LOW",
+                        estimated_impact="Removes losing symbol from scan universe; can be reversed manually.",
+                    )
+                except Exception as _pe_err:
+                    logger.debug(f"perf_exclude proposal failed ({sym}): {_pe_err}")
 
         # ── Confidence floor raise-back: detect if a previously-lowered
         # confidence floor is now producing too many low-quality signals ─────
