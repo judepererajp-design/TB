@@ -563,6 +563,15 @@ class CommandsMixin:
         if not self._auth(update):
             return
         from analyzers.news_override import news_override_store
+        # Hydrate any persisted state so /news_override status is correct
+        # after a restart — status() is sync so can't trigger load itself.
+        # Silent failure is acceptable here: a DB hiccup should not crash
+        # the Telegram handler; the subsequent status() will just reflect
+        # the (possibly empty) in-memory state and we log for debugging.
+        try:
+            await news_override_store.load()
+        except Exception as _load_err:
+            logger.debug(f"news_override_store.load failed in /news_override: {_load_err}")
         args = context.args or []
         sub = (args[0].lower() if args else "status")
 
@@ -640,15 +649,22 @@ class CommandsMixin:
         except Exception:
             pass
 
-        ov = await news_override_store.set_override(
-            event_type=event_type,
-            direction=direction,
-            confidence_mult=conf_mult,
-            size_mult=size_mult,
-            reason=reason,
-            set_by=set_by,
-            ttl_minutes=ttl_minutes,
-        )
+        ov = None
+        try:
+            ov = await news_override_store.set_override(
+                event_type=event_type,
+                direction=direction,
+                confidence_mult=conf_mult,
+                size_mult=size_mult,
+                reason=reason,
+                set_by=set_by,
+                ttl_minutes=ttl_minutes,
+            )
+        except ValueError as exc:
+            await update.message.reply_text(
+                f"❌ {exc}", parse_mode=ParseMode.HTML
+            )
+            return
         await update.message.reply_text(
             f"📝 Override installed\n"
             f"Event: <b>{ov.event_type}/{ov.direction}</b>\n"

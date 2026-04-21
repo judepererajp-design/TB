@@ -9,6 +9,7 @@ behaviour is exercised via a stub LLMClient.
 from __future__ import annotations
 
 import asyncio
+import sys
 import time
 from unittest.mock import AsyncMock, MagicMock
 
@@ -53,6 +54,24 @@ class TestAmbiguityDetector:
         assert etype == self.BTCEventType.MACRO_RISK_OFF
         assert is_mixed is False
 
+    def test_diplomatic_breakdown_is_not_de_escalation(self):
+        """Escalation-veto: 'diplomatic breakdown' contains diplomacy-flavoured
+        language but is unambiguously escalation — must not be flagged mixed."""
+        title = "Diplomatic breakdown between Iran and Israel after failed talks"
+        etype, direction, conf, is_mixed = self.classifier.classify(title)
+        assert etype == self.BTCEventType.MACRO_RISK_OFF
+        assert is_mixed is False, (
+            "Headlines containing escalation-veto phrases (breakdown/fail/…) "
+            "must NOT be softened via the de-escalation path."
+        )
+
+    def test_peace_talks_collapse_is_not_de_escalation(self):
+        title = "Peace talks collapse as North Korea walks out of summit"
+        etype, direction, conf, is_mixed = self.classifier.classify(title)
+        # 'collapse' + 'walk out' veto the de-escalation inversion even though
+        # "peace talks" and "summit" are in the de-escalation list.
+        assert is_mixed is False
+
     def test_is_ambiguous_flags_mixed(self):
         title = "Iran plans delegation to Pakistan amid military threats"
         etype, direction, conf, is_mixed = self.classifier.classify(title)
@@ -92,7 +111,7 @@ def override_store(monkeypatch):
     fake_db.save_learning_state = AsyncMock()
     fake_db.load_learning_state = AsyncMock(return_value=None)
     fake_module = MagicMock(db=fake_db)
-    monkeypatch.setitem(__import__("sys").modules, "data.database", fake_module)
+    monkeypatch.setitem(sys.modules, "data.database", fake_module)
     store = news_override.NewsOverrideStore()
     return store, fake_db
 
@@ -130,6 +149,68 @@ class TestNewsOverrideStore:
         assert ov.size_mult == NewsOverrideDefaults.MIN_SIZE_MULT
         ttl_m = (ov.expires_at_utc - ov.set_at_utc) / 60
         assert ttl_m <= NewsOverrideDefaults.MAX_TTL_MINUTES + 1
+
+    @pytest.mark.asyncio
+    async def test_set_override_rejects_invalid_event_type(self, override_store):
+        """Typos like FOOBAR must raise at set time instead of silently
+        installing a no-op override."""
+        store, _ = override_store
+        with pytest.raises(ValueError, match="Unknown event_type"):
+            await store.set_override(
+                event_type="FOOBAR",
+                direction="BEARISH",
+                confidence_mult=0.9,
+                size_mult=0.9,
+            )
+        assert store.get_active() is None
+
+    @pytest.mark.asyncio
+    async def test_load_is_idempotent_and_hydrates_persisted_override(
+        self, monkeypatch
+    ):
+        """After a 'restart' (fresh store, DB has a payload), load() must
+        hydrate the in-memory override exactly once."""
+        from analyzers import news_override
+        now = time.time()
+        persisted = {
+            "active": {
+                "event_type": "MACRO_RISK_OFF",
+                "direction": "BEARISH",
+                "confidence_mult": 0.8,
+                "size_mult": 0.8,
+                "set_by": "alice",
+                "set_at_utc": now,
+                "expires_at_utc": now + 3600,
+                "consume_on_next_event": True,
+                "declared_severity": "MEDIUM",
+                "reason": "persisted before restart",
+                "source_headline": "",
+                "block_longs": False,
+                "block_shorts": False,
+            },
+            "trust": {"alice": 0.1},
+            "history": [],
+        }
+        fake_db = MagicMock()
+        fake_db.save_learning_state = AsyncMock()
+        fake_db.load_learning_state = AsyncMock(return_value=persisted)
+        monkeypatch.setitem(
+            sys.modules, "data.database", MagicMock(db=fake_db)
+        )
+        store = news_override.NewsOverrideStore()
+        # Before load: sync get_active sees nothing.
+        assert store.get_active() is None
+        # After load: override is hydrated.
+        await store.load()
+        ov = store.get_active()
+        assert ov is not None
+        assert ov.event_type == "MACRO_RISK_OFF"
+        assert ov.set_by == "alice"
+        assert store.trust_score("alice") == pytest.approx(0.1)
+        # Idempotent second call must not re-issue the DB read.
+        fake_db.load_learning_state.reset_mock()
+        await store.load()
+        fake_db.load_learning_state.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_override_ttl_expiry(self, override_store):

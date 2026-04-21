@@ -211,29 +211,66 @@ class NewsOverrideStore:
         Install a new override, replacing any prior one.  Bounds are clamped
         to :class:`NewsOverrideDefaults` limits.
         """
+        # Validate event_type against the BTCEventType enum so a typo like
+        # "MACRO_OFF" doesn't install a silent-no-op override.  We import
+        # lazily to avoid a circular import at module load time.
+        event_type_u = str(event_type).upper()
+        try:
+            from analyzers.btc_news_intelligence import BTCEventType
+            try:
+                BTCEventType(event_type_u)
+            except ValueError as exc:
+                valid = ", ".join(t.value for t in BTCEventType)
+                raise ValueError(
+                    f"Unknown event_type {event_type_u!r}; must be one of: {valid}"
+                ) from exc
+        except ImportError:  # pragma: no cover — should never happen in prod
+            logger.debug("BTCEventType unavailable for validation")
+
         await self.load()
 
-        ttl = ttl_minutes if ttl_minutes is not None else NewsOverrideDefaults.DEFAULT_TTL_MINUTES
+        ttl_requested = ttl_minutes if ttl_minutes is not None else NewsOverrideDefaults.DEFAULT_TTL_MINUTES
         ttl = int(_clamp(
-            ttl,
+            ttl_requested,
             NewsOverrideDefaults.MIN_TTL_MINUTES,
             NewsOverrideDefaults.MAX_TTL_MINUTES,
         ))
+        if ttl != ttl_requested:
+            logger.info(
+                f"📝 News override TTL clamped: requested {ttl_requested}m → "
+                f"applied {ttl}m (bounds {NewsOverrideDefaults.MIN_TTL_MINUTES}"
+                f"–{NewsOverrideDefaults.MAX_TTL_MINUTES}m)"
+            )
 
         now = time.time()
+        # Clamp each multiplier and record whether any clamp fired so we
+        # can surface the adjustment to the operator via the installation
+        # log.  Silent clamping was masking operator input errors.
+        conf_mult_req = float(confidence_mult)
+        conf_mult = _clamp(
+            conf_mult_req,
+            NewsOverrideDefaults.MIN_CONF_MULT,
+            NewsOverrideDefaults.MAX_CONF_MULT,
+        )
+        size_mult_req = float(size_mult)
+        size_mult_val = _clamp(
+            size_mult_req,
+            NewsOverrideDefaults.MIN_SIZE_MULT,
+            NewsOverrideDefaults.MAX_SIZE_MULT,
+        )
+        if conf_mult != conf_mult_req:
+            logger.info(
+                f"📝 News override conf_mult clamped: {conf_mult_req} → {conf_mult}"
+            )
+        if size_mult_val != size_mult_req:
+            logger.info(
+                f"📝 News override size_mult clamped: {size_mult_req} → {size_mult_val}"
+            )
         ov = NewsOverride(
-            event_type=str(event_type).upper(),
+            event_type=event_type_u,
             direction=str(direction).upper(),
-            confidence_mult=_clamp(
-                float(confidence_mult),
-                NewsOverrideDefaults.MIN_CONF_MULT,
-                NewsOverrideDefaults.MAX_CONF_MULT,
-            ),
-            size_mult=_clamp(
-                float(size_mult),
-                NewsOverrideDefaults.MIN_SIZE_MULT,
-                NewsOverrideDefaults.MAX_SIZE_MULT,
-            ),
+            confidence_mult=conf_mult,
+            size_mult=size_mult_val,
             block_longs=bool(block_longs),
             block_shorts=bool(block_shorts),
             reason=str(reason or "")[:500],

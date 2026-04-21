@@ -317,16 +317,46 @@ _BULLISH_OFFSET_KEYWORDS: List[str] = [
 # engagement, not escalation.  We flag these as ambiguous so the mixed-signal
 # softening path kicks in instead of the full risk-off hard-block.
 _DE_ESCALATION_KEYWORDS: List[str] = [
-    "delegation", "diplomat", "diplomacy", "diplomatic visit",
-    "talks", "talks resume", "talks continue", "meet",
-    "meeting", "visit", "summit",
+    # Diplomatic engagement actions (specific phrases, not bare "diplomat"
+    # which would false-positive on "diplomatic breakdown").
+    "delegation", "diplomatic visit", "diplomatic talks",
+    "diplomacy",
+    "talks resume", "talks continue", "resume talks",
+    "high-level talks", "bilateral talks",
+    "meeting", "summit", "state visit", "official visit",
     "ceasefire", "cease fire", "truce",
     "de-escalat", "deescalat", "ease tensions", "easing tension",
-    "peace", "peace talks", "peace deal",
+    "peace talks", "peace deal",
     "agreement", "accord", "pact", "treaty", "signed deal",
-    "resumed", "resume talks", "back to the table",
+    "back to the table", "return to talks",
     "dialogue", "negotiation resume", "reconcil",
 ]
+
+# Explicit-escalation phrases that VETO a de-escalation match — a headline
+# containing any of these is escalation regardless of which softer cue is
+# also present (e.g. "diplomatic breakdown" contains "diplomacy"-flavoured
+# language but is unambiguously escalation).
+_ESCALATION_VETO_PHRASES: Tuple[str, ...] = (
+    "breakdown", "break down", "collapse", "collapsed",
+    "fail", "failed", "fall apart", "fell apart",
+    "crisis", "rupture", "suspend", "suspended",
+    "reject", "rejected", "cancel", "cancelled", "canceled",
+    "walk out", "walked out", "walkout",
+    "no deal", "no agreement",
+)
+
+
+def _has_de_escalation_cue(title_lower: str) -> bool:
+    """True iff a lowercased title contains a de-escalation cue AND does
+    not also contain an explicit-escalation veto phrase.  The veto guard
+    prevents "diplomatic breakdown"-style headlines from being softened
+    by the mixed-signal path.
+    """
+    if not title_lower:
+        return False
+    if any(kw in title_lower for kw in _ESCALATION_VETO_PHRASES):
+        return False
+    return any(kw in title_lower for kw in _DE_ESCALATION_KEYWORDS)
 
 
 class NewsClassifier:
@@ -406,7 +436,7 @@ class NewsClassifier:
             if (
                 not is_mixed
                 and best_type == BTCEventType.MACRO_RISK_OFF
-                and any(kw in low for kw in _DE_ESCALATION_KEYWORDS)
+                and _has_de_escalation_cue(low)
             ):
                 is_mixed = True
 
@@ -524,9 +554,7 @@ class NewsClassifier:
         if is_mixed:
             return True, "mixed_signal"
 
-        if event_type == BTCEventType.MACRO_RISK_OFF and any(
-            kw in low for kw in _DE_ESCALATION_KEYWORDS
-        ):
+        if event_type == BTCEventType.MACRO_RISK_OFF and _has_de_escalation_cue(low):
             return True, "de_escalation_cue"
 
         try:
@@ -747,6 +775,17 @@ class BTCNewsIntelligence:
         if not headlines:
             return
 
+        # Hydrate any persisted operator override on first use after restart.
+        # ``NewsOverrideStore.load()`` is idempotent (``_loaded`` guard) so
+        # it's cheap to call every batch.  Without this, an override set
+        # before a restart would stay invisible to the sync ``get_active``
+        # path until some other async mutation triggered the lazy load.
+        try:
+            from analyzers.news_override import news_override_store
+            await news_override_store.load()
+        except Exception as _ov_load_err:
+            logger.debug(f"news_override_store.load skipped (non-fatal): {_ov_load_err}")
+
         # Filter to BTC/macro relevant headlines
                 # Includes geopolitical/crisis terms so headlines like
         # "JD Vance: Iran-US deal fails" are not filtered out.
@@ -822,10 +861,14 @@ class BTCNewsIntelligence:
                         _body = str(h.get("body") or h.get("raw_text") or "")
                         break
                 # Best-effort hit count from single-headline classify for
-                # the sanity veto guard.  NewsClassifier.classify() adds
-                # roughly +0.08 confidence per extra keyword hit on top of
-                # a base ~0.20, so we invert that schedule to recover an
-                # approximate hit count for the flip-guard threshold.
+                # the sanity veto guard.  NewsClassifier.classify() computes
+                # confidence as ``base_conf + (hits - 1) * 0.08`` (see
+                # ``conf = min(1.0, base_conf + (hits - 1) * 0.08)`` on the
+                # hit-scoring branch).  Typical ``base_conf`` is ~0.20
+                # so we invert the schedule here:
+                #   hits ≈ 1 + (conf - base) / step
+                # This is an approximation — its only consumer is the
+                # flip-guard which cares about ≥2 hits, not the exact count.
                 _CONF_HIT_BASE = 0.20
                 _CONF_HIT_STEP = 0.08
                 try:
@@ -1175,8 +1218,10 @@ class BTCNewsIntelligence:
         try:
             ov_etype = BTCEventType(ov.event_type)
         except ValueError:
-            ov_etype = base_ctx.event_type if base_ctx.event_type != BTCEventType.UNKNOWN \
-                else BTCEventType.UNKNOWN
+            # Invalid override event_type slipped through (older persisted
+            # data from before set-time validation).  Fall through to the
+            # base classifier's event_type if active, else leave UNKNOWN.
+            ov_etype = base_ctx.event_type
 
         # Start from a copy of base_ctx so we don't mutate the live state.
         out = copy.copy(base_ctx) if base_ctx is not None else BTCEventContext()
@@ -1184,7 +1229,7 @@ class BTCNewsIntelligence:
             # Synthesise a minimal active context so downstream consumers
             # treat the override as an active event.
             now = time.time()
-            out.event_type = ov_etype if ov_etype != BTCEventType.UNKNOWN else BTCEventType.UNKNOWN
+            out.event_type = ov_etype
             out.direction = ov.direction
             out.confidence = 0.70
             out.detected_at = now
