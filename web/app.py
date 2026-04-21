@@ -2061,7 +2061,8 @@ class DashboardApp:
 
     def _btc_news_context_payload(self, btc_news_intelligence, ctx) -> Dict[str, Any]:
         """Serialize a BTC news context for dashboard consumers."""
-        move_pct, move_dir = btc_news_intelligence._move_analyzer.get_move(30)
+        move_window_minutes = 30
+        move_pct, move_dir = btc_news_intelligence._move_analyzer.get_move(move_window_minutes)
         since_pct, since_dir = (
             btc_news_intelligence._move_analyzer.get_move_since(ctx.detected_at)
             if getattr(ctx, "detected_at", 0) > 0
@@ -2109,7 +2110,7 @@ class DashboardApp:
 
             await news_override_store.load()
             effective_ctx = btc_news_intelligence.get_event_context()
-            auto_status = btc_news_intelligence.get_status()
+            automatic_status = btc_news_intelligence.get_status()
             override_status = news_override_store.status()
 
             # Attach recent BTC/macro headlines for the dashboard feed
@@ -2136,7 +2137,7 @@ class DashboardApp:
 
             return _json_response({
                 "context": self._btc_news_context_payload(btc_news_intelligence, effective_ctx),
-                "auto_context": auto_status,
+                "auto_context": automatic_status,
                 "override": override_status,
                 "headlines": recent_btc,
                 "type_counts": dict(type_counts),
@@ -2155,7 +2156,12 @@ class DashboardApp:
                 },
             })
         except Exception as e:
-            return _json_response({"error": str(e), "context": {}, "headlines": []})
+            logger.warning("BTC news dashboard load failed: %s", e)
+            return _json_response({
+                "error": "Failed to load BTC news dashboard data",
+                "context": {},
+                "headlines": [],
+            }, status=500)
 
     async def _handle_btc_news_override(self, request: "web.Request") -> "web.Response":
         """POST /api/btc-news/override - install a manual BTC news override."""
@@ -2185,7 +2191,8 @@ class DashboardApp:
         except ValueError as e:
             return _json_response({"ok": False, "error": str(e)}, status=400)
         except Exception as e:
-            return _json_response({"ok": False, "error": str(e)}, status=500)
+            logger.warning("BTC news override save failed: %s", e)
+            return _json_response({"ok": False, "error": "Failed to save BTC news override"}, status=500)
 
     async def _handle_btc_news_override_clear(self, request: "web.Request") -> "web.Response":
         """POST /api/btc-news/override/clear - remove the active manual override."""
@@ -2202,7 +2209,8 @@ class DashboardApp:
                 "cleared": prev.to_dict() if prev else None,
             })
         except Exception as e:
-            return _json_response({"ok": False, "error": str(e)}, status=500)
+            logger.warning("BTC news override clear failed: %s", e)
+            return _json_response({"ok": False, "error": "Failed to clear BTC news override"}, status=500)
 
     async def _build_signal_detail_payload(self, signal_id: int, sig: Dict[str, Any]) -> Dict[str, Any]:
         # Get live scored signal from bot memory if available

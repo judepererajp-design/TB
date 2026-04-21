@@ -197,7 +197,7 @@ def test_btc_news_override_clear_removes_override(monkeypatch):
 
 
 def test_dashboard_html_contains_btc_override_controls():
-    html = Path("/home/runner/work/TB/TB/web/static/index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).resolve().parents[1] / "web" / "static" / "index.html").read_text(encoding="utf-8")
 
     assert "openBtcOverride()" in html
     assert "clearBtcOverride()" in html

@@ -2985,10 +2985,10 @@ async function openBtcOverride(){
   if(!confRaw)return;
   var sizeRaw=(prompt('Size multiplier',current&&current.size_mult!=null?String(current.size_mult):'1.0')||'').trim();
   if(!sizeRaw)return;
-  var ttlRaw=(prompt('TTL minutes',current&&current.expires_at_utc?String(Math.max(1,Math.round((current.expires_at_utc-Date.now()/1000)/60))):String(defaults.ttl_minutes||60))||'').trim();
-  if(!ttlRaw)return;
+  var ttlInput=(prompt('TTL minutes',current&&current.expires_at_utc?String(Math.max(1,Math.round((current.expires_at_utc-Date.now()/1000)/60))):String(defaults.ttl_minutes||60))||'').trim();
+  if(!ttlInput)return;
   var reason=(prompt('Reason / note',current&&current.reason||currentCtx.headline||'')||'').trim();
-  var conf=parseFloat(confRaw),size=parseFloat(sizeRaw),ttl=parseInt(ttlRaw,10);
+  var conf=parseFloat(confRaw),size=parseFloat(sizeRaw),ttl=parseInt(ttlInput,10);
   if(!isFinite(conf)||!isFinite(size)||!isFinite(ttl)){alert('Confidence, size, and TTL must be numeric.');return;}
   var resp=await btcOverridePost('/api/btc-news/override',{event_type:eventType,direction:direction,confidence_mult:conf,size_mult:size,ttl_minutes:ttl,reason:reason});
   if(!resp.ok||!resp.data||resp.data.error){alert('Override failed: '+((resp.data&&resp.data.error)||'unknown'));return;}
