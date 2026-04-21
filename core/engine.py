@@ -4940,6 +4940,25 @@ class Engine:
             from core.execution_engine import execution_engine
             exec_summary = execution_engine.get_status_summary()
             logger.info(f"║  Execution  : {exec_summary:<28}║")
+            # Signal funnel (last 1h): top kill reasons from diagnostic engine.
+            # Gives visibility into why approved signals aren't becoming fills —
+            # e.g. "6× AGG_SEMANTIC_KILL, 3× EXECUTION_GATE" points the operator
+            # straight at the upstream cause without needing to grep the logs.
+            try:
+                from core.diagnostic_engine import diagnostic_engine as _de
+                from collections import Counter as _Cnt
+                _now = time.time()
+                _recent = [d for d in _de._death_log if _now - d.get("ts", 0) < 3600]
+                if _recent:
+                    _top = _Cnt(
+                        (d.get("kill_reason", "?") or "?").split(":", 1)[0]
+                        for d in _recent
+                    ).most_common(3)
+                    _kill_str = " ".join(f"{n}×{r[:14]}" for r, n in _top)
+                    logger.info(f"║  Kills/1h   : {len(_recent):<3} ({_kill_str})"
+                                f"{'':<{max(0, 10 - len(_kill_str))}}║")
+            except Exception:
+                pass
             logger.info(f"║  Positions  : {pf_state.position_count} ({pf_state.net_exposure:+,.0f} net){'':<10}║")
             logger.info(f"║  Learning   : {ll_stats.get('total_trades', 0)} trades recorded{'':<12}║")
             if ll_stats.get('total_trades', 0) > 0:

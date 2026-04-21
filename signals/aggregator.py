@@ -1803,6 +1803,61 @@ class SignalAggregator:
             signal.raw_data = {}
         signal.raw_data["setup_context"] = signal.setup_context
 
+        # ── 12b. Semantic kill pre-filter ────────────────────
+        # The ExecutionQualityGate in core/engine.py applies the same semantic
+        # kills (HTF-trend mismatch, CHoCH direction mismatch, Wyckoff-phase
+        # opposition) AFTER publish — after the aggregator has already paid
+        # the cost of dedup marking, card generation, Telegram send, and
+        # execution-engine tracking.  These kills are alpha-side (setup_context
+        # is stable tick-to-tick), not microstructure-side, so pre-filtering
+        # them here saves the wasted pipeline work without losing any of the
+        # microstructure checks (spread/trigger/volume/whale) that must stay
+        # at the exec gate.  We reuse the exact same helper so logic stays in
+        # one place; execution_context=None means only the alpha-side checks
+        # fire (the volatility-regime scalp guard correctly short-circuits).
+        try:
+            from analyzers.execution_gate import ExecutionQualityGate
+            _pre_kill = ExecutionQualityGate._check_semantic_kills(
+                direction=_sig_dir,
+                setup_context=signal.setup_context,
+                execution_context=None,
+            )
+        except Exception as _pk_err:
+            logger.debug(f"Semantic pre-kill check skipped: {_pk_err}")
+            _pre_kill = ""
+        if _pre_kill:
+            logger.info(
+                f"⛔ Signal died | {signal.symbol} {_sig_dir} "
+                f"| reason=AGG_SEMANTIC_KILL | {_pre_kill}"
+            )
+            try:
+                from core.diagnostic_engine import diagnostic_engine as _de
+                _de.record_signal_death(
+                    symbol=signal.symbol,
+                    direction=_sig_dir,
+                    strategy=signal.strategy,
+                    kill_reason=f"AGG_SEMANTIC_KILL:{_pre_kill[:60]}",
+                    rr=getattr(signal, 'rr_ratio', 0) or 0,
+                    confidence=final,
+                    regime=scored.regime,
+                    setup_class=getattr(signal, 'setup_class', 'intraday'),
+                )
+            except Exception:
+                pass
+            if _tl:
+                _tl.signal(
+                    symbol=signal.symbol, direction=_sig_dir, grade="?",
+                    confidence=final, entry_low=signal.entry_low,
+                    entry_high=signal.entry_high, stop_loss=signal.stop_loss,
+                    tp1=signal.tp1, tp2=signal.tp2, rr=signal.rr_ratio,
+                    strategy=signal.strategy, regime=scored.regime,
+                    tech=scored.technical_score, vol=scored.volume_score,
+                    flow=scored.orderflow_score, deriv=scored.derivatives_score,
+                    sent=scored.sentiment_score, corr=scored.correlation_score,
+                    result=f"REJECTED(AGG_SEMANTIC_KILL:{_pre_kill[:40]})",
+                )
+            return None
+
         # ── 13a. Post-scoring dedup check (atomic check-and-mark) ────────────
         # DEDUP-FIX (CONFIDENCE CONSISTENCY): Now that we have final_confidence,
         # do the real dedup check. This compares final vs stored-final so the
