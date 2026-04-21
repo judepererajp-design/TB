@@ -1,0 +1,149 @@
+2026-04-21 06:54:16 | INFO | === AI Analyst initialised | fast=openai | deep=openai ===
+2026-04-21 06:54:47 | DEBUG | [CALL:dead_signal_batch] model=openai
+--- PROMPT ---
+Analysing why a crypto bot's signals fail quality filters.
+Period: 2h | Regime: BULL_TREND | Total dead: 4
+Kill reasons: {"RR_FLOOR": 4}
+Strategy fires: {"PriceAction": 4}
+Per-strategy direction (LONG/SHORT counts): {"PriceAction": {"LONG": 4, "SHORT": 0}}
+Strategies with >85% single-direction bias: {}
+Avg R:R: 1.44 | Avg confidence: 81.5
+HTF blocks: LONG=0 SHORT=0
+Whale flow: BUY=0($0k) SELL=0($0k)
+Signals vs whale flow conflict: 0
+Ensemble voter suppressions: 0/4 (0%) — multi-source voting killed these
+
+Analysis rules:
+- If whale_buy_usd > whale_sell_usd × 3 and LONG signals are being killed, note whale tailwind is wasted
+- If whale_sell_usd > whale_buy_usd × 3 and SHORT signals are killed, note whale tailwind is wasted
+- If HTF blocks one direction 3x more than other, that is the real filter not a bug
+- If rr < 1.3 across most signals, set rr_issue=true
+- If dominant_kill_reason is AGG_THRESHOLD and avg confidence is near floor, threshold may be misconfigured
+
+Return ONLY valid JSON:
+{"dominant_kill_reason":"<str>","regime_mismatch":<bool>,"strategy_to_suppress":"<str|null>","rr_issue":<bool>,"direction_bias_detected":<bool>,"ensemble_over_suppressing":<bool>,"whale_alignment_note":"<brief note on whale flow vs signal direction or empty string>","recommendation":"<150 chars>"}
+--- END PROMPT ---
+2026-04-21 06:54:58 | DEBUG | [RESP:dead_signal_batch] latency=11018ms
+--- RESPONSE ---
+{"dominant_kill_reason":"RR_FLOOR","regime_mismatch":false,"strategy_to_suppress":null,"rr_issue":false,"direction_bias_detected":false,"ensemble_over_suppressing":false,"whale_alignment_note":"","recommendation":"All signals killed due to RR floor; consider raising RR threshold or adding higher R:R filters. No whale tailwind or HTF block issues."}
+--- END RESPONSE ---
+2026-04-21 06:54:58 | INFO | [DEAD_SIGNAL_AUDIT] {"dominant_kill_reason": "RR_FLOOR", "regime_mismatch": false, "strategy_to_suppress": null, "rr_issue": false, "direction_bias_detected": false, "ensemble_over_suppressing": false, "whale_alignment_note": "", "recommendation": "All signals killed due to RR floor; consider raising RR threshold or adding higher R:R filters. No whale tailwind or HTF block issues."}
+2026-04-21 06:54:58 | DEBUG | [CALL:structural_audit_fast] model=openai
+--- PROMPT ---
+You are a senior quant engineer auditing a crypto trading bot for structural bugs.
+Find systematic direction biases, broken strategy logic, and filter asymmetries.
+
+TOTAL RAW SIGNALS (pre-filter): 18
+
+STRATEGY DIRECTION BREAKDOWN (raw signals, before HTF or aggregator filtering):
+{}
+
+HTF GUARDRAIL BLOCKS (signals killed by higher-timeframe filter, after raw generation):
+LONG blocked=0 | SHORT blocked=0 | Asymmetric=False
+(If one direction is blocked 3x+ more, the guardrail is a one-sided factory)
+
+WHALE FLOW vs SIGNALS:
+Whale BUY: 0 events ($0k)
+Whale SELL: 0 events ($0k)
+Dominant whale: NEUTRAL | Signals sent AGAINST whale flow: 0
+
+REGIME vs SIGNAL DIRECTION (signals that survived HTF, before aggregator):
+{
+  "BULL_TREND": {
+    "LONG": 9,
+    "SHORT": 0
+  }
+}
+
+Find: (1) strategies with >80% single-direction bias, (2) HTF one-sided factory ONLY when it is blocking signals that SHOULD go through, (3) systematic trading against whale flow, (4) signals opposite to regime.
+
+STRICT RULES — violation means invalid output:
+- biased_strategies: ONLY include strategies with >80% bias AND at least 10 signals. Below 10, directional skew is statistically expected noise. 75% bias is NOT a bug.
+- htf_asymmetry: ONLY flag true if HTF is blocking the direction that ALIGNS with the weekly trend (e.g. blocking LONGs when weekly is BULLISH, or blocking SHORTs when weekly is BEARISH). Blocking LONGs in a BEARISH weekly trend is CORRECT behavior — do NOT flag it. Note: weekly trend context is not available in this data — if you cannot determine weekly trend from the regime data, set htf_asymmetry=false.
+- If fewer than 20 total raw signals exist, set severity=LOW and root_causes=["Insufficient data — need 20+ signals for meaningful analysis"]
+- Every recommendation must cite a SPECIFIC number from the data above
+
+Return ONLY valid JSON:
+{"biased_strategies":["<name>",...],"htf_asymmetry":<bool>,"whale_signal_conflict":<bool>,"regime_signal_conflict":<bool>,"root_causes":["<cause1>","<cause2>"],"recommendations":["<fix1>","<fix2>"],"severity":"<LOW|MEDIUM|HIGH|CRITICAL>"}
+--- END PROMPT ---
+2026-04-21 06:55:24 | DEBUG | [RESP:structural_audit_fast] latency=26282ms
+--- RESPONSE ---
+{"biased_strategies":[],"htf_asymmetry":false,"whale_signal_conflict":false,"regime_signal_conflict":false,"root_causes":["Insufficient data — need 20+ signals for meaningful analysis"],"recommendations":["Increase sample size to at least 20 signals (currently 18)","Re-evaluate HTF guardrail settings; currently 0 signals blocked in both directions"],"severity":"LOW"}
+--- END RESPONSE ---
+2026-04-21 06:55:24 | INFO | [STRUCTURAL_AUDIT] severity=LOW {"biased_strategies": [], "htf_asymmetry": false, "whale_signal_conflict": false, "regime_signal_conflict": false, "root_causes": ["Insufficient data \u2014 need 20+ signals for meaningful analysis"], "recommendations": ["Increase sample size to at least 20 signals (currently 18)", "Re-evaluate HTF guardrail settings; currently 0 signals blocked in both directions"], "severity": "LOW"}
+2026-04-21 07:02:39 | DEBUG | [CALL:structural_audit_fast] model=openai
+--- PROMPT ---
+You are a senior quant engineer auditing a crypto trading bot for structural bugs.
+Find systematic direction biases, broken strategy logic, and filter asymmetries.
+
+TOTAL RAW SIGNALS (pre-filter): 264
+
+STRATEGY DIRECTION BREAKDOWN (raw signals, before HTF or aggregator filtering):
+{
+  "SmartMoneyConcepts": {
+    "total": 89,
+    "SHORT": 2,
+    "LONG": 87,
+    "SHORT%": 2.2,
+    "LONG%": 97.8,
+    "biased": true
+  },
+  "PriceAction": {
+    "total": 73,
+    "SHORT": 24,
+    "LONG": 49,
+    "SHORT%": 32.9,
+    "LONG%": 67.1,
+    "biased": false
+  },
+  "ElliottWave": {
+    "total": 38,
+    "SHORT": 0,
+    "LONG": 38,
+    "SHORT%": 0.0,
+    "LONG%": 100.0,
+    "biased": true
+  },
+  "GeometricPattern:FallingWedge": {
+    "total": 54,
+    "SHORT": 0,
+    "LONG": 54,
+    "SHORT%": 0.0,
+    "LONG%": 100.0,
+    "biased": true
+  }
+}
+
+HTF GUARDRAIL BLOCKS (signals killed by higher-timeframe filter, after raw generation):
+LONG blocked=0 | SHORT blocked=3 | Asymmetric=True
+(If one direction is blocked 3x+ more, the guardrail is a one-sided factory)
+
+WHALE FLOW vs SIGNALS:
+Whale BUY: 9 events ($14253k)
+Whale SELL: 3 events ($2928k)
+Dominant whale: BUY | Signals sent AGAINST whale flow: 0
+
+REGIME vs SIGNAL DIRECTION (signals that survived HTF, before aggregator):
+{
+  "BULL_TREND": {
+    "LONG": 129,
+    "SHORT": 11
+  }
+}
+
+Find: (1) strategies with >80% single-direction bias, (2) HTF one-sided factory ONLY when it is blocking signals that SHOULD go through, (3) systematic trading against whale flow, (4) signals opposite to regime.
+
+STRICT RULES — violation means invalid output:
+- biased_strategies: ONLY include strategies with >80% bias AND at least 10 signals. Below 10, directional skew is statistically expected noise. 75% bias is NOT a bug.
+- htf_asymmetry: ONLY flag true if HTF is blocking the direction that ALIGNS with the weekly trend (e.g. blocking LONGs when weekly is BULLISH, or blocking SHORTs when weekly is BEARISH). Blocking LONGs in a BEARISH weekly trend is CORRECT behavior — do NOT flag it. Note: weekly trend context is not available in this data — if you cannot determine weekly trend from the regime data, set htf_asymmetry=false.
+- If fewer than 20 total raw signals exist, set severity=LOW and root_causes=["Insufficient data — need 20+ signals for meaningful analysis"]
+- Every recommendation must cite a SPECIFIC number from the data above
+
+Return ONLY valid JSON:
+{"biased_strategies":["<name>",...],"htf_asymmetry":<bool>,"whale_signal_conflict":<bool>,"regime_signal_conflict":<bool>,"root_causes":["<cause1>","<cause2>"],"recommendations":["<fix1>","<fix2>"],"severity":"<LOW|MEDIUM|HIGH|CRITICAL>"}
+--- END PROMPT ---
+2026-04-21 07:02:51 | DEBUG | [RESP:structural_audit_fast] latency=11365ms
+--- RESPONSE ---
+{"biased_strategies":["SmartMoneyConcepts","ElliottWave","GeometricPattern:FallingWedge"],"htf_asymmetry":false,"whale_signal_conflict":false,"regime_signal_conflict":true,"root_causes":["Strategy bias in SmartMoneyConcepts, ElliottWave, GeometricPattern:FallingWedge","Presence of SHORT signals in bullish regime (regime_signal_conflict)"],"recommendations":["Modify SmartMoneyConcepts, ElliottWave, and GeometricPattern:FallingWedge to reduce directional bias by incorporating additional indicators or counterbalancing logic","Add regime‑aware filtering to suppress SHORT signals during bullish trend"],"severity":"HIGH"}
+--- END RESPONSE ---
+2026-04-21 07:02:51 | INFO | [STRUCTURAL_AUDIT] severity=HIGH {"biased_strategies": ["SmartMoneyConcepts", "ElliottWave", "GeometricPattern:FallingWedge"], "htf_asymmetry": false, "whale_signal_conflict": false, "regime_signal_conflict": true, "root_causes": ["Strategy bias in SmartMoneyConcepts, ElliottWave, GeometricPattern:FallingWedge", "Presence of SHORT signals in bullish regime (regime_signal_conflict)"], "recommendations": ["Modify SmartMoneyConcepts, ElliottWave, and GeometricPattern:FallingWedge to reduce directional bias by incorporating additional indicators or counterbalancing logic", "Add regime\u2011aware filtering to suppress SHORT signals during bullish trend"], "severity": "HIGH"}
