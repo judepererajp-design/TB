@@ -59,6 +59,24 @@ from config.constants import NewsIntelligence
 logger = logging.getLogger(__name__)
 
 
+def _severity_from_confidence(confidence: float) -> str:
+    """Map a classification confidence to the qualitative severity tier
+    used by :class:`BTCEventContext.severity`.  Extracted so the override
+    consumption path can compute severity without instantiating a context.
+    """
+    try:
+        c = float(confidence)
+    except (TypeError, ValueError):
+        return "LOW"
+    if c >= 0.85:
+        return "EXTREME"
+    if c >= 0.65:
+        return "HIGH"
+    if c >= 0.40:
+        return "MEDIUM"
+    return "LOW"
+
+
 class BTCEventType(str, Enum):
     MACRO_RISK_ON     = "MACRO_RISK_ON"
     MACRO_RISK_OFF    = "MACRO_RISK_OFF"
@@ -290,6 +308,27 @@ _BULLISH_OFFSET_KEYWORDS: List[str] = [
 ]
 
 
+# ── De-escalation keywords ───────────────────────────────────
+# When a headline triggers a geopolitical/macro MACRO_RISK_OFF rule but ALSO
+# contains a de-escalation cue (diplomacy, talks resuming, ceasefire, etc.)
+# the net impact is usually much softer — sometimes even positive for risk
+# assets.  Example: "Iran plans delegation to Pakistan amid military threats"
+# hits MACRO_RISK_OFF on "iran" + "military" but the *action* is diplomatic
+# engagement, not escalation.  We flag these as ambiguous so the mixed-signal
+# softening path kicks in instead of the full risk-off hard-block.
+_DE_ESCALATION_KEYWORDS: List[str] = [
+    "delegation", "diplomat", "diplomacy", "diplomatic visit",
+    "talks", "talks resume", "talks continue", "meet",
+    "meeting", "visit", "summit",
+    "ceasefire", "cease fire", "truce",
+    "de-escalat", "deescalat", "ease tensions", "easing tension",
+    "peace", "peace talks", "peace deal",
+    "agreement", "accord", "pact", "treaty", "signed deal",
+    "resumed", "resume talks", "back to the table",
+    "dialogue", "negotiation resume", "reconcil",
+]
+
+
 class NewsClassifier:
     """
     Classifies a news headline into the BTCEventType taxonomy.
@@ -357,6 +396,18 @@ class NewsClassifier:
             # Check for bullish offset keywords (institutional buying, etc.)
             bullish_hits = sum(1 for kw in _BULLISH_OFFSET_KEYWORDS if kw in low)
             if bullish_hits > 0:
+                is_mixed = True
+
+            # De-escalation cue inside a MACRO_RISK_OFF headline:
+            # "Iran plans delegation to Pakistan amid military threats" matches
+            # the risk-off rule on "iran" + "military" but the *action* is
+            # diplomatic engagement.  Treat as mixed so the softer penalty
+            # path applies instead of a full risk-off hard-block.
+            if (
+                not is_mixed
+                and best_type == BTCEventType.MACRO_RISK_OFF
+                and any(kw in low for kw in _DE_ESCALATION_KEYWORDS)
+            ):
                 is_mixed = True
 
             # Also mixed if headline matches BOTH bearish and bullish rule categories
@@ -444,6 +495,62 @@ class NewsClassifier:
                 any_mixed = True
 
         return winner, winner_dir, round(norm_conf, 3), best_headline, any_mixed
+
+    # ── Ambiguity detection for LLM escalation ────────────────
+    def is_ambiguous(
+        self,
+        title: str,
+        event_type: BTCEventType,
+        confidence: float,
+        is_mixed: bool,
+    ) -> Tuple[bool, str]:
+        """
+        Decide whether a classified headline is ambiguous enough to warrant an
+        LLM re-rank call.  Returns ``(ambiguous, reason)``.
+
+        Ambiguous when ANY of:
+          * ``is_mixed`` is True (conflicting signals already detected)
+          * MACRO_RISK_OFF / geopolitical rule hit AND a de-escalation cue
+            is present (``_DE_ESCALATION_KEYWORDS``) — the classic
+            "Iran plans delegation" inversion case.
+          * Low keyword confidence (below the configured escalation
+            threshold) on a HIGH-IMPACT event type (MACRO_RISK_OFF,
+            EXCHANGE_EVENT) — these are the size-×0.5 decisions where a
+            false positive is most costly.
+          * Severity would be HIGH (confidence ≥ HARD_BLOCK_MIN_CONFIDENCE)
+            — worth the tiny LLM cost to double-check before we hard-block.
+        """
+        low = (title or "").lower()
+        if is_mixed:
+            return True, "mixed_signal"
+
+        if event_type == BTCEventType.MACRO_RISK_OFF and any(
+            kw in low for kw in _DE_ESCALATION_KEYWORDS
+        ):
+            return True, "de_escalation_cue"
+
+        try:
+            low_conf_thresh = float(NewsIntelligence.LLM_AMBIGUITY_LOW_CONF_THRESHOLD)
+        except Exception:
+            low_conf_thresh = 0.30
+        if (
+            event_type in (BTCEventType.MACRO_RISK_OFF, BTCEventType.EXCHANGE_EVENT)
+            and 0.0 < confidence < low_conf_thresh
+        ):
+            return True, "low_confidence_high_impact"
+
+        try:
+            high_sev_thresh = float(NewsIntelligence.HARD_BLOCK_MIN_CONFIDENCE)
+        except Exception:
+            high_sev_thresh = 0.65
+        if confidence >= high_sev_thresh and event_type in (
+            BTCEventType.MACRO_RISK_OFF,
+            BTCEventType.EXCHANGE_EVENT,
+            BTCEventType.REGULATORY,
+        ):
+            return True, "high_severity"
+
+        return False, ""
 
 
 class BTCMoveAnalyzer:
@@ -689,6 +796,63 @@ class BTCNewsIntelligence:
         titles = [h["title"] for h in btc_headlines]
         etype, direction, conf, winning_headline, is_mixed = self._classifier.classify_batch(titles)
 
+        # ── Optional LLM re-rank for ambiguous high-impact headlines ──
+        # The re-ranker is off by default (NewsLLM.ENABLED=False) and, when
+        # enabled, starts in SHADOW_MODE which logs disagreements without
+        # changing behaviour.  All failure modes (timeout, malformed JSON,
+        # circuit-breaker) fall back to the keyword verdict — the keyword
+        # classifier remains the source of truth.
+        try:
+            ambiguous, _amb_reason = self._classifier.is_ambiguous(
+                winning_headline or "", etype, conf, is_mixed
+            )
+        except Exception as _amb_err:
+            logger.debug(f"is_ambiguous() error (non-fatal): {_amb_err}")
+            ambiguous = False
+        if ambiguous and etype != BTCEventType.UNKNOWN:
+            try:
+                from analyzers.news_llm_classifier import llm_reranker
+                # Find the body for the winning headline, if the scraper
+                # provided one (news_scraper passes title/published_at/source;
+                # body passthrough is opt-in so we fall back to "").
+                _body = ""
+                _hit_count = 0
+                for h in btc_headlines:
+                    if h.get("title", "") == winning_headline:
+                        _body = str(h.get("body") or h.get("raw_text") or "")
+                        break
+                # Best-effort hit count from single-headline classify for
+                # the sanity veto guard.
+                try:
+                    _, _, _single_conf, _ = self._classifier.classify(winning_headline or "")
+                    # Approximate hit count from the base 0.25 + 0.08*(n-1)
+                    # schedule used in classify().  Reversed: n ≈ 1 + (conf-base)/0.08
+                    _hit_count = max(1, int(round(1 + (_single_conf - 0.20) / 0.08)))
+                except Exception:
+                    _hit_count = 1
+                rerank = await llm_reranker.rerank(
+                    title=winning_headline or "",
+                    body=_body,
+                    keyword_event_type=etype,
+                    keyword_direction=direction,
+                    keyword_confidence=conf,
+                    keyword_is_mixed=is_mixed,
+                    keyword_hit_count=_hit_count,
+                )
+                if rerank.source == "llm":
+                    # LLM overruled keyword; map the string back onto the enum.
+                    try:
+                        etype = BTCEventType(rerank.event_type)
+                    except ValueError:
+                        pass  # already validated, defensive
+                    direction = rerank.direction
+                    conf = float(rerank.confidence)
+                elif rerank.source == "keyword_veto":
+                    # Sanity-veto downgraded the flip attempt to mixed.
+                    is_mixed = True
+            except Exception as _llm_err:
+                logger.debug(f"LLM re-rank skipped (non-fatal): {_llm_err}")
+
         if etype == BTCEventType.UNKNOWN or conf < NewsIntelligence.NEWS_GATING_MIN_CONFIDENCE:
             for h in btc_headlines:
                 _h_title = h.get("title", "")
@@ -870,6 +1034,23 @@ class BTCNewsIntelligence:
                 else:
                     _expires_at = _detected_at + ttl
 
+                # ── Consume any active operator override ─────────
+                # If the operator has an override set in "consume on next
+                # event" mode, this qualifying classification retires it
+                # (agreeing or disagreeing bookkeeping is handled in the
+                # store).  Ignored when the override is in TTL-only mode.
+                try:
+                    from analyzers.news_override import news_override_store
+                    _severity_for_override = _severity_from_confidence(conf)
+                    await news_override_store.consume_if_applicable(
+                        new_event_type=etype.value,
+                        new_direction=direction,
+                        new_severity=_severity_for_override,
+                        new_headline=winning_headline or "",
+                    )
+                except Exception as _ov_err:
+                    logger.debug(f"Override consumption skipped (non-fatal): {_ov_err}")
+
                 self._current_ctx = BTCEventContext(
                     event_type      = etype,
                     confidence      = conf,
@@ -954,18 +1135,71 @@ class BTCNewsIntelligence:
         Get the current BTC event context for signal adjustment.
         Called by engine._scan_symbol() before publishing each signal.
         Returns an inactive (neutral) context if no event is active.
+
+        Manual override: if an operator has an active override in place,
+        it is applied on top of the auto-classified context at this single
+        chokepoint (no strategy-layer changes needed).  When no auto
+        context is active, the override synthesises one so the operator
+        can forcibly activate a regime even when the classifier is silent.
         """
+        base_ctx: BTCEventContext
         if not self._current_ctx.is_active:
-            return BTCEventContext()  # neutral defaults
-        self._current_ctx.net_news_score = self.compute_net_news_score()
-        if (
-            abs(self._current_ctx.net_news_score) < NewsIntelligence.NET_SCORE_BULLISH_THRESHOLD
-            and self._current_ctx.reduce_size_mult >= 1.0
-        ):
-            _ctx = copy.copy(self._current_ctx)
-            _ctx.reduce_size_mult = NewsIntelligence.NET_SCORE_MIXED_SIZE_MULT
-            return _ctx
-        return self._current_ctx
+            base_ctx = BTCEventContext()  # neutral defaults
+        else:
+            self._current_ctx.net_news_score = self.compute_net_news_score()
+            if (
+                abs(self._current_ctx.net_news_score) < NewsIntelligence.NET_SCORE_BULLISH_THRESHOLD
+                and self._current_ctx.reduce_size_mult >= 1.0
+            ):
+                base_ctx = copy.copy(self._current_ctx)
+                base_ctx.reduce_size_mult = NewsIntelligence.NET_SCORE_MIXED_SIZE_MULT
+            else:
+                base_ctx = self._current_ctx
+
+        # ── Apply operator override, if any ──────────────────────
+        try:
+            from analyzers.news_override import news_override_store
+            ov = news_override_store.get_active()
+        except Exception as _ov_err:
+            logger.debug(f"Override lookup skipped (non-fatal): {_ov_err}")
+            ov = None
+        if ov is None:
+            return base_ctx
+
+        try:
+            ov_etype = BTCEventType(ov.event_type)
+        except ValueError:
+            ov_etype = base_ctx.event_type if base_ctx.event_type != BTCEventType.UNKNOWN \
+                else BTCEventType.UNKNOWN
+
+        # Start from a copy of base_ctx so we don't mutate the live state.
+        out = copy.copy(base_ctx) if base_ctx is not None else BTCEventContext()
+        if not out.is_active:
+            # Synthesise a minimal active context so downstream consumers
+            # treat the override as an active event.
+            now = time.time()
+            out.event_type = ov_etype if ov_etype != BTCEventType.UNKNOWN else BTCEventType.UNKNOWN
+            out.direction = ov.direction
+            out.confidence = 0.70
+            out.detected_at = now
+            out.expires_at = ov.expires_at_utc if ov.expires_at_utc > 0 else now + 60 * 60
+            out.headline = ov.source_headline or f"Operator override: {ov.reason}"
+            out.sources = ["operator"]
+            out.headline_published_at = ov.set_at_utc or now
+
+        # Stamp override-provided multipliers + block flags.
+        out.confidence_mult = float(ov.confidence_mult)
+        out.reduce_size_mult = float(ov.size_mult)
+        out.block_longs = bool(ov.block_longs)
+        out.block_shorts = bool(ov.block_shorts)
+        if ov.direction in ("BULLISH", "BEARISH", "NEUTRAL"):
+            out.direction = ov.direction
+        out.explanation = (
+            f"[Operator override by {ov.set_by}: {ov.reason or 'no reason given'}] "
+            + (base_ctx.explanation if base_ctx.is_active else "")
+        ).strip()
+        out.impact_type = out.impact_type or "Operator Override"
+        return out
 
     def get_signal_block_reason(self, direction: str) -> str:
         """
