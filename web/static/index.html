@@ -3073,10 +3073,10 @@ async function runBacktest(){
   document.getElementById('bt-loading').style.display='none';
   document.getElementById('bt-btn').disabled=false;
   if(!d||d.error){alert('Backtest failed: '+(d?.error||'unknown'));return;}
+  document.getElementById('bt-results').style.display='';
 
   // Handle IS/OOS split mode
   if(d.mode==='oos_split'){
-    document.getElementById('bt-results').style.display='';
     var is_r=d.in_sample||{};var oos_r=d.out_of_sample||{};
     var decay=d.overfitting_decay??1;
     var warn=d.overfitting_warn?`<div style="background:rgba(255,51,85,.08);border:1px solid rgba(255,51,85,.2);border-radius:6px;padding:10px 14px;margin-bottom:12px;font-size:12px;color:var(--red)">⚠️ Overfitting signal: IS Sharpe decays to ${(oos_r.sharpe||0).toFixed(2)} OOS (${(decay*100).toFixed(0)}% retention — strategies may be curve-fit)</div>`:'';
@@ -3352,12 +3352,28 @@ async function auditSymbol(){
   var sym=(document.getElementById('sent-sym-inp').value||'').trim().toUpperCase();
   if(!sym)return;
   var el=document.getElementById('sent-audit-result');
-  el.textContent='Running audit on '+sym+'…';
+  var fast=document.getElementById('sen-fast');
+  el.textContent='Running audit on '+sym+'… (up to 45s)';
+  if(fast)fast.innerHTML='<div class="loading" style="padding:16px"><div class="spin"></div> Auditing '+sym+'…</div>';
   try{
     var r=await fetch('/api/sentinel/audit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:sym})});
     var d=await r.json();
-    el.textContent=d.ok?'✓ Audit queued for '+sym:('Error: '+(d.error||'failed'));
-  }catch(e){el.textContent='Error: '+e.message;}
+    if(d&&d.ok){
+      el.textContent='✓ '+sym+' audit complete'+(d.regime&&d.regime!=='UNKNOWN'?' · regime: '+d.regime:'');
+      if(fast){
+        var safe=(d.analysis||'(no content)').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');
+        fast.innerHTML='<div style="font-size:11.5px;line-height:1.55;color:var(--text2);white-space:normal">'+
+          '<div style="font-family:var(--mono);font-size:10px;color:var(--text3);letter-spacing:.1em;text-transform:uppercase;margin-bottom:8px">'+sym+(d.regime?' · '+d.regime:'')+'</div>'+
+          safe+'</div>';
+      }
+    } else {
+      el.textContent='Error: '+(d&&d.error?d.error:'failed');
+      if(fast)fast.innerHTML='<div class="empty">Audit failed: '+(d&&d.error?d.error:'unknown')+'</div>';
+    }
+  }catch(e){
+    el.textContent='Error: '+e.message;
+    if(fast)fast.innerHTML='<div class="empty">Audit error: '+e.message+'</div>';
+  }
 }
 async function loadAIDecisions(){
   var d=await api('/api/ai-decisions');

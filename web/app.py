@@ -1938,7 +1938,11 @@ class DashboardApp:
             return _json_response({"ok": False, "error": str(e)})
 
     async def _handle_sentinel_audit_symbol(self, request: "web.Request") -> "web.Response":
-        """POST /api/sentinel/audit - queue a fast audit for a specific symbol."""
+        """POST /api/sentinel/audit - run a fast AI audit on a specific symbol.
+
+        Returns the narrative analysis inline so the UI can display symbol-specific
+        output. Capped at 45s to avoid unbounded waits.
+        """
         try:
             _auth_err = self._auth_required(request)
             if _auth_err: return _auth_err
@@ -1946,18 +1950,57 @@ class DashboardApp:
             symbol = str(body.get("symbol", "")).upper().strip()
             if not symbol:
                 return _json_response({"ok": False, "error": "symbol required"})
+            if "/" not in symbol:
+                symbol += "/USDT"
+
             from analyzers.ai_analyst import ai_analyst
-            # Schedule a fast audit in the background (non-blocking)
-            # Note: structural_audit is session-wide; symbol is logged for context only
-            import asyncio
-            task = asyncio.create_task(ai_analyst.structural_audit(force=True))
-            task.add_done_callback(
-                lambda t: logger.warning(f"Sentinel audit task failed: {t.exception()}")
-                if not t.cancelled() and t.exception() else None
-            )
+
+            # Gather minimal context for a focused symbol audit
+            ohlcv_1h: list = []
+            regime: str = "UNKNOWN"
+            try:
+                from data.api_client import api as exchange_api
+                bars = await exchange_api.fetch_ohlcv(symbol, "1h", limit=50)
+                ohlcv_1h = [[c[0], c[1], c[2], c[3], c[4], c[5]] for c in (bars or [])]
+            except Exception as _e:
+                logger.debug("sentinel audit: OHLCV fetch failed for %s: %s", symbol, _e)
+            try:
+                from analyzers.regime import regime_analyzer
+                regime = regime_analyzer.regime.value if regime_analyzer.regime else "UNKNOWN"
+            except Exception:
+                pass
+            whale = {"buy_usd": 0.0, "sell_usd": 0.0}
+            try:
+                from signals.whale_aggregator import whale_aggregator
+                recent_w = whale_aggregator.get_recent_events(symbol=symbol, max_age_secs=600)
+                whale = {
+                    "buy_usd":  sum(w.order_usd for w in recent_w if w.side == "buy"),
+                    "sell_usd": sum(w.order_usd for w in recent_w if w.side == "sell"),
+                }
+            except Exception:
+                pass
+
+            try:
+                analysis = await asyncio.wait_for(
+                    ai_analyst.analyse_symbol(
+                        symbol=symbol,
+                        ohlcv_data=ohlcv_1h,
+                        signals=[],
+                        whale_data=whale,
+                        news=[],
+                        regime=regime,
+                    ),
+                    timeout=45.0,
+                )
+            except asyncio.TimeoutError:
+                return _json_response({
+                    "ok": False, "symbol": symbol,
+                    "error": "AI audit timed out after 45s",
+                })
+
             return _json_response({
-                "ok": True, "symbol": symbol, "queued": True,
-                "note": "Runs session-wide structural audit (symbol-specific audit not yet supported)",
+                "ok": True, "symbol": symbol, "regime": regime,
+                "analysis": analysis or "AI audit returned no content.",
             })
         except Exception as e:
             logger.warning(f"sentinel audit symbol error: {e}")
