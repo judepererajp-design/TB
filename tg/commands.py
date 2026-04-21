@@ -12,7 +12,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -538,6 +538,139 @@ class CommandsMixin:
             text, parse_mode=ParseMode.HTML,
             reply_markup=market_menu(),
             disable_web_page_preview=True
+        )
+
+    async def _cmd_news_override(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Manually override the automated BTC news classification.
+
+        Usage:
+          /news_override status
+          /news_override clear
+          /news_override set <event_type> <direction> <conf_mult> <size_mult>
+                            [ttl_minutes] [reason...]
+
+        event_type: MACRO_RISK_OFF | MACRO_RISK_ON | BTC_FUNDAMENTAL |
+                    BTC_TECHNICAL | EXCHANGE_EVENT | REGULATORY | UNKNOWN
+        direction:  BULLISH | BEARISH | NEUTRAL
+        conf_mult:  e.g. 1.0 = unchanged, 0.7 = soften, 1.1 = boost
+        size_mult:  e.g. 1.0 = unchanged, 0.5 = half size
+
+        Example:
+          /news_override set MACRO_RISK_OFF BEARISH 0.95 0.95 60 Iran \
+              delegation is de-escalation, not escalation
+        """
+        if not self._auth(update):
+            return
+        from analyzers.news_override import news_override_store
+        # Hydrate any persisted state so /news_override status is correct
+        # after a restart — status() is sync so can't trigger load itself.
+        # Silent failure is acceptable here: a DB hiccup should not crash
+        # the Telegram handler; the subsequent status() will just reflect
+        # the (possibly empty) in-memory state and we log for debugging.
+        try:
+            await news_override_store.load()
+        except Exception as _load_err:
+            logger.debug(f"news_override_store.load failed in /news_override: {_load_err}")
+        args = context.args or []
+        sub = (args[0].lower() if args else "status")
+
+        if sub in ("status", "show"):
+            st = news_override_store.status()
+            active = st.get("active")
+            if not active:
+                await update.message.reply_text(
+                    "📝 <b>News Override</b>\n\nNo active override.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            remaining = st.get("expires_in_minutes", 0)
+            text = (
+                f"📝 <b>News Override — Active</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Event:   <b>{active.get('event_type')}</b>\n"
+                f"Dir:     <b>{active.get('direction')}</b>\n"
+                f"Conf×:   <b>{active.get('confidence_mult')}</b>\n"
+                f"Size×:   <b>{active.get('size_mult')}</b>\n"
+                f"Blocks:  LONG={active.get('block_longs')} SHORT={active.get('block_shorts')}\n"
+                f"Set by:  <b>{active.get('set_by')}</b>\n"
+                f"Expires: <b>{remaining:.0f}m</b>\n"
+                f"Next-news consume: <b>{active.get('consume_on_next_event')}</b>\n"
+                f"Reason:  <i>{active.get('reason') or '—'}</i>"
+            )
+            await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+            return
+
+        if sub in ("clear", "remove", "cancel"):
+            prev = await news_override_store.clear(reason="/news_override clear")
+            if prev is None:
+                await update.message.reply_text("📝 No override to clear.")
+            else:
+                await update.message.reply_text(
+                    f"📝 Override cleared: <b>{prev.event_type}/{prev.direction}</b>",
+                    parse_mode=ParseMode.HTML,
+                )
+            return
+
+        if sub != "set" or len(args) < 5:
+            await update.message.reply_text(
+                "Usage:\n"
+                "<code>/news_override status</code>\n"
+                "<code>/news_override clear</code>\n"
+                "<code>/news_override set &lt;event_type&gt; &lt;direction&gt; "
+                "&lt;conf_mult&gt; &lt;size_mult&gt; [ttl_minutes] [reason...]</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        event_type = args[1].upper()
+        direction  = args[2].upper()
+        try:
+            conf_mult = float(args[3])
+            size_mult = float(args[4])
+        except ValueError:
+            await update.message.reply_text("❌ conf_mult and size_mult must be numbers.")
+            return
+        ttl_minutes: Optional[int] = None  # default — store fills in
+        reason_start = 5
+        if len(args) >= 6:
+            try:
+                ttl_minutes = int(args[5])
+                reason_start = 6
+            except ValueError:
+                ttl_minutes = None
+                reason_start = 5
+        reason = " ".join(args[reason_start:]).strip()
+
+        # Derive a user-facing identity.
+        set_by = "operator"
+        try:
+            set_by = update.effective_user.username or str(update.effective_user.id)
+        except Exception:
+            pass
+
+        ov = None
+        try:
+            ov = await news_override_store.set_override(
+                event_type=event_type,
+                direction=direction,
+                confidence_mult=conf_mult,
+                size_mult=size_mult,
+                reason=reason,
+                set_by=set_by,
+                ttl_minutes=ttl_minutes,
+            )
+        except ValueError as exc:
+            await update.message.reply_text(
+                f"❌ {exc}", parse_mode=ParseMode.HTML
+            )
+            return
+        await update.message.reply_text(
+            f"📝 Override installed\n"
+            f"Event: <b>{ov.event_type}/{ov.direction}</b>\n"
+            f"Conf×{ov.confidence_mult:.2f} Size×{ov.size_mult:.2f}\n"
+            f"TTL: <b>{(ov.expires_at_utc - ov.set_at_utc)/60:.0f}m</b>",
+            parse_mode=ParseMode.HTML,
         )
 
     async def _cmd_performance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):

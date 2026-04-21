@@ -229,6 +229,7 @@ class TelegramBot(CommandsMixin, CallbacksMixin):
             "whales":      self._cmd_whales,     # v21: HyperTracker smart money
             "sentinel":    self._cmd_sentinel,   # v209: Sentinel intelligence features
             "news":        self._cmd_news,       # v21: RSS news feed
+            "news_override": self._cmd_news_override,  # v22: manual news classification override
             "trending":    self._cmd_trending,   # v21: CoinGecko trending coins
         }
 

@@ -26,6 +26,8 @@ from config.constants import (
     LeverageMapper,
     Liquidation,
     MarketBrain,
+    NewsLLM,
+    NewsOverrideDefaults,
     NoTradeZones,
     OrderFlow,
     ParabolicDetector,
@@ -1263,6 +1265,55 @@ def validate_analyzer_constants() -> List[str]:
         errors.append(
             "VolatilityStructure: GARCH α + β must be < 1 for a stationary process "
             f"(got {VolatilityStructure.GARCH_ALPHA + VolatilityStructure.GARCH_BETA:.3f})"
+        )
+
+    # ── NewsLLM re-ranker invariants ──────────────────────────────
+    if NewsLLM.CALL_TIMEOUT_SEC <= 0:
+        errors.append("NewsLLM: CALL_TIMEOUT_SEC must be > 0")
+    if NewsLLM.MAX_BODY_CHARS <= 0:
+        errors.append("NewsLLM: MAX_BODY_CHARS must be > 0")
+    if not (0.0 < NewsLLM.MIN_FLIP_CONFIDENCE <= 1.0):
+        errors.append("NewsLLM: MIN_FLIP_CONFIDENCE must be in (0, 1]")
+    if not (0.0 < NewsLLM.FLIP_GUARD_KEYWORD_CONF <= 1.0):
+        errors.append("NewsLLM: FLIP_GUARD_KEYWORD_CONF must be in (0, 1]")
+    if NewsLLM.FLIP_GUARD_MIN_KEYWORD_HITS < 1:
+        errors.append("NewsLLM: FLIP_GUARD_MIN_KEYWORD_HITS must be ≥ 1")
+    if NewsLLM.CIRCUIT_BREAKER_FAILS < 1:
+        errors.append("NewsLLM: CIRCUIT_BREAKER_FAILS must be ≥ 1")
+    if NewsLLM.CIRCUIT_BREAKER_WINDOW_SEC <= 0:
+        errors.append("NewsLLM: CIRCUIT_BREAKER_WINDOW_SEC must be > 0")
+    if NewsLLM.CIRCUIT_BREAKER_COOLDOWN_SEC <= 0:
+        errors.append("NewsLLM: CIRCUIT_BREAKER_COOLDOWN_SEC must be > 0")
+    if NewsLLM.DISAGREEMENT_LOG_CAP < 1:
+        errors.append("NewsLLM: DISAGREEMENT_LOG_CAP must be ≥ 1")
+
+    # ── NewsOverrideDefaults invariants ───────────────────────────
+    if not (
+        1 <= NewsOverrideDefaults.MIN_TTL_MINUTES
+        <= NewsOverrideDefaults.DEFAULT_TTL_MINUTES
+        <= NewsOverrideDefaults.MAX_TTL_MINUTES
+    ):
+        errors.append(
+            "NewsOverrideDefaults: TTL minutes must satisfy "
+            "1 ≤ MIN ≤ DEFAULT ≤ MAX"
+        )
+    if not (
+        0 < NewsOverrideDefaults.MIN_CONF_MULT
+        <= NewsOverrideDefaults.MAX_CONF_MULT
+    ):
+        errors.append(
+            "NewsOverrideDefaults: MIN_CONF_MULT must be > 0 and ≤ MAX_CONF_MULT"
+        )
+    if not (
+        0 < NewsOverrideDefaults.MIN_SIZE_MULT
+        <= NewsOverrideDefaults.MAX_SIZE_MULT
+    ):
+        errors.append(
+            "NewsOverrideDefaults: MIN_SIZE_MULT must be > 0 and ≤ MAX_SIZE_MULT"
+        )
+    if NewsOverrideDefaults.TRUST_SCORE_FLOOR >= NewsOverrideDefaults.TRUST_SCORE_CEILING:
+        errors.append(
+            "NewsOverrideDefaults: TRUST_SCORE_FLOOR must be < TRUST_SCORE_CEILING"
         )
 
     return errors

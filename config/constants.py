@@ -1467,6 +1467,113 @@ class NewsIntelligence:
     DB_RETRY_MAX_RETRIES_PER_RECORD: int = 10 # Max retries before dead-lettering a record
     DB_RETRY_QUEUE_ALERT_THRESHOLD: int = 100 # Alert when queue exceeds this size
 
+    # ── LLM-assisted classification (Apr 2026) ─────────────────
+    # See NewsLLM class below for the full LLM re-ranker config.  The
+    # following constant lives on NewsIntelligence because the
+    # ambiguity detector in NewsClassifier.is_ambiguous() reads it
+    # alongside the existing HARD_BLOCK_MIN_CONFIDENCE threshold.
+    # Headlines with keyword confidence strictly below this value on a
+    # high-impact event type (MACRO_RISK_OFF / EXCHANGE_EVENT) are
+    # flagged as ambiguous so the LLM re-ranker (when enabled) can
+    # confirm or invert the keyword verdict.
+    LLM_AMBIGUITY_LOW_CONF_THRESHOLD: float = 0.30
+
+
+# ════════════════════════════════════════════════════════════════
+# NEWS LLM RE-RANKER
+# ════════════════════════════════════════════════════════════════
+
+class NewsLLM:
+    """
+    Configuration for the LLM-assisted news re-ranker that sits behind
+    the deterministic :class:`analyzers.btc_news_intelligence.NewsClassifier`.
+
+    The keyword classifier is the source of truth; the LLM is only called
+    for headlines flagged as ambiguous (mixed signal, de-escalation cue,
+    low-conf high-impact, or HIGH-severity).  All results pass through a
+    strict veto pipeline (schema → sanity → circuit breaker) before being
+    honoured — a malformed or over-confident LLM can never silently flip
+    a high-conviction keyword verdict.
+    """
+
+    # Master feature flag — default OFF so the LLM path stays dormant
+    # until an operator explicitly enables it.  When False the classifier
+    # falls through to keyword-only, preserving the current behaviour.
+    ENABLED: bool = False
+
+    # Shadow mode: call the LLM and log disagreements but DO NOT honour
+    # its verdict.  Used during rollout to measure hit rate before going
+    # live.  When ENABLED=True and SHADOW_MODE=True, production decisions
+    # still use the keyword verdict.
+    SHADOW_MODE: bool = True
+
+    # ── Call budget & latency ─────────────────────────────────
+    CALL_TIMEOUT_SEC: float = 5.0                # hard per-call timeout
+    MAX_BODY_CHARS: int = 400                    # body snippet fed alongside the title
+
+    # ── Veto thresholds ───────────────────────────────────────
+    # Minimum LLM confidence required to HONOUR a directional flip when
+    # the keyword verdict was high-conviction (≥ FLIP_GUARD_KEYWORD_CONF
+    # with FLIP_GUARD_MIN_KEYWORD_HITS distinct hits).  Below this we
+    # downgrade to `is_mixed=True` rather than accept the flip outright.
+    MIN_FLIP_CONFIDENCE: float = 0.75
+    FLIP_GUARD_KEYWORD_CONF: float = 0.50
+    FLIP_GUARD_MIN_KEYWORD_HITS: int = 2
+
+    # ── Circuit breaker ───────────────────────────────────────
+    # After CIRCUIT_BREAKER_FAILS failures within CIRCUIT_BREAKER_WINDOW_SEC,
+    # pause LLM calls for CIRCUIT_BREAKER_COOLDOWN_SEC.  All headlines
+    # fall through to keyword-only while degraded.
+    CIRCUIT_BREAKER_FAILS: int = 3
+    CIRCUIT_BREAKER_WINDOW_SEC: float = 120.0
+    CIRCUIT_BREAKER_COOLDOWN_SEC: float = 300.0
+
+    # ── Override / disagreement persistence keys ──────────────
+    # Persisted via data.database.db.save_learning_state.  Separate keys
+    # so operators can inspect each stream independently.
+    DISAGREEMENT_STATE_KEY: str = "news_llm_disagreements_v1"
+    DISAGREEMENT_LOG_CAP: int = 500              # ring-buffer cap
+    OVERRIDE_STATE_KEY: str = "news_override_v1"
+
+
+# ════════════════════════════════════════════════════════════════
+# NEWS MANUAL OVERRIDE
+# ════════════════════════════════════════════════════════════════
+
+class NewsOverrideDefaults:
+    """Defaults for the manual news override system.
+
+    Operators set an override via /news_override when they disagree with
+    the automated classifier (e.g. "this is not actually bearish").  The
+    override is enforced at the single chokepoint in
+    :meth:`analyzers.btc_news_intelligence.BTCNewsIntelligence.get_event_context`.
+    """
+
+    # Default TTL when an operator doesn't supply one explicitly.
+    DEFAULT_TTL_MINUTES: int = 120
+
+    # Minimum and maximum TTL (clamped at set time).
+    MIN_TTL_MINUTES: int = 1
+    MAX_TTL_MINUTES: int = 1440                  # 24h ceiling
+
+    # Allowed confidence / size multiplier bounds.
+    MIN_CONF_MULT: float = 0.1
+    MAX_CONF_MULT: float = 1.5
+    MIN_SIZE_MULT: float = 0.1
+    MAX_SIZE_MULT: float = 1.5
+
+    # Trust-score adjustments applied on override consumption.
+    # When the *next* classified news agrees with the override → +boost.
+    # When it disagrees → -penalty.  Stored alongside overrides in the
+    # same learning-state row; read by operators via /news_override status.
+    TRUST_AGREE_BOOST: float = 0.05
+    TRUST_DISAGREE_PENALTY: float = 0.10
+    TRUST_SCORE_FLOOR: float = -1.0
+    TRUST_SCORE_CEILING: float = 1.0
+
+
+# ════════════════════════════════════════════════════════════════
+
 
 # ════════════════════════════════════════════════════════════════
 # TRIGGER QUALITY SCORING
