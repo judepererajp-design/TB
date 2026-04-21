@@ -1154,6 +1154,7 @@ class DashboardApp:
 
             # AI analysis - capped at 45s so total scan stays under 90s client timeout
             try:
+                from analyzers.ai_analyst import ai_analyst
                 analysis = await asyncio.wait_for(
                     ai_analyst.analyse_symbol(
                         symbol=symbol,
@@ -1273,73 +1274,105 @@ class DashboardApp:
 
             pipeline_diag = await ai_analyst.pipeline_diagnostics(sd)
 
-            # If AI is unavailable (no API key), generate a rule-based diagnosis
-            # so the Diagnostics page is never empty
+            # Build a rule-based diagnosis so the Diagnostics page is never empty,
+            # even when the AI returns a partial dict (e.g. missing
+            # structural_issues/improvements). We compute it unconditionally and
+            # use it as a fallback for any missing fields on the AI response.
+            total_kills = sum(kill_reasons.values()) if kill_reasons else 0
+            published = sd.get("published", 0)
+            scanned = sd.get("symbols_scanned", 0)
+            top_killer = max(kill_reasons, key=kill_reasons.get) if kill_reasons else "NONE"
+            top_killer_count = kill_reasons.get(top_killer, 0)
+
+            funnel_pct = (published / max(total_kills + published, 1)) * 100
+            if funnel_pct >= 20:
+                _rb_health = "GOOD"; _rb_score = 75
+            elif funnel_pct >= 10:
+                _rb_health = "FAIR"; _rb_score = 55
+            elif funnel_pct >= 5:
+                _rb_health = "POOR"; _rb_score = 35
+            else:
+                _rb_health = "CRITICAL"; _rb_score = 15
+
+            reason_labels = {
+                "RR_FLOOR": "R:R floor - setups not meeting minimum reward-to-risk ratio",
+                "HTF_GUARDRAIL": "HTF guardrail - signals blocked by weekly trend direction",
+                "AGG_THRESHOLD": "Confidence threshold - signals below minimum confidence score",
+                "EQ_ZONE_BLOCK": "Equilibrium zone - price too close to midrange (no edge)",
+                "DAILY_SYMBOL_LIMIT": "Daily symbol limit - same coin already fired max signals today",
+                "DAILY_TRADE_LIMIT": "Daily trade limit - maximum published signals reached",
+                "HOURLY_TOTAL_LIMIT": "Hourly cap - too many signals in the last hour",
+                "DEDUP_WINDOW": "Dedup cooldown - same setup recently published, waiting for cooldown",
+                "RISK_LIMIT": "Risk limit - daily trade counter exhausted",
+                "CONFLUENCE": "Confluence threshold - not enough confirming factors",
+                "VALIDATOR_ERROR": "Data validator - signal data failed programmatic or LLM integrity checks",
+                "VALIDATOR_KILL_SWITCH": "Validator kill-switch - critical data confidence failure or multiple violations",
+            }
+            bottleneck_desc = reason_labels.get(top_killer, f"{top_killer} - {top_killer_count} signals killed")
+
+            issues: list = []
+            if kill_reasons.get("DAILY_TRADE_LIMIT", 0) > 0 or kill_reasons.get("RISK_LIMIT", 0) > 0:
+                issues.append("Daily trade limit was hit - consider raising max_daily_trades in settings.yaml")
+            if kill_reasons.get("EQ_ZONE_BLOCK", 0) > total_kills * 0.4:
+                issues.append("Equilibrium zone blocking >40% of signals - market is ranging, this is expected in CHOPPY regime")
+            if kill_reasons.get("DAILY_SYMBOL_LIMIT", 0) > 5:
+                issues.append("Symbol daily limit frequently hit - same setups firing repeatedly, consider raising max_signals_per_symbol")
+            if published == 0 and scanned > 100:
+                issues.append("Zero signals published despite high scan count - check logs for gate stacking")
+            if kill_reasons.get("RR_FLOOR", 0) > max(total_kills * 0.3, 10):
+                issues.append(f"RR floor killing {kill_reasons.get('RR_FLOOR', 0)} signals (>30% of deaths) - minimum reward:risk threshold may be too strict for current volatility")
+            if kill_reasons.get("AGG_THRESHOLD", 0) > max(total_kills * 0.25, 8):
+                issues.append(f"Confidence threshold killing {kill_reasons.get('AGG_THRESHOLD', 0)} signals - aggregator may be over-filtering")
+            if not issues:
+                issues.append("No critical structural issues detected")
+
+            improvements: list = []
+            if top_killer == "RR_FLOOR":
+                improvements.append({"change": "Lower rr_floor_intraday from 1.2 to 1.1", "expected": "+20-30% more signals pass the RR gate", "priority": "MEDIUM"})
+            if top_killer == "EQ_ZONE_BLOCK":
+                improvements.append({"change": "EQ dead zone already at 7% in CHOPPY - wait for breakout conditions", "expected": "More signals when price moves from mid-range", "priority": "LOW"})
+            if top_killer == "AGG_THRESHOLD":
+                improvements.append({"change": "Lower min_confidence by 2-3 points in settings", "expected": "+15% more signals at cost of slightly lower average quality", "priority": "MEDIUM"})
+            if top_killer == "HTF_GUARDRAIL":
+                improvements.append({"change": "Review weekly bias — HTF guardrail is the dominant gate", "expected": "If weekly is neutral, consider loosening HTF block", "priority": "MEDIUM"})
+            improvements.append({"change": "Review Kill Reasons chart below to identify the dominant gate", "expected": "Targeted tuning of the biggest bottleneck", "priority": "HIGH"})
+
+            _rule_based = {
+                "bottleneck": bottleneck_desc if top_killer != "NONE" else "No signal deaths recorded yet - bot may be warming up",
+                "structural_issues": issues,
+                "filter_verdict": "too aggressive" if funnel_pct < 5 else ("balanced" if funnel_pct < 25 else "permissive"),
+                "improvements": improvements,
+                "overall_health": _rb_health,
+                "health_score": _rb_score,
+                "_source": "rule_based",  # flag that this is not AI-generated
+            }
+
             if not pipeline_diag:
-                total_kills = sum(kill_reasons.values()) if kill_reasons else 0
-                published = sd.get("published", 0)
-                scanned = sd.get("symbols_scanned", 0)
-                top_killer = max(kill_reasons, key=kill_reasons.get) if kill_reasons else "NONE"
-                top_killer_count = kill_reasons.get(top_killer, 0)
+                pipeline_diag = _rule_based
+            else:
+                # AI returned something — fill any missing/empty/malformed fields
+                # from the rule-based fallback so the UI always has arrays to render.
+                def _valid_list(v):
+                    return isinstance(v, list) and len(v) > 0
 
-                # Determine health score from funnel efficiency
-                funnel_pct = (published / max(total_kills + published, 1)) * 100
-                if funnel_pct >= 20:
-                    health = "GOOD"; score = 75
-                elif funnel_pct >= 10:
-                    health = "FAIR"; score = 55
-                elif funnel_pct >= 5:
-                    health = "POOR"; score = 35
+                if not _valid_list(pipeline_diag.get("structural_issues")):
+                    pipeline_diag["structural_issues"] = _rule_based["structural_issues"]
+                if not _valid_list(pipeline_diag.get("improvements")):
+                    pipeline_diag["improvements"] = _rule_based["improvements"]
                 else:
-                    health = "CRITICAL"; score = 15
-
-                # Map kill reason to plain-English bottleneck
-                reason_labels = {
-                    "RR_FLOOR": "R:R floor - setups not meeting minimum reward-to-risk ratio",
-                    "HTF_GUARDRAIL": "HTF guardrail - signals blocked by weekly trend direction",
-                    "AGG_THRESHOLD": "Confidence threshold - signals below minimum confidence score",
-                    "EQ_ZONE_BLOCK": "Equilibrium zone - price too close to midrange (no edge)",
-                    "DAILY_SYMBOL_LIMIT": "Daily symbol limit - same coin already fired max signals today",
-                    "DAILY_TRADE_LIMIT": "Daily trade limit - maximum published signals reached",
-                    "HOURLY_TOTAL_LIMIT": "Hourly cap - too many signals in the last hour",
-                    "DEDUP_WINDOW": "Dedup cooldown - same setup recently published, waiting for cooldown",
-                    "RISK_LIMIT": "Risk limit - daily trade counter exhausted",
-                    "CONFLUENCE": "Confluence threshold - not enough confirming factors",
-                    "VALIDATOR_ERROR": "Data validator - signal data failed programmatic or LLM integrity checks",
-                    "VALIDATOR_KILL_SWITCH": "Validator kill-switch - critical data confidence failure or multiple violations",
-                }
-                bottleneck_desc = reason_labels.get(top_killer, f"{top_killer} - {top_killer_count} signals killed")
-
-                issues = []
-                if kill_reasons.get("DAILY_TRADE_LIMIT", 0) > 0 or kill_reasons.get("RISK_LIMIT", 0) > 0:
-                    issues.append("Daily trade limit was hit - consider raising max_daily_trades in settings.yaml")
-                if kill_reasons.get("EQ_ZONE_BLOCK", 0) > total_kills * 0.4:
-                    issues.append("Equilibrium zone blocking >40% of signals - market is ranging, this is expected in CHOPPY regime")
-                if kill_reasons.get("DAILY_SYMBOL_LIMIT", 0) > 5:
-                    issues.append("Symbol daily limit frequently hit - same setups firing repeatedly, consider raising max_signals_per_symbol")
-                if published == 0 and scanned > 100:
-                    issues.append("Zero signals published despite high scan count - check logs for gate stacking")
-                if not issues:
-                    issues.append("No critical structural issues detected")
-
-                improvements = []
-                if top_killer == "RR_FLOOR":
-                    improvements.append({"change": "Lower rr_floor_intraday from 1.2 to 1.1", "expected": "+20-30% more signals pass the RR gate", "priority": "MEDIUM"})
-                if top_killer == "EQ_ZONE_BLOCK":
-                    improvements.append({"change": "EQ dead zone already at 7% in CHOPPY - wait for breakout conditions", "expected": "More signals when price moves from mid-range", "priority": "LOW"})
-                if top_killer == "AGG_THRESHOLD":
-                    improvements.append({"change": "Lower min_confidence by 2-3 points in settings", "expected": "+15% more signals at cost of slightly lower average quality", "priority": "MEDIUM"})
-                improvements.append({"change": "Review Kill Reasons chart below to identify the dominant gate", "expected": "Targeted tuning of the biggest bottleneck", "priority": "HIGH"})
-
-                pipeline_diag = {
-                    "bottleneck": bottleneck_desc if top_killer != "NONE" else "No signal deaths recorded yet - bot may be warming up",
-                    "structural_issues": issues,
-                    "filter_verdict": "too aggressive" if funnel_pct < 5 else ("balanced" if funnel_pct < 25 else "permissive"),
-                    "improvements": improvements,
-                    "overall_health": health,
-                    "health_score": score,
-                    "_source": "rule_based"  # flag that this is not AI-generated
-                }
+                    # Normalise improvement items: some AI responses return bare strings.
+                    _norm = []
+                    for im in pipeline_diag["improvements"]:
+                        if isinstance(im, dict):
+                            _norm.append(im)
+                        elif isinstance(im, str) and im.strip():
+                            _norm.append({"change": im.strip(), "expected": "", "priority": "MEDIUM"})
+                    pipeline_diag["improvements"] = _norm or _rule_based["improvements"]
+                for _k in ("bottleneck", "filter_verdict", "overall_health"):
+                    if not isinstance(pipeline_diag.get(_k), str) or not pipeline_diag.get(_k):
+                        pipeline_diag[_k] = _rule_based[_k]
+                if not isinstance(pipeline_diag.get("health_score"), (int, float)):
+                    pipeline_diag["health_score"] = _rule_based["health_score"]
 
             veto_proposals = veto_system.get_proposals(limit=5)
             audit_status = ai_analyst.get_audit_status()
@@ -1937,7 +1970,11 @@ class DashboardApp:
             return _json_response({"ok": False, "error": str(e)})
 
     async def _handle_sentinel_audit_symbol(self, request: "web.Request") -> "web.Response":
-        """POST /api/sentinel/audit - queue a fast audit for a specific symbol."""
+        """POST /api/sentinel/audit - run a fast AI audit on a specific symbol.
+
+        Returns the narrative analysis inline so the UI can display symbol-specific
+        output. Capped at 45s to avoid unbounded waits.
+        """
         try:
             _auth_err = self._auth_required(request)
             if _auth_err: return _auth_err
@@ -1945,18 +1982,57 @@ class DashboardApp:
             symbol = str(body.get("symbol", "")).upper().strip()
             if not symbol:
                 return _json_response({"ok": False, "error": "symbol required"})
+            if "/" not in symbol:
+                symbol += "/USDT"
+
             from analyzers.ai_analyst import ai_analyst
-            # Schedule a fast audit in the background (non-blocking)
-            # Note: structural_audit is session-wide; symbol is logged for context only
-            import asyncio
-            task = asyncio.create_task(ai_analyst.structural_audit(force=True))
-            task.add_done_callback(
-                lambda t: logger.warning(f"Sentinel audit task failed: {t.exception()}")
-                if not t.cancelled() and t.exception() else None
-            )
+
+            # Gather minimal context for a focused symbol audit
+            ohlcv_1h: list = []
+            regime: str = "UNKNOWN"
+            try:
+                from data.api_client import api as exchange_api
+                bars = await exchange_api.fetch_ohlcv(symbol, "1h", limit=50)
+                ohlcv_1h = [[c[0], c[1], c[2], c[3], c[4], c[5]] for c in (bars or [])]
+            except Exception as _e:
+                logger.debug("sentinel audit: OHLCV fetch failed for %s: %s", symbol, _e)
+            try:
+                from analyzers.regime import regime_analyzer
+                regime = regime_analyzer.regime.value if regime_analyzer.regime else "UNKNOWN"
+            except Exception:
+                pass
+            whale = {"buy_usd": 0.0, "sell_usd": 0.0}
+            try:
+                from signals.whale_aggregator import whale_aggregator
+                recent_w = whale_aggregator.get_recent_events(symbol=symbol, max_age_secs=600)
+                whale = {
+                    "buy_usd":  sum(w.order_usd for w in recent_w if w.side == "buy"),
+                    "sell_usd": sum(w.order_usd for w in recent_w if w.side == "sell"),
+                }
+            except Exception:
+                pass
+
+            try:
+                analysis = await asyncio.wait_for(
+                    ai_analyst.analyse_symbol(
+                        symbol=symbol,
+                        ohlcv_data=ohlcv_1h,
+                        signals=[],
+                        whale_data=whale,
+                        news=[],
+                        regime=regime,
+                    ),
+                    timeout=45.0,
+                )
+            except asyncio.TimeoutError:
+                return _json_response({
+                    "ok": False, "symbol": symbol,
+                    "error": "AI audit timed out after 45s",
+                })
+
             return _json_response({
-                "ok": True, "symbol": symbol, "queued": True,
-                "note": "Runs session-wide structural audit (symbol-specific audit not yet supported)",
+                "ok": True, "symbol": symbol, "regime": regime,
+                "analysis": analysis or "AI audit returned no content.",
             })
         except Exception as e:
             logger.warning(f"sentinel audit symbol error: {e}")

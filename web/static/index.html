@@ -3073,10 +3073,10 @@ async function runBacktest(){
   document.getElementById('bt-loading').style.display='none';
   document.getElementById('bt-btn').disabled=false;
   if(!d||d.error){alert('Backtest failed: '+(d?.error||'unknown'));return;}
+  document.getElementById('bt-results').style.display='';
 
   // Handle IS/OOS split mode
   if(d.mode==='oos_split'){
-    document.getElementById('bt-results').style.display='';
     var is_r=d.in_sample||{};var oos_r=d.out_of_sample||{};
     var decay=d.overfitting_decay??1;
     var warn=d.overfitting_warn?`<div style="background:rgba(255,51,85,.08);border:1px solid rgba(255,51,85,.2);border-radius:6px;padding:10px 14px;margin-bottom:12px;font-size:12px;color:var(--red)">⚠️ Overfitting signal: IS Sharpe decays to ${(oos_r.sharpe||0).toFixed(2)} OOS (${(decay*100).toFixed(0)}% retention — strategies may be curve-fit)</div>`:'';
@@ -3352,12 +3352,28 @@ async function auditSymbol(){
   var sym=(document.getElementById('sent-sym-inp').value||'').trim().toUpperCase();
   if(!sym)return;
   var el=document.getElementById('sent-audit-result');
-  el.textContent='Running audit on '+sym+'…';
+  var fast=document.getElementById('sen-fast');
+  el.textContent='Running audit on '+sym+'… (up to 45s)';
+  if(fast)fast.innerHTML='<div class="loading" style="padding:16px"><div class="spin"></div> Auditing '+sym+'…</div>';
   try{
     var r=await fetch('/api/sentinel/audit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:sym})});
     var d=await r.json();
-    el.textContent=d.ok?'✓ Audit queued for '+sym:('Error: '+(d.error||'failed'));
-  }catch(e){el.textContent='Error: '+e.message;}
+    if(d&&d.ok){
+      el.textContent='✓ '+sym+' audit complete'+(d.regime&&d.regime!=='UNKNOWN'?' · regime: '+d.regime:'');
+      if(fast){
+        var safe=(d.analysis||'(no content)').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');
+        fast.innerHTML='<div style="font-size:11.5px;line-height:1.55;color:var(--text2);white-space:normal">'+
+          '<div style="font-family:var(--mono);font-size:10px;color:var(--text3);letter-spacing:.1em;text-transform:uppercase;margin-bottom:8px">'+sym+(d.regime?' · '+d.regime:'')+'</div>'+
+          safe+'</div>';
+      }
+    } else {
+      el.textContent='Error: '+(d&&d.error?d.error:'failed');
+      if(fast)fast.innerHTML='<div class="empty">Audit failed: '+(d&&d.error?d.error:'unknown')+'</div>';
+    }
+  }catch(e){
+    el.textContent='Error: '+e.message;
+    if(fast)fast.innerHTML='<div class="empty">Audit error: '+e.message+'</div>';
+  }
 }
 async function loadAIDecisions(){
   var d=await api('/api/ai-decisions');
@@ -3565,8 +3581,8 @@ async function loadDiag(){
   var hEl=document.getElementById('diag-badge');hEl.textContent=(pl.overall_health||'UNKNOWN')+' ('+sc+'/100)'+_aiNote;hEl.style.background=sc>=70?'rgba(0,232,122,.1)':sc>=50?'rgba(240,180,41,.08)':'rgba(255,51,85,.08)';hEl.style.color=sc>=70?'var(--green)':sc>=50?'var(--amber)':'var(--red)';
   document.getElementById('diag-bn').textContent=pl.bottleneck||'—';document.getElementById('diag-fv').textContent=pl.filter_verdict||'—';
   var scEl=document.getElementById('diag-sc');scEl.textContent=sc;scEl.className='stat-value '+(sc>=70?'up':sc>=50?'am':'dn');
-  var iss=pl.structural_issues||[];document.getElementById('diag-iss').innerHTML=iss.length?iss.map(i=>`<div style="display:flex;gap:6px;padding:6px 0;border-bottom:1px solid var(--border);font-size:11.5px"><span class="am">⚠</span><span>${i}</span></div>`).join(''):'<div class="empty">No structural issues ✓</div>';
-  var imps=pl.improvements||[];document.getElementById('diag-rec').innerHTML=imps.length?imps.map(im=>{var pc=im.priority==='HIGH'?'dn':im.priority==='MEDIUM'?'am':'up';return`<div style="padding:6px 0;border-bottom:1px solid var(--border)"><div style="display:flex;gap:5px;margin-bottom:1px"><span class="${pc}" style="font-size:9px;font-weight:700">${im.priority||'MED'}</span><span style="font-size:11.5px;font-weight:500">${im.change||im}</span></div>${im.expected?`<div style="font-size:10px;color:var(--text2)">${im.expected}</div>`:''}</div>`;}).join(''):'<div class="empty">No suggestions</div>';
+  var iss=Array.isArray(pl.structural_issues)?pl.structural_issues:[];document.getElementById('diag-iss').innerHTML=iss.length?iss.map(i=>{var t=typeof i==='string'?i:(i&&i.issue)||JSON.stringify(i);return`<div style="display:flex;gap:6px;padding:6px 0;border-bottom:1px solid var(--border);font-size:11.5px"><span class="am">⚠</span><span>${esc(t)}</span></div>`;}).join(''):'<div class="empty">No structural issues ✓</div>';
+  var imps=Array.isArray(pl.improvements)?pl.improvements:[];document.getElementById('diag-rec').innerHTML=imps.length?imps.map(im=>{if(typeof im==='string')im={change:im,priority:'MED'};var pc=im.priority==='HIGH'?'dn':im.priority==='MEDIUM'?'am':'up';return`<div style="padding:6px 0;border-bottom:1px solid var(--border)"><div style="display:flex;gap:5px;margin-bottom:1px"><span class="${pc}" style="font-size:9px;font-weight:700">${esc(im.priority||'MED')}</span><span style="font-size:11.5px;font-weight:500">${esc(im.change||'')}</span></div>${im.expected?`<div style="font-size:10px;color:var(--text2)">${esc(im.expected)}</div>`:''}</div>`;}).join(''):'<div class="empty">No suggestions</div>';
   var kr=d.kill_reasons||{};if(Object.keys(kr).length)mkC('ch-kill','bar',Object.keys(kr),[{label:'Count',data:Object.values(kr),backgroundColor:'rgba(255,51,85,.65)',borderRadius:4}],{plugins:{legend:{display:false}}});
   var sb=d.strategy_breakdown||{};var sbk=Object.keys(sb).slice(0,8);if(sbk.length)mkC('ch-dstr','bar',sbk.map(k=>k.replace(/Strategy|Pattern/g,'').slice(0,11)),[{label:'Deaths',data:sbk.map(k=>sb[k].deaths||0),backgroundColor:'rgba(41,121,255,.65)',borderRadius:4}],{plugins:{legend:{display:false}}});
   /* Execution Gate panel */
