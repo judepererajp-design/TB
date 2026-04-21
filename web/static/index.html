@@ -545,9 +545,7 @@ tr:hover td{background:rgba(255,255,255,.015)}
 .help-fab:hover{background:var(--blue);color:#fff;border-color:var(--blue)}
 
 /* P&L UNIT TOGGLE */
-.unit-toggle{display:inline-flex;border:1px solid var(--border2);border-radius:6px;overflow:hidden;font-family:var(--mono);font-size:10px}
-.unit-toggle button{padding:3px 8px;border:none;background:none;color:var(--text3);cursor:pointer;transition:all .12s}
-.unit-toggle button.on{background:var(--blue);color:#fff}
+
 
 /* global: cursor-help hint on elements with title attr hinting a metric */
 [data-tip]{cursor:help;border-bottom:1px dotted var(--border3)}
@@ -2019,7 +2017,7 @@ var HELP={
     what:'Structural audit (Fast + Deep LLM), strategy direction bias detection, HTF guardrail blocks, symbol blacklist, AI decision log.',
     howpro:['Fast Audit (Arcee Trinity) runs continuously; Deep Audit (Nemotron 120B) is on-demand + expensive.','Strategy direction bias persistently >75% one way = strategy is broken for current regime; consider disabling.','Blacklist here always wins; good for removing manipulated low-cap tokens.'],
     metrics:[['AI Budget','$ spent on AI today across all models.']],
-    next:['Ops → Approvals','Ops → Health &amp; Pipeline']
+    next:['Ops → Approvals','Ops → Health & Pipeline']
   },
   approvals:{title:'Approvals',group:'Ops',ico:'⚖️',
     what:'Tier-3 parameter changes the veto system wants to apply. 3-model debate: Proposer → Challenger → Arbitrator. LOW-risk auto-applies after 30 min unless you override.',
@@ -2092,7 +2090,7 @@ var LABEL_TO_PAGE={};
     'Intel Hub → Smart Money':'smartmoney','Intel Hub → Microstructure':'microstructure','Intel Hub → News':'news','Intel Hub → BTC Events':'btcintel','Intel Hub → Scan Lab':'notebook',
     'Performance → Track Record':'performance','Performance → AI Learning':'learning','Performance → Backtester':'backtester',
     'Risk':'risk',
-    'Ops → Health &amp; Pipeline':'diagnostics','Ops → Approvals':'approvals','Ops → Settings':'settings','Ops → Sentinel AI':'sentinel','Ops → Adaptive':'adaptive',
+    'Ops → Health & Pipeline':'diagnostics','Ops → Approvals':'approvals','Ops → Settings':'settings','Ops → Sentinel AI':'sentinel','Ops → Adaptive':'adaptive',
     'Guide':'guide'
   };
   Object.keys(map).forEach(k=>{LABEL_TO_PAGE[k]=map[k];});
@@ -2105,6 +2103,8 @@ function cmdkOpen(){
   bg.classList.add('open');
   bg.setAttribute('aria-hidden','false');
   var inp=document.getElementById('cmdk-in');inp.value='';inp.focus();
+  // Rebuild every open so symbols loaded after startup (ticker fills _prices async) appear.
+  _cmdkItems=[];
   cmdkRender();
 }
 function cmdkClose(){
@@ -2122,7 +2122,6 @@ function cmdkBuildIndex(){
   items.push({type:'action',title:'Open Command Palette Help',sub:'?',ico:'❓',action:()=>{cmdkClose();openHelp(pg);}});
   items.push({type:'action',title:'Toggle dark / light theme',sub:'theme',ico:'🌓',action:()=>{toggleTheme();cmdkClose();}});
   items.push({type:'action',title:'Refresh current page',sub:'r',ico:'↻',action:()=>{cmdkClose();nav(pg);}});
-  items.push({type:'action',title:'Toggle P&L unit (R ↔ $)',sub:'$',ico:'💱',action:()=>{togglePnLUnit();cmdkClose();}});
   // symbols from ticker / prices
   Object.keys(_prices||{}).forEach(sym=>{
     var s=sym.replace('/USDT','');
@@ -2214,34 +2213,6 @@ document.addEventListener('keydown',function(e){
   }
   _gChord=false;
 });
-
-/* ─── P&L UNIT TOGGLE (R ↔ $) ─── */
-var pnlUnit=(function(){try{return localStorage.getItem('tb_pnl_unit')||'R';}catch(e){return'R';}})();
-function togglePnLUnit(){
-  pnlUnit=pnlUnit==='R'?'USD':'R';
-  try{localStorage.setItem('tb_pnl_unit',pnlUnit);}catch(e){}
-  document.querySelectorAll('.unit-toggle button').forEach(b=>{
-    b.classList.toggle('on',b.dataset.unit===pnlUnit);
-  });
-  // best-effort refresh of the current page so the unit is applied
-  nav(pg);
-}
-
-/* ─── FRESHNESS BADGE HELPER ─── */
-/* Callers pass a unix-seconds timestamp or ISO string. Returns HTML string. */
-function freshBadge(ts,ttlSec){
-  if(!ts)return '<span class="fresh fr-unknown">unknown</span>';
-  ttlSec=ttlSec||120;
-  var t=typeof ts==='string'?(new Date(ts).getTime()/1000):parseFloat(ts);
-  if(!t||isNaN(t))return '<span class="fresh fr-unknown">unknown</span>';
-  var age=Math.max(0,Math.floor(Date.now()/1000-t));
-  var cls='fr-fresh',lbl=age+'s',status='fresh';
-  if(age>=ttlSec*4){cls='fr-stale';status='stale';}
-  else if(age>=ttlSec){cls='fr-aging';status='aging';}
-  if(age>=60)lbl=Math.round(age/60)+'m';
-  if(age>=3600)lbl=Math.round(age/3600)+'h';
-  return '<span class="fresh '+cls+'" role="status" aria-label="Data status: '+status+', last update '+lbl+' ago" title="Data age: '+age+'s · TTL '+ttlSec+'s">'+lbl+'</span>';
-}
 
 /* ─── INFO BUTTON INJECTION (every page topbar gets an (i) ─── */
 function injectInfoButtons(){
