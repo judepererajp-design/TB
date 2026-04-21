@@ -427,6 +427,131 @@ tr:hover td{background:rgba(255,255,255,.015)}
 .sdm-bar-track{width:120px;height:6px;background:var(--border2);border-radius:3px;overflow:hidden;display:inline-block;vertical-align:middle}
 .sdm-bar-fill{height:100%;border-radius:3px}
 .sdm-section{font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--text3);margin:12px 0 6px}
+
+/* ─── PRO DASHBOARD REFACTOR (v4.1) ─── */
+
+/* SIDEBAR — grouped accordion nav */
+.nav-group{padding:2px 6px 0;flex-shrink:0}
+.nav-group-head{display:flex;align-items:center;gap:7px;width:100%;padding:6px 8px;border-radius:var(--r);border:none;background:none;color:var(--text2);cursor:pointer;font-size:11.5px;font-family:var(--sans);text-align:left;font-weight:600;letter-spacing:.2px;transition:all .12s;position:relative}
+.nav-group-head:hover{background:var(--bg3);color:var(--text)}
+.nav-group-head.active{color:var(--blue2)}
+.nav-group-head.active::before{content:"";position:absolute;left:0;top:22%;bottom:22%;width:2px;background:var(--blue);border-radius:1px}
+.nav-group-head .caret{margin-left:auto;font-size:9px;color:var(--text3);transition:transform .15s}
+.nav-group.open .nav-group-head .caret{transform:rotate(90deg)}
+.nav-group-head .gico{font-size:13px;width:16px;text-align:center;flex-shrink:0}
+.nav-group-head .bdg{margin-left:auto;background:var(--blue);color:#fff;border-radius:8px;padding:0 5px;font-size:9px;font-weight:700;display:none;font-family:var(--mono)}
+.nav-group-head .bdg.show{display:block}
+.nav-group-head.alert .bdg{background:var(--red)}
+.nav-sub{display:none;padding:2px 0 4px 26px;flex-direction:column;gap:1px}
+.nav-group.open .nav-sub{display:flex}
+.nav-sub .nb{padding:4px 8px;font-size:10.5px}
+.nav-sub .nb::before{display:none}
+.nav-sub .nb.on{background:rgba(41,121,255,.08);color:var(--blue2)}
+.nav-sub .nb.on::before{content:"";position:absolute;left:-10px;top:35%;bottom:35%;width:2px;background:var(--blue);border-radius:1px;display:block}
+/* top-level single-page item (Command, Risk, Guide) */
+.nav-top{padding:2px 6px 0;flex-shrink:0}
+.nav-top .nb{padding:6px 8px;font-size:11.5px;font-weight:600}
+.nav-top .nb .gico{font-size:13px;width:16px;text-align:center;flex-shrink:0;opacity:1}
+
+/* TOPBAR — info button */
+.ibt{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border-radius:50%;border:1px solid var(--border2);background:var(--bg2);color:var(--text3);cursor:pointer;font-size:10px;font-weight:700;font-family:var(--mono);line-height:1;margin-left:8px;transition:all .12s;padding:0}
+.ibt:hover{background:var(--blue);color:#fff;border-color:var(--blue)}
+
+/* METRIC TOOLTIP — hover title is native; add a (?) style hint for explicit ones */
+.tip{display:inline-flex;align-items:center;justify-content:center;width:13px;height:13px;border-radius:50%;border:1px solid var(--border2);color:var(--text3);font-size:8px;font-weight:700;font-family:var(--mono);cursor:help;margin-left:4px;line-height:1}
+.tip:hover{background:var(--bg3);color:var(--text)}
+
+/* HELP DRAWER (right-side, independent of TV panel) */
+.help-drawer{position:fixed;top:0;right:-460px;bottom:0;width:460px;max-width:100vw;background:var(--bg1);border-left:1px solid var(--border2);z-index:700;display:flex;flex-direction:column;transition:right .25s;box-shadow:-4px 0 24px rgba(0,0,0,.5)}
+.help-drawer.open{right:0}
+.help-head{padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
+.help-title{font-size:14px;font-weight:700;color:var(--text)}
+.help-sub{font-size:10px;color:var(--text3);font-family:var(--mono);text-transform:uppercase;letter-spacing:1px;margin-top:3px}
+.help-body{flex:1;overflow-y:auto;padding:16px 20px 28px}
+.help-section{margin-bottom:18px}
+.help-section h4{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1.2px;color:var(--blue2);margin-bottom:8px;font-family:var(--mono)}
+.help-section p{font-size:12.5px;color:var(--text);line-height:1.65;margin-bottom:6px}
+.help-section ul{margin:0;padding-left:18px;font-size:12px;color:var(--text);line-height:1.75}
+.help-section li{margin-bottom:3px}
+.help-section .warn{color:var(--red)}
+.help-section .good{color:var(--green)}
+.help-gloss{display:grid;gap:6px}
+.help-gloss-row{display:grid;grid-template-columns:130px 1fr;gap:10px;padding:6px 0;border-bottom:1px solid var(--border);font-size:11.5px}
+.help-gloss-row:last-child{border-bottom:none}
+.help-gloss-k{font-family:var(--mono);font-size:10.5px;color:var(--blue2);font-weight:600}
+.help-gloss-v{color:var(--text2);line-height:1.5}
+.help-xlink{display:inline-block;margin:4px 6px 0 0;padding:3px 9px;background:var(--bg3);border:1px solid var(--border2);border-radius:12px;font-size:10.5px;color:var(--text);cursor:pointer;transition:all .12s}
+.help-xlink:hover{background:var(--blue);color:#fff;border-color:var(--blue)}
+
+/* COMMAND PALETTE */
+.cmdk-bg{position:fixed;inset:0;background:rgba(0,0,0,.55);backdrop-filter:blur(3px);z-index:800;display:none;align-items:flex-start;justify-content:center;padding-top:12vh}
+.cmdk-bg.open{display:flex}
+.cmdk{background:var(--bg1);border:1px solid var(--border2);border-radius:12px;width:560px;max-width:94vw;max-height:70vh;display:flex;flex-direction:column;box-shadow:0 12px 48px rgba(0,0,0,.6);overflow:hidden}
+.cmdk-in-wrap{padding:12px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px}
+.cmdk-hint{font-size:14px;color:var(--text3)}
+.cmdk-in{flex:1;background:none;border:none;outline:none;color:var(--text);font-size:14px;font-family:var(--sans)}
+.cmdk-in::placeholder{color:var(--text3)}
+.cmdk-kbd{padding:2px 6px;border-radius:4px;background:var(--bg3);border:1px solid var(--border2);font-size:9.5px;font-family:var(--mono);color:var(--text3)}
+.cmdk-list{flex:1;overflow-y:auto;padding:6px 0}
+.cmdk-sec{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:1.2px;color:var(--text3);padding:9px 14px 5px;font-family:var(--mono)}
+.cmdk-row{display:flex;align-items:center;gap:10px;padding:8px 14px;cursor:pointer;border:none;background:none;width:100%;text-align:left;color:var(--text)}
+.cmdk-row:hover,.cmdk-row.focus{background:var(--bg3)}
+.cmdk-ico{font-size:14px;width:18px;text-align:center;flex-shrink:0}
+.cmdk-title{font-size:12.5px;font-weight:500}
+.cmdk-sub{font-size:10.5px;color:var(--text3);margin-left:auto;font-family:var(--mono)}
+.cmdk-empty{padding:28px;text-align:center;color:var(--text3);font-size:11.5px}
+
+/* KBD shortcut chip (used in Guide + help) */
+.kbd{display:inline-block;padding:1px 6px;border-radius:4px;background:var(--bg3);border:1px solid var(--border2);font-family:var(--mono);font-size:10.5px;color:var(--text);margin:0 2px;line-height:1.4;box-shadow:0 1px 0 var(--border2)}
+
+/* GUIDE PAGE */
+.guide-hero{background:linear-gradient(135deg,rgba(41,121,255,.08),rgba(124,58,237,.04));border:1px solid rgba(41,121,255,.2);border-radius:var(--r3);padding:18px 22px;margin-bottom:14px}
+.guide-hero h2{font-size:18px;font-weight:700;margin-bottom:6px;letter-spacing:-.3px}
+.guide-hero p{font-size:12.5px;color:var(--text2);line-height:1.6}
+.guide-toc{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.guide-toc button{background:var(--bg2);border:1px solid var(--border2);color:var(--text);padding:4px 10px;border-radius:14px;font-size:11px;cursor:pointer;transition:all .12s}
+.guide-toc button:hover{background:var(--blue);color:#fff;border-color:var(--blue)}
+.guide-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:10px}
+.guide-card{background:var(--bg1);border:1px solid var(--border);border-radius:var(--r2);padding:14px 16px;transition:border-color .15s}
+.guide-card:hover{border-color:var(--border3)}
+.guide-card-h{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.guide-card-ico{font-size:16px}
+.guide-card-t{font-size:13px;font-weight:700;color:var(--text)}
+.guide-card-group{font-size:9px;font-family:var(--mono);text-transform:uppercase;letter-spacing:1px;color:var(--text3);margin-left:auto}
+.guide-card-desc{font-size:11.5px;color:var(--text2);line-height:1.55;margin-bottom:8px}
+.guide-card-actions{display:flex;gap:6px;flex-wrap:wrap}
+.guide-shortcut-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:11.5px}
+.guide-shortcut-grid>div{display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--border)}
+
+/* GRADE BADGE — color bar variant */
+.gbar{display:inline-flex;align-items:center;gap:4px;padding:1px 7px;border-radius:4px;font-family:var(--mono);font-size:10px;font-weight:700;line-height:1.5}
+.gbar::before{content:"";width:3px;height:10px;border-radius:2px;background:currentColor}
+.gbar.g-ap{background:rgba(232,184,0,.14);color:var(--gold)}
+.gbar.g-a{background:rgba(0,232,122,.12);color:var(--green)}
+.gbar.g-bp{background:rgba(41,121,255,.12);color:var(--blue2)}
+.gbar.g-b{background:rgba(122,143,176,.12);color:var(--text2)}
+.gbar.g-c{background:rgba(61,80,112,.15);color:var(--text3)}
+
+/* FRESHNESS BADGE */
+.fresh{display:inline-flex;align-items:center;gap:3px;padding:1px 5px;border-radius:3px;font-family:var(--mono);font-size:9px;font-weight:600;margin-left:6px;line-height:1.4}
+.fresh::before{content:"";width:5px;height:5px;border-radius:50%;background:currentColor}
+.fresh.fr-fresh{background:rgba(0,232,122,.08);color:var(--green)}
+.fresh.fr-aging{background:rgba(240,180,41,.08);color:var(--amber)}
+.fresh.fr-stale{background:rgba(255,51,85,.08);color:var(--red)}
+.fresh.fr-unknown{background:rgba(122,143,176,.06);color:var(--text3)}
+
+/* HELP FAB in top bar region */
+.help-fab{background:none;border:1px solid var(--border2);color:var(--text2);width:28px;height:28px;border-radius:50%;cursor:pointer;font-size:12px;font-weight:700;font-family:var(--mono);line-height:1;display:inline-flex;align-items:center;justify-content:center;transition:all .12s}
+.help-fab:hover{background:var(--blue);color:#fff;border-color:var(--blue)}
+
+/* P&L UNIT TOGGLE */
+.unit-toggle{display:inline-flex;border:1px solid var(--border2);border-radius:6px;overflow:hidden;font-family:var(--mono);font-size:10px}
+.unit-toggle button{padding:3px 8px;border:none;background:none;color:var(--text3);cursor:pointer;transition:all .12s}
+.unit-toggle button.on{background:var(--blue);color:#fff}
+
+/* global: cursor-help hint on elements with title attr hinting a metric */
+[data-tip]{cursor:help;border-bottom:1px dotted var(--border3)}
+
 </style>
 </head>
 <body>
@@ -493,44 +618,84 @@ tr:hover td{background:rgba(255,255,255,.015)}
     <div class="brand-ico">⚡</div>
     <div>
       <div class="brand-name">Titan<span>Bot</span></div>
-      <div class="brand-ver">PRO v4.0</div>
+      <div class="brand-ver">PRO v4.1</div>
     </div>
   </div>
 
   <div class="sidebar-nav">
-  <div class="nav-section">
-    <div class="nav-label">Trading</div>
-    <button class="nb on" id="nb-overview" onclick="nav('overview')"><span class="ico">◈</span>Overview<span id="bdg-sigs" class="bdg">0</span></button>
-    <button class="nb" id="nb-positions" onclick="nav('positions')"><span class="ico">◉</span>Open Positions<span id="bdg-pos" class="bdg">0</span></button>
-    <button class="nb" id="nb-signals" onclick="nav('signals')"><span class="ico">◎</span>Signals</button>
-    <button class="nb" id="nb-markets" onclick="nav('markets')"><span class="ico">▦</span>Markets</button>
+
+  <!-- Command Center (single page) -->
+  <div class="nav-top" data-group="command">
+    <button class="nb on" id="nb-overview" onclick="nav('overview')" title="Command Center · 1-glance situation room">
+      <span class="gico">🎯</span>Command<span id="bdg-sigs" class="bdg">0</span>
+    </button>
   </div>
 
-  <div class="nav-section">
-    <div class="nav-label">Analytics</div>
-    <button class="nb" id="nb-performance" onclick="nav('performance')"><span class="ico">▲</span>Performance</button>
-    <button class="nb" id="nb-risk" onclick="nav('risk')"><span class="ico">◈</span>Risk / Portfolio</button>
-    <button class="nb" id="nb-learning" onclick="nav('learning')"><span class="ico">◉</span>AI Learning</button>
-    <button class="nb" id="nb-backtester" onclick="nav('backtester')"><span class="ico">◎</span>Backtester</button>
+  <!-- Trade Desk -->
+  <div class="nav-group" id="grp-trade" data-group="trade">
+    <button class="nav-group-head" onclick="navGroup('trade')" title="Live positions · signals · markets · journal">
+      <span class="gico">📈</span>Trade Desk<span id="bdg-pos" class="bdg">0</span><span class="caret">▸</span>
+    </button>
+    <div class="nav-sub">
+      <button class="nb" id="nb-positions" onclick="nav('positions')">Open Positions</button>
+      <button class="nb" id="nb-signals"   onclick="nav('signals')">Signals</button>
+      <button class="nb" id="nb-markets"   onclick="nav('markets')">Markets</button>
+      <button class="nb" id="nb-journal"   onclick="nav('journal')">Trade Journal</button>
+    </div>
   </div>
 
-  <div class="nav-section">
-    <div class="nav-label">Intelligence</div>
-    <button class="nb" id="nb-smartmoney" onclick="nav('smartmoney')"><span class="ico">◈</span>Smart Money</button>
-    <button class="nb" id="nb-microstructure" onclick="nav('microstructure')"><span class="ico">◉</span>Microstructure</button>
-    <button class="nb" id="nb-news" onclick="nav('news')"><span class="ico">◎</span>News Feed</button>
-    <button class="nb" id="nb-btcintel" onclick="nav('btcintel')"><span class="ico">◈</span>BTC Intelligence<span id="bdg-btc" class="bdg" style="display:none">!</span></button>
-    <button class="nb" id="nb-sentinel" onclick="nav('sentinel')"><span class="ico">▦</span>Sentinel AI</button>
-    <button class="nb" id="nb-adaptive" onclick="nav('adaptive')"><span class="ico">◉</span>Adaptive Engine</button>
+  <!-- Intel Hub -->
+  <div class="nav-group" id="grp-intel" data-group="intel">
+    <button class="nav-group-head" onclick="navGroup('intel')" title="Smart money · microstructure · news · BTC events · scan lab">
+      <span class="gico">🧠</span>Intel Hub<span id="bdg-btc" class="bdg">!</span><span class="caret">▸</span>
+    </button>
+    <div class="nav-sub">
+      <button class="nb" id="nb-smartmoney"      onclick="nav('smartmoney')">Smart Money</button>
+      <button class="nb" id="nb-microstructure"  onclick="nav('microstructure')">Microstructure</button>
+      <button class="nb" id="nb-news"            onclick="nav('news')">News Feed</button>
+      <button class="nb" id="nb-btcintel"        onclick="nav('btcintel')">BTC Events</button>
+      <button class="nb" id="nb-notebook"        onclick="nav('notebook')">Scan Lab</button>
+    </div>
   </div>
 
-  <div class="nav-section">
-    <div class="nav-label">System</div>
-    <button class="nb" id="nb-approvals" onclick="nav('approvals')"><span class="ico">◈</span>Approvals<span id="bdg-appr" class="bdg">0</span></button>
-    <button class="nb" id="nb-notebook" onclick="nav('notebook')"><span class="ico">◉</span>Scan Lab</button>
-    <button class="nb" id="nb-journal" onclick="nav('journal')"><span class="ico">▲</span>Trade Journal</button>
-    <button class="nb" id="nb-settings" onclick="nav('settings')"><span class="ico">◎</span>Settings</button>
-    <button class="nb" id="nb-diagnostics" onclick="nav('diagnostics')"><span class="ico">▦</span>Diagnostics</button>
+  <!-- Performance -->
+  <div class="nav-group" id="grp-perf" data-group="perf">
+    <button class="nav-group-head" onclick="navGroup('perf')" title="Track record · AI learning · backtester">
+      <span class="gico">📊</span>Performance<span class="caret">▸</span>
+    </button>
+    <div class="nav-sub">
+      <button class="nb" id="nb-performance" onclick="nav('performance')">Track Record</button>
+      <button class="nb" id="nb-learning"    onclick="nav('learning')">AI Learning</button>
+      <button class="nb" id="nb-backtester"  onclick="nav('backtester')">Backtester</button>
+    </div>
+  </div>
+
+  <!-- Risk (single page) -->
+  <div class="nav-top" data-group="risk">
+    <button class="nb" id="nb-risk" onclick="nav('risk')" title="Capital · concentration · correlation · drawdown">
+      <span class="gico">🛡️</span>Risk
+    </button>
+  </div>
+
+  <!-- Ops -->
+  <div class="nav-group" id="grp-ops" data-group="ops">
+    <button class="nav-group-head" onclick="navGroup('ops')" title="Health · adaptive · sentinel · approvals · settings">
+      <span class="gico">⚙️</span>Ops<span id="bdg-appr" class="bdg">0</span><span class="caret">▸</span>
+    </button>
+    <div class="nav-sub">
+      <button class="nb" id="nb-diagnostics" onclick="nav('diagnostics')">Health &amp; Pipeline</button>
+      <button class="nb" id="nb-adaptive"    onclick="nav('adaptive')">Adaptive Engine</button>
+      <button class="nb" id="nb-sentinel"    onclick="nav('sentinel')">Sentinel AI</button>
+      <button class="nb" id="nb-approvals"   onclick="nav('approvals')">Approvals</button>
+      <button class="nb" id="nb-settings"    onclick="nav('settings')">Settings</button>
+    </div>
+  </div>
+
+  <!-- Guide (single page) -->
+  <div class="nav-top" data-group="guide" style="margin-top:6px">
+    <button class="nb" id="nb-guide" onclick="nav('guide')" title="How everything works · press ? anywhere">
+      <span class="gico">📖</span>Guide
+    </button>
   </div>
 
   </div><!-- end sidebar-nav -->
@@ -538,7 +703,9 @@ tr:hover td{background:rgba(255,255,255,.015)}
     <div class="status-pill" id="status-pill">
       <div class="status-dot"></div>
       <span class="status-label" id="status-label">Live</span>
-      <button id="theme-toggle" onclick="toggleTheme()" title="Toggle dark/light mode" style="margin-left:auto;background:none;border:none;cursor:pointer;font-size:14px;line-height:1;padding:2px;color:var(--text2);transition:color .15s" onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--text2)'">🌙</button>
+      <button onclick="cmdkOpen()" title="Command palette (⌘K / Ctrl+K)" style="margin-left:auto;background:none;border:none;cursor:pointer;font-size:11px;font-family:var(--mono);font-weight:700;line-height:1;padding:2px 4px;color:var(--text3);transition:color .15s" onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--text3)'">⌘K</button>
+      <button onclick="openHelp(pg)" title="Help for current page (?)" style="background:none;border:none;cursor:pointer;font-size:12px;line-height:1;padding:2px 4px;color:var(--text3);transition:color .15s" onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--text3)'">?</button>
+      <button id="theme-toggle" onclick="toggleTheme()" title="Toggle dark/light mode" style="background:none;border:none;cursor:pointer;font-size:14px;line-height:1;padding:2px;color:var(--text2);transition:color .15s" onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--text2)'">🌙</button>
     </div>
     <div class="sidebar-meta">
       <div class="smeta"><div class="smeta-l">Regime</div><div class="smeta-v" id="sm-regime">—</div></div>
@@ -1491,6 +1658,148 @@ tr:hover td{background:rgba(255,255,255,.015)}
 </div>
 </div>
 
+<!-- ████ GUIDE ████ -->
+<div class="page" id="page-guide">
+<div class="topbar">
+  <div><div class="ph">📖 Guide &amp; Playbook</div><div class="pm">Everything the dashboard does · how a pro trader uses it · keyboard shortcuts</div></div>
+  <div style="display:flex;gap:7px;align-items:center">
+    <button class="btn" onclick="cmdkOpen()" title="Jump to page or symbol">⌘K · Command Palette</button>
+    <button class="btn" onclick="openHelp(pg)">? Page Help</button>
+  </div>
+</div>
+<div class="page-scroll">
+  <div class="guide-hero">
+    <h2>Your pro trading cockpit — at a glance</h2>
+    <p>TitanBot scans ~400 coins across 13 strategies, kills 95%+ of low-quality signals through a multi-stage filter/validator/veto pipeline, and publishes only the survivors. This guide explains what each page shows, how pros read it, and how to act on it.</p>
+    <div class="guide-toc">
+      <button onclick="document.getElementById('guide-playbooks').scrollIntoView({behavior:'smooth'})">Playbooks</button>
+      <button onclick="document.getElementById('guide-pages').scrollIntoView({behavior:'smooth'})">Every Page</button>
+      <button onclick="document.getElementById('guide-glossary').scrollIntoView({behavior:'smooth'})">Metric Glossary</button>
+      <button onclick="document.getElementById('guide-lifecycle').scrollIntoView({behavior:'smooth'})">Signal Lifecycle</button>
+      <button onclick="document.getElementById('guide-shortcuts').scrollIntoView({behavior:'smooth'})">Shortcuts</button>
+      <button onclick="document.getElementById('guide-faq').scrollIntoView({behavior:'smooth'})">FAQ</button>
+    </div>
+  </div>
+
+  <!-- PLAYBOOKS -->
+  <div class="card" id="guide-playbooks">
+    <div class="card-h"><div class="card-t">🎯 Trader Playbooks — pick your style</div></div>
+    <div class="card-b">
+      <div class="g3">
+        <div>
+          <div style="font-weight:700;margin-bottom:6px;color:var(--blue2)">Day Trader (intraday · 15m/1h)</div>
+          <ol style="font-size:11.5px;color:var(--text2);line-height:1.75;padding-left:18px">
+            <li>Start on <b>Command</b> — check regime, F&amp;G, macro ribbon.</li>
+            <li>Jump to <b>Intel → News + Microstructure</b> for the driver.</li>
+            <li>Open <b>Trade Desk → Signals</b>, filter by A+/A grades.</li>
+            <li>Confirm on <b>Risk</b> before adding — correlation and concentration caps.</li>
+            <li>Manage on <b>Trade Desk → Open Positions</b>.</li>
+          </ol>
+        </div>
+        <div>
+          <div style="font-weight:700;margin-bottom:6px;color:var(--purple2)">Swing Trader (4h/1d)</div>
+          <ol style="font-size:11.5px;color:var(--text2);line-height:1.75;padding-left:18px">
+            <li><b>Intel → Smart Money + BTC Events</b> for the weekly bias.</li>
+            <li><b>Performance → AI Learning</b> — which strategy's posterior is trending up?</li>
+            <li><b>Trade Desk → Signals</b> filter by that strategy + 4h/1d.</li>
+            <li><b>Backtester</b> to sanity-check the setup on recent data.</li>
+            <li>Enter, then monitor weekly on <b>Risk</b>.</li>
+          </ol>
+        </div>
+        <div>
+          <div style="font-weight:700;margin-bottom:6px;color:var(--green)">Passive Supervisor</div>
+          <ol style="font-size:11.5px;color:var(--text2);line-height:1.75;padding-left:18px">
+            <li><b>Command</b> daily — 30-second health check.</li>
+            <li><b>Ops → Approvals</b> when the badge lights up — decide within 24h.</li>
+            <li><b>Ops → Health</b> weekly — no red alerts, no pipeline drift.</li>
+            <li><b>Performance → Track Record</b> monthly — DD within bounds.</li>
+          </ol>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- EVERY PAGE -->
+  <div class="card" id="guide-pages">
+    <div class="card-h"><div class="card-t">📑 Every page, at a glance</div><span class="muted" style="font-size:10px">click any card for full help</span></div>
+    <div class="card-b">
+      <div class="guide-grid" id="guide-cards"><div class="loading"><div class="spin"></div></div></div>
+    </div>
+  </div>
+
+  <!-- LIFECYCLE -->
+  <div class="card" id="guide-lifecycle">
+    <div class="card-h"><div class="card-t">🔄 Signal lifecycle — where each stage is shown</div></div>
+    <div class="card-b">
+      <ol style="font-size:12px;color:var(--text2);line-height:1.9;padding-left:22px">
+        <li><b>Scanned</b> — scanner polls all tier-1/2/3 coins. Seen on <a class="help-xlink" onclick="nav('diagnostics')">Health &amp; Pipeline</a>.</li>
+        <li><b>Triggered</b> — one of 13 strategies produces a candidate. Kill reasons on Health.</li>
+        <li><b>Filtered</b> — aggregator gate (min confidence, R:R floor, dedup, regime). Drop-off visible on pipeline funnel.</li>
+        <li><b>Validated</b> — structural + LLM sanity check. Failures on <a class="help-xlink" onclick="nav('diagnostics')">Signal Validator</a>.</li>
+        <li><b>Published</b> — Telegram + dashboard. Row appears on <a class="help-xlink" onclick="nav('signals')">Signals</a> + <a class="help-xlink" onclick="nav('overview')">Command feed</a>.</li>
+        <li><b>Entry watched</b> — tracked execution. Near-misses + missed-fill replay on Health.</li>
+        <li><b>Entered</b> — position opened. Managed on <a class="help-xlink" onclick="nav('positions')">Open Positions</a>.</li>
+        <li><b>Closed</b> — outcome learned. Posteriors update on <a class="help-xlink" onclick="nav('learning')">AI Learning</a>; journal on <a class="help-xlink" onclick="nav('journal')">Trade Journal</a>.</li>
+      </ol>
+    </div>
+  </div>
+
+  <!-- GLOSSARY -->
+  <div class="card" id="guide-glossary">
+    <div class="card-h"><div class="card-t">📚 Metric glossary</div></div>
+    <div class="card-b"><div class="help-gloss" id="guide-glossary-body"></div></div>
+  </div>
+
+  <!-- SHORTCUTS -->
+  <div class="card" id="guide-shortcuts">
+    <div class="card-h"><div class="card-t">⌨️ Keyboard shortcuts</div></div>
+    <div class="card-b">
+      <div class="guide-shortcut-grid">
+        <div><span class="kbd">⌘</span><span class="kbd">K</span><span style="color:var(--text2)">Command palette — jump to any page or symbol</span></div>
+        <div><span class="kbd">?</span><span style="color:var(--text2)">Contextual help for the current page</span></div>
+        <div><span class="kbd">/</span><span style="color:var(--text2)">Focus symbol search on current page</span></div>
+        <div><span class="kbd">Esc</span><span style="color:var(--text2)">Close any open drawer or modal</span></div>
+        <div><span class="kbd">g</span> <span class="kbd">o</span><span style="color:var(--text2)">Go to Command Center</span></div>
+        <div><span class="kbd">g</span> <span class="kbd">t</span><span style="color:var(--text2)">Go to Trade Desk</span></div>
+        <div><span class="kbd">g</span> <span class="kbd">i</span><span style="color:var(--text2)">Go to Intel Hub</span></div>
+        <div><span class="kbd">g</span> <span class="kbd">p</span><span style="color:var(--text2)">Go to Performance</span></div>
+        <div><span class="kbd">g</span> <span class="kbd">r</span><span style="color:var(--text2)">Go to Risk</span></div>
+        <div><span class="kbd">g</span> <span class="kbd">s</span><span style="color:var(--text2)">Go to Ops (System)</span></div>
+        <div><span class="kbd">g</span> <span class="kbd">h</span><span style="color:var(--text2)">Go to Guide (this page)</span></div>
+        <div><span class="kbd">r</span><span style="color:var(--text2)">Refresh current page data</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- FAQ -->
+  <div class="card" id="guide-faq">
+    <div class="card-h"><div class="card-t">❓ FAQ &amp; Troubleshooting</div></div>
+    <div class="card-b">
+      <details style="padding:6px 0;border-bottom:1px solid var(--border)"><summary style="cursor:pointer;font-weight:600">Why am I not seeing any signals?</summary><div style="padding:6px 0 0;color:var(--text2);font-size:12px;line-height:1.6">Check <b>Health &amp; Pipeline</b> for a bottleneck. Likely causes: high minimum-confidence floor, choppy regime, macro risk-off blocking longs, or circuit breaker active. The funnel tells you which stage is killing them.</div></details>
+      <details style="padding:6px 0;border-bottom:1px solid var(--border)"><summary style="cursor:pointer;font-weight:600">Why was a signal I expected blocked?</summary><div style="padding:6px 0 0;color:var(--text2);font-size:12px;line-height:1.6">Open <b>Signals</b>, find the closest candidate and click the "why" icon — you'll see aggregator kill reason, validator verdict, and any veto. If it was never generated, check <b>Sentinel → Direction Bias</b> and <b>BTC Events</b>.</div></details>
+      <details style="padding:6px 0;border-bottom:1px solid var(--border)"><summary style="cursor:pointer;font-weight:600">What's the difference between Approvals and Settings?</summary><div style="padding:6px 0 0;color:var(--text2);font-size:12px;line-height:1.6"><b>Settings</b> is manual — you change a parameter directly (runtime-only). <b>Approvals</b> is AI-proposed — the veto system debates changes and asks you to sign off on Tier-3 parameter changes. All Approvals are reversible.</div></details>
+      <details style="padding:6px 0;border-bottom:1px solid var(--border)"><summary style="cursor:pointer;font-weight:600">How do I revert a bad approval?</summary><div style="padding:6px 0 0;color:var(--text2);font-size:12px;line-height:1.6">On <b>Approvals</b>, click "↩ Revert last" in the veto-status card. In Telegram, run <code>/undo</code>.</div></details>
+      <details style="padding:6px 0"><summary style="cursor:pointer;font-weight:600">What does "macro risk-off" actually block?</summary><div style="padding:6px 0 0;color:var(--text2);font-size:12px;line-height:1.6">When DXY/VIX/SPX flash risk-off, the aggregator multiplies SHORT size by 0.70 and blocks LONGs below HIGH grade. See <b>BTC Events → Event Classification</b> for the full matrix.</div></details>
+    </div>
+  </div>
+
+  <!-- SAFETY -->
+  <div class="card">
+    <div class="card-h"><div class="card-t">🛡️ Safety net — what prevents bad trades</div></div>
+    <div class="card-b" style="font-size:12px;color:var(--text2);line-height:1.8">
+      <b style="color:var(--text)">Five layers, any one can veto:</b>
+      <ol style="padding-left:22px;margin-top:6px">
+        <li><b>Aggregator gate</b> — min confidence, R:R floor, dedup, session/regime filters.</li>
+        <li><b>Signal validator</b> — structural sanity + LLM second opinion.</li>
+        <li><b>Execution engine</b> — trigger-based entry with magnitude scaling; invalidates on BTC event change.</li>
+        <li><b>Sentinel + Veto</b> — direction bias audit, symbol blacklist, 3-model debate on parameter changes.</li>
+        <li><b>Circuit breaker</b> — stops all new entries after a pre-defined consecutive-loss streak.</li>
+      </ol>
+    </div>
+  </div>
+</div>
+</div>
+
 </div></div></div><!-- pages / main / shell -->
 
 <script>
@@ -1556,13 +1865,34 @@ function mkC(id,type,labels,datasets,opts={}){
   charts[id]=new Chart(el,{type,data:{labels,datasets},options:deep(base,opts)});
 }
 
-/* NAV */
+/* ─── NAV (v4.1: group-aware) ─── */
+/* Maps each page → parent group id in the sidebar */
+var PAGE_GROUPS={
+  overview:'command',
+  positions:'trade', signals:'trade', markets:'trade', journal:'trade',
+  smartmoney:'intel', microstructure:'intel', news:'intel', btcintel:'intel', notebook:'intel',
+  performance:'perf', learning:'perf', backtester:'perf',
+  risk:'risk',
+  diagnostics:'ops', adaptive:'ops', sentinel:'ops', approvals:'ops', settings:'ops',
+  guide:'guide'
+};
+
 function nav(p){
   document.querySelectorAll('.page').forEach(x=>x.classList.remove('on'));
   document.querySelectorAll('.nb').forEach(x=>x.classList.remove('on'));
+  document.querySelectorAll('.nav-group-head').forEach(x=>x.classList.remove('active'));
+  document.querySelectorAll('.nav-group').forEach(x=>x.classList.remove('open'));
   var pe=document.getElementById('page-'+p);if(pe)pe.classList.add('on');
   var nb=document.getElementById('nb-'+p);if(nb)nb.classList.add('on');
+  var grp=PAGE_GROUPS[p];
+  if(grp){
+    var head=document.querySelector('[data-group="'+grp+'"] .nav-group-head, [data-group="'+grp+'"] .nb');
+    if(head)head.classList.add('active');
+    var gEl=document.getElementById('grp-'+grp);
+    if(gEl)gEl.classList.add('open');
+  }
   pg=p;
+  try{localStorage.setItem('tb_last_page',p);}catch(e){}
   ({overview:loadOverview,positions:loadPositions,signals:loadSignals,
     markets:loadMarkets,performance:loadPerf,risk:loadRisk,
     btcintel:loadBtcIntel,
@@ -1570,7 +1900,425 @@ function nav(p){
     smartmoney:loadSM,microstructure:loadMicro,
     news:loadNews,sentinel:()=>{loadSentinel();loadAIDecisions();},approvals:loadApprovals,
     notebook:()=>{},journal:loadJournal,settings:loadSettings,diagnostics:loadDiag,
-    adaptive:loadAdaptive})[p]?.();
+    adaptive:loadAdaptive,
+    guide:renderGuide})[p]?.();
+}
+
+/* Click on a group header: open/toggle + navigate to its default page */
+var GROUP_DEFAULT={trade:'positions',intel:'smartmoney',perf:'performance',ops:'diagnostics'};
+function navGroup(g){
+  var gEl=document.getElementById('grp-'+g);
+  var parent=PAGE_GROUPS[pg];
+  if(parent===g && gEl && gEl.classList.contains('open')){
+    // second click: just toggle collapse if we're already inside
+    gEl.classList.remove('open');
+    return;
+  }
+  var target=GROUP_DEFAULT[g];
+  if(target)nav(target);
+}
+
+/* ─── HELP CONTENT (single source of truth) ─── */
+var HELP={
+  overview:{title:'Command Center',group:'Command',ico:'🎯',
+    what:'One-glance situation room. Shows regime, macro risk, F&G, today’s P&L, open positions, recent signals, pipeline funnel, and the equity curve.',
+    howpro:['Start your day here — read the macro ribbon first (risk-on / off).','If the regime pill is red (bear/vol), trust only HIGH-grade longs and widen stops.','Pipeline funnel tells you *where* signals are dying today — tune via Settings if the bottleneck is "Aggregator gate".','Use the "All Signals →" button to jump to the full Signals page filtered by your watchlist.'],
+    metrics:[['Win Rate (30d)','Closed-trade win ratio over the last 30 days. <50% is a warning; >55% sustainable is excellent.'],['Avg R (30d)','Average R-multiple per closed trade. Target > +0.20R.'],['Fear & Greed','0–100 sentiment index. Trade counter-sentiment extremes with confirmation.'],['Alt Season','0–100 score. >75 = alt-season; <25 = BTC dominant — adjust correlation exposure.']],
+    next:['Trade Desk → Open Positions','Intel Hub → News','Performance → Track Record']
+  },
+  positions:{title:'Open Positions',group:'Trade Desk',ico:'◉',
+    what:'Live P&L, distance to TP/SL, and direction split for every position the bot currently holds.',
+    howpro:['Watch "Capital at Risk" — above 20% is the first warning line.','Positions updating but P&L frozen = exchange feed stale; check Ops → Health.','Long/short split >80/20 in one direction = you are biased by regime; verify on Sentinel.'],
+    metrics:[['Total P&L (R)','Sum of unrealized R across all open positions.'],['Capital at Risk','Sum of (entry − SL) × size — the dollar loss if every stop hits at once.']],
+    next:['Trade Desk → Signals','Risk','Trade Desk → Trade Journal']
+  },
+  signals:{title:'Signals History',group:'Trade Desk',ico:'◎',
+    what:'Every signal the bot has ever published — wins, losses, pending — with full filters, grade, strategy, R:R, and notes.',
+    howpro:['Sort by created_at desc; filter to last 24h A/A+ to see what is "hot" right now.','Click the 📓 icon on a row to add a journal note — searchable later.','Export filtered set as CSV and slice it in a spreadsheet for deeper analysis.'],
+    metrics:[['Grade','Composite of confidence × R:R × evidence. A+ is top 5%, A top 20%.'],['R/R','Reward-to-risk multiple from entry to TP1.'],['P(win)','Bayesian posterior win probability for this strategy+regime.'],['EV','Expected value in R = P(win)×Avg-win − P(loss)×Avg-loss.']],
+    next:['Trade Desk → Trade Journal','Performance → AI Learning']
+  },
+  markets:{title:'Markets',group:'Trade Desk',ico:'▦',
+    what:'Price + 24h move + signal marker for every symbol in the universe. Click any coin for TradingView + AI narrative.',
+    howpro:['Filter to "🎯 Signal" to see only coins with an active setup.','Use gainers/losers filter to hunt continuation or mean-reversion setups.','Click a coin tile → TV panel opens with live chart and AI read.'],
+    metrics:[['T1/T2/T3','Scan-frequency tier. T1 = highest liquidity & fastest scan.']],
+    next:['Intel Hub → Scan Lab','Trade Desk → Signals']
+  },
+  journal:{title:'Trade Journal',group:'Trade Desk',ico:'📓',
+    what:'Annotated log — every auto-signal you added a note to, plus manual trade entries.',
+    howpro:['Write WHY you believed the setup, not just the result. Searchable later for pattern discovery.','Tag notes by setup type so you can filter ("breakout failures", "news-driven", etc).','Review wins/losses monthly and look for repeated note phrases in losses.'],
+    metrics:[],
+    next:['Trade Desk → Signals','Performance → Track Record']
+  },
+  smartmoney:{title:'Smart Money',group:'Intel Hub',ico:'🐋',
+    what:'Institutional positioning — CME COT, Coinbase premium, Binance/Bybit top-trader ratios, Hyperliquid top wallets, macro.',
+    howpro:['Asset-manager net-long on CME rising = BlackRock/Fidelity tier buying — confluence for longs.','Coinbase premium >0.1% = US buyer pressure. Sustained for days = strong signal.','Cross-check Binance top-trader ratio vs retail — fade retail extremes.'],
+    metrics:[['Institutional Flow Score','−100 to +100 composite of CME + CB premium + Binance/Bybit top traders.'],['Coinbase Premium','(Coinbase − Binance) / Binance price. Positive = US buying pressure.']],
+    next:['Intel Hub → Microstructure','Intel Hub → News']
+  },
+  microstructure:{title:'Market Microstructure',group:'Intel Hub',ico:'🔬',
+    what:'Order-flow-level data — CVD, Deribit options, exchange netflow, basis.',
+    howpro:['CVD divergence from price = absorption; a reversal is likely.','25-delta skew > 0 = put-heavy = downside hedging; <0 = call-heavy = upside greed.','Sustained netflow to exchange = sell pressure incoming.'],
+    metrics:[['CVD','Cumulative volume delta. Rising = net buying, falling = net selling.'],['25Δ Skew','Put-call IV skew at 25-delta. Positive = more demand for puts.'],['Basis','Futures vs spot divergence. Extreme premium = over-leveraged longs.']],
+    next:['Intel Hub → Smart Money','Intel Hub → BTC Events']
+  },
+  news:{title:'News Feed',group:'Intel Hub',ico:'📰',
+    what:'15 RSS sources with AI sentiment scoring, plus TVL and events. Filter by coin, sentiment, or breaking tag.',
+    howpro:['Sentiment is AI-scored — use it as a read, not gospel. Headlines with "Breaking" + bearish = verify instantly.','Filter to a coin before opening a position to make sure no bad news is brewing.','Cross-check with BTC Events page if multiple macro items hit.'],
+    metrics:[['Sentiment','-1 (bearish) to +1 (bullish) AI classification per headline.']],
+    next:['Intel Hub → BTC Events']
+  },
+  btcintel:{title:'BTC Events',group:'Intel Hub',ico:'⚡',
+    what:'Classifies the current BTC-driving event (macro risk-on/off, exchange hack, regulatory, halving, etc.) and shows how each event type rewrites altcoin signal rules.',
+    howpro:['When banner shows MACRO_RISK_OFF: all new LONG signals below HIGH grade are blocked — don’t force entries.','EXCHANGE_EVENT is binary — step aside for 1–3 hours, the market is noise.','The Classification Guide table tells you exactly how sizing + direction rules flex per event.'],
+    metrics:[['Confidence','AI confidence in the event classification. >80% is trustworthy.'],['Severity','Impact magnitude. CRITICAL > HIGH > MEDIUM > LOW.']],
+    next:['Intel Hub → News','Ops → Sentinel AI']
+  },
+  notebook:{title:'Scan Lab',group:'Intel Hub',ico:'🧪',
+    what:'Run all 13 strategies on any single symbol. Combines strategy output + whale flow + AI analysis + live chat.',
+    howpro:['Great for pre-entry due-diligence on an unusual signal.','Also use to scan an *unlisted* symbol quickly.','The AI chat remembers context — ask follow-ups like "what invalidates this?".'],
+    metrics:[['Whale Buy/Sell','Net on-chain large-holder flow over the lookback period.']],
+    next:['Trade Desk → Signals','Performance → Backtester']
+  },
+  performance:{title:'Track Record',group:'Performance',ico:'📊',
+    what:'Risk-adjusted results over any window: Sharpe, Sortino, Calmar, VaR/CVaR, Omega, monthly P&L heatmap, by-strategy breakdown.',
+    howpro:['Calmar > 1.0 is institutional-grade. Monitor it across 90/180d.','VaR 95% / CVaR 95% tells you what a "bad" 5% day looks like — make sure your risk sizing can absorb CVaR × 2.','Strategy breakdown "Sharpe" column tells you which strategy is worth more budget.'],
+    metrics:[['Sharpe','(Mean − RFR) / σ. >1 good, >2 excellent, annualised.'],['Sortino','Like Sharpe but penalising only downside volatility.'],['Calmar','Annualised return / max drawdown. >1 = sustainable.'],['VaR 95%','Worst loss in best-case 95% of trades. 5% tail excluded.'],['CVaR 95%','Expected loss given the worst 5% of trades occur.'],['Omega','Prob-weighted gain / prob-weighted loss. >1.5 target.'],['Profit Factor','Gross profit / gross loss. >1.5 healthy.']],
+    next:['Performance → AI Learning','Risk']
+  },
+  learning:{title:'AI Learning',group:'Performance',ico:'🧬',
+    what:'Bayesian posteriors per strategy, evidence likelihood ratios, and calibration plot (predicted vs actual).',
+    howpro:['Posterior mean rising + n > 30 = trust this strategy more; consider size-bias toward it.','Evidence ratios above +1.5 = strong positive signal; apply to Scan Lab interpretation.','A calibration plot hugging the diagonal = your probabilities are well-calibrated.'],
+    metrics:[['Beta Posterior','P(win) with Beta(α,β) prior updated by outcomes. N is trade count.'],['Evidence LR','Likelihood ratio — how much an evidence factor shifts p(win).']],
+    next:['Performance → Track Record','Ops → Sentinel AI']
+  },
+  backtester:{title:'Backtester',group:'Performance',ico:'⏮️',
+    what:'Historical simulation with commission + slippage. IS/OOS split, Monte Carlo (n=1000), walk-forward consistency, per-regime breakdown.',
+    howpro:['Always run with IS/OOS split (≥20%) to avoid overfit optimism.','MC p5 is your worst realistic outcome — if p5 is negative, don’t deploy.','Walk-forward should be roughly flat — steeply declining = overfit to a specific regime.'],
+    metrics:[['IS/OOS','In-sample / out-of-sample split. OOS is the held-out test window.'],['MC p5/p50/p95','Monte Carlo permutation percentiles of final equity.']],
+    next:['Performance → Track Record']
+  },
+  risk:{title:'Risk &amp; Portfolio',group:'Risk',ico:'🛡️',
+    what:'Capital allocation, sector weights, direction balance, BTC-correlated positions, drawdown.',
+    howpro:['BTC-correlated positions count ≥ 3 + BTC in a vol regime = reduce new exposure.','Direction pie heavily skewed = regime bet, not a diversified book. Fine if intentional.','Drawdown > Max DD in Track Record by 50% = something structural shifted; investigate.'],
+    metrics:[['BTC-Correlated','Number of open positions with β to BTC ≥ 0.70.'],['Risk Deployed','Total pre-stop capital at risk as % of portfolio.']],
+    next:['Performance → Track Record','Ops → Sentinel AI']
+  },
+  diagnostics:{title:'Health &amp; Pipeline',group:'Ops',ico:'🩺',
+    what:'Pipeline health score, bottleneck detection, kill reasons, structural issues, AI recommendations. Also: validator, near-miss feedback, missed-fill replay, execution gate.',
+    howpro:['Health score < 60 = something is wrong. Recommendations card tells you what.','Drift rate >30% = validator is killing too many signals; may indicate data issue.','Near-miss false-negative spike = gate is too strict; consider loosening.'],
+    metrics:[['Drift Rate','% of recent signals flagged by validator as anomalous.'],['Gate Accuracy','Of blocked signals, fraction that would indeed have lost.'],['Pass Win Rate','Of passed signals, fraction that won.']],
+    next:['Ops → Approvals','Ops → Settings']
+  },
+  adaptive:{title:'Adaptive Engine',group:'Ops',ico:'🌊',
+    what:'Real-time state of adaptive subsystems — cascade pressure, flow dynamics, whale behavior, volatility regime, regime transition, adaptive weights.',
+    howpro:['Rising cascade pressure + thin liquidity = step aside, wait for the flush.','Regime transition indicator flipping = strategies reweight; expect short-term drawdown.','Adaptive weights table shows which strategy the system currently trusts most.'],
+    metrics:[['Cascade Pressure','Composite liquidation-risk index across leveraged venues.'],['Flow Dynamics','Net taker-flow imbalance aggregated across exchanges.']],
+    next:['Ops → Sentinel AI','Intel Hub → Microstructure']
+  },
+  sentinel:{title:'Sentinel AI',group:'Ops',ico:'🕵️',
+    what:'Structural audit (Fast + Deep LLM), strategy direction bias detection, HTF guardrail blocks, symbol blacklist, AI decision log.',
+    howpro:['Fast Audit (Arcee Trinity) runs continuously; Deep Audit (Nemotron 120B) is on-demand + expensive.','Strategy direction bias persistently >75% one way = strategy is broken for current regime; consider disabling.','Blacklist here always wins; good for removing manipulated low-cap tokens.'],
+    metrics:[['AI Budget','$ spent on AI today across all models.']],
+    next:['Ops → Approvals','Ops → Health &amp; Pipeline']
+  },
+  approvals:{title:'Approvals',group:'Ops',ico:'⚖️',
+    what:'Tier-3 parameter changes the veto system wants to apply. 3-model debate: Proposer → Challenger → Arbitrator. LOW-risk auto-applies after 30 min unless you override.',
+    howpro:['Read the AI Recommendation — it is generated from *your* live data.','If arbitrator confidence < 70% or risk = HIGH: wait.','You can always revert with "↩ Revert last".'],
+    metrics:[['Confidence','Arbitrator confidence that the change is an improvement.'],['Risk','LOW auto-applies; MEDIUM/HIGH need your manual approval.']],
+    next:['Ops → Sentinel AI','Ops → Settings']
+  },
+  settings:{title:'Settings',group:'Ops',ico:'🎛️',
+    what:'Runtime config — min confidence, R:R floors, rate limits. Read-only view of universe + scan intervals.',
+    howpro:['Changes apply *immediately* but reset on restart. Edit settings.yaml for permanent changes.','Raise Min Confidence when signal rate is too high; lower when too low.','Use Approvals page to let AI propose changes with evidence.'],
+    metrics:[],
+    next:['Ops → Approvals']
+  },
+  guide:{title:'Guide &amp; Playbook',group:'Guide',ico:'📖',
+    what:'The dashboard user-manual — playbooks, per-page help, metric glossary, signal lifecycle, shortcuts, FAQ.',
+    howpro:['Press <span class="kbd">?</span> anywhere for contextual help on the current page.','Press <span class="kbd">⌘</span><span class="kbd">K</span> anywhere to jump to a page or search a symbol.'],
+    metrics:[],
+    next:[]
+  }
+};
+
+/* ─── HELP DRAWER ─── */
+function openHelp(p){
+  p=p||pg;
+  var h=HELP[p]||HELP.overview;
+  document.getElementById('help-title').innerHTML=(h.ico||'')+' '+h.title;
+  document.getElementById('help-sub').textContent=h.group||'';
+  var body=document.getElementById('help-body');
+  var html='';
+  html+='<div class="help-section"><h4>What this page is for</h4><p>'+h.what+'</p></div>';
+  if(h.howpro&&h.howpro.length){
+    html+='<div class="help-section"><h4>How a pro trader uses it</h4><ul>';
+    h.howpro.forEach(x=>{html+='<li>'+x+'</li>';});
+    html+='</ul></div>';
+  }
+  if(h.metrics&&h.metrics.length){
+    html+='<div class="help-section"><h4>Metrics explained</h4><div class="help-gloss">';
+    h.metrics.forEach(m=>{html+='<div class="help-gloss-row"><div class="help-gloss-k">'+esc(m[0])+'</div><div class="help-gloss-v">'+m[1]+'</div></div>';});
+    html+='</div></div>';
+  }
+  if(h.next&&h.next.length){
+    html+='<div class="help-section"><h4>What to do next</h4>';
+    h.next.forEach(lbl=>{
+      var target=lbl.split('→').pop().trim().toLowerCase().replace(/[^a-z0-9]+/g,'_');
+      var slug=LABEL_TO_PAGE[lbl]||LABEL_TO_PAGE[target]||'';
+      if(slug)html+='<span class="help-xlink" onclick="nav(\''+slug+'\');closeHelp()">'+esc(lbl)+'</span>';
+      else html+='<span class="help-xlink" style="opacity:.7">'+esc(lbl)+'</span>';
+    });
+    html+='</div>';
+  }
+  html+='<div class="help-section" style="margin-top:22px"><h4>Shortcuts</h4><p style="font-size:11px"><span class="kbd">⌘</span><span class="kbd">K</span> palette · <span class="kbd">?</span> help · <span class="kbd">/</span> search · <span class="kbd">Esc</span> close</p></div>';
+  body.innerHTML=html;
+  document.getElementById('help-drawer').classList.add('open');
+  document.getElementById('help-overlay').style.display='block';
+}
+function closeHelp(){
+  document.getElementById('help-drawer').classList.remove('open');
+  document.getElementById('help-overlay').style.display='none';
+}
+
+/* Label-to-slug table for "what to do next" cross-links */
+var LABEL_TO_PAGE={};
+(function(){
+  var map={
+    'Command Center':'overview','Command':'overview',
+    'Trade Desk → Open Positions':'positions','Trade Desk → Signals':'signals','Trade Desk → Markets':'markets','Trade Desk → Trade Journal':'journal',
+    'Intel Hub → Smart Money':'smartmoney','Intel Hub → Microstructure':'microstructure','Intel Hub → News':'news','Intel Hub → BTC Events':'btcintel','Intel Hub → Scan Lab':'notebook',
+    'Performance → Track Record':'performance','Performance → AI Learning':'learning','Performance → Backtester':'backtester',
+    'Risk':'risk',
+    'Ops → Health &amp; Pipeline':'diagnostics','Ops → Approvals':'approvals','Ops → Settings':'settings','Ops → Sentinel AI':'sentinel','Ops → Adaptive':'adaptive',
+    'Guide':'guide'
+  };
+  Object.keys(map).forEach(k=>{LABEL_TO_PAGE[k]=map[k];});
+})();
+
+/* ─── COMMAND PALETTE ─── */
+var _cmdkItems=[];
+function cmdkOpen(){
+  document.getElementById('cmdk-bg').classList.add('open');
+  var inp=document.getElementById('cmdk-in');inp.value='';inp.focus();
+  cmdkRender();
+}
+function cmdkClose(){document.getElementById('cmdk-bg').classList.remove('open');}
+function cmdkBuildIndex(){
+  var items=[];
+  Object.keys(HELP).forEach(p=>{
+    var h=HELP[p];
+    items.push({type:'page',id:p,title:h.title.replace(/&amp;/g,'&'),sub:h.group,ico:h.ico||'•',action:()=>{nav(p);cmdkClose();}});
+  });
+  // actions
+  items.push({type:'action',title:'Open Command Palette Help',sub:'?',ico:'❓',action:()=>{cmdkClose();openHelp(pg);}});
+  items.push({type:'action',title:'Toggle dark / light theme',sub:'theme',ico:'🌓',action:()=>{toggleTheme();cmdkClose();}});
+  items.push({type:'action',title:'Refresh current page',sub:'r',ico:'↻',action:()=>{cmdkClose();nav(pg);}});
+  items.push({type:'action',title:'Toggle P&L unit (R ↔ $)',sub:'$',ico:'💱',action:()=>{togglePnLUnit();cmdkClose();}});
+  // symbols from ticker / prices
+  Object.keys(_prices||{}).forEach(sym=>{
+    var s=sym.replace('/USDT','');
+    items.push({type:'symbol',title:s,sub:'open chart · '+sym,ico:'📈',action:()=>{cmdkClose();openTV(s);}});
+    items.push({type:'scan',title:'Scan '+s,sub:'run Scan Lab on '+s,ico:'🧪',action:()=>{cmdkClose();nav('notebook');setTimeout(()=>{var el=document.getElementById('nb-sym');if(el){el.value=s;if(typeof runScan==='function')runScan();}},150);}});
+  });
+  _cmdkItems=items;
+}
+function cmdkRender(){
+  if(!_cmdkItems.length)cmdkBuildIndex();
+  var q=(document.getElementById('cmdk-in').value||'').trim().toLowerCase();
+  var list=document.getElementById('cmdk-list');
+  var filtered=_cmdkItems.filter(x=>!q||(x.title+' '+x.sub).toLowerCase().indexOf(q)>=0);
+  if(!filtered.length){list.innerHTML='<div class="cmdk-empty">No matches for "'+esc(q)+'"</div>';return;}
+  var bySec={};
+  filtered.forEach(x=>{(bySec[x.type]=bySec[x.type]||[]).push(x);});
+  var order=['page','symbol','scan','action'];
+  var labels={page:'Pages',symbol:'Symbols',scan:'Scan Lab',action:'Actions'};
+  var html='';var gi=0;
+  order.forEach(sec=>{
+    var arr=bySec[sec];if(!arr||!arr.length)return;
+    html+='<div class="cmdk-sec">'+labels[sec]+'</div>';
+    arr.slice(0,sec==='symbol'?20:8).forEach(x=>{
+      html+='<button class="cmdk-row" data-gi="'+gi+'" onclick="_cmdkClick('+gi+')"><span class="cmdk-ico">'+x.ico+'</span><span class="cmdk-title">'+esc(x.title)+'</span><span class="cmdk-sub">'+esc(x.sub||'')+'</span></button>';
+      gi++;
+    });
+  });
+  list.innerHTML=html;
+  // Track visible items for key-nav
+  _cmdkVisible=[];
+  list.querySelectorAll('.cmdk-row').forEach((el,i)=>{_cmdkVisible.push({el:el,item:filtered.filter(x=>true)[parseInt(el.dataset.gi)]});});
+  // easier: rebuild list in order
+  _cmdkVisible=[];
+  var visIdx=0;
+  order.forEach(sec=>{
+    var arr=bySec[sec];if(!arr||!arr.length)return;
+    arr.slice(0,sec==='symbol'?20:8).forEach(x=>{_cmdkVisible.push(x);visIdx++;});
+  });
+  _cmdkFocus=0;_cmdkUpdFocus();
+}
+var _cmdkVisible=[],_cmdkFocus=0;
+function _cmdkClick(gi){
+  if(_cmdkVisible[gi])_cmdkVisible[gi].action();
+}
+function _cmdkUpdFocus(){
+  var rows=document.querySelectorAll('#cmdk-list .cmdk-row');
+  rows.forEach((r,i)=>{if(i===_cmdkFocus)r.classList.add('focus');else r.classList.remove('focus');});
+  if(rows[_cmdkFocus])rows[_cmdkFocus].scrollIntoView({block:'nearest'});
+}
+function cmdkKey(e){
+  var rows=document.querySelectorAll('#cmdk-list .cmdk-row');
+  if(e.key==='ArrowDown'){e.preventDefault();_cmdkFocus=Math.min(_cmdkFocus+1,rows.length-1);_cmdkUpdFocus();}
+  else if(e.key==='ArrowUp'){e.preventDefault();_cmdkFocus=Math.max(_cmdkFocus-1,0);_cmdkUpdFocus();}
+  else if(e.key==='Enter'){e.preventDefault();_cmdkClick(_cmdkFocus);}
+  else if(e.key==='Escape'){cmdkClose();}
+}
+
+/* ─── GLOBAL KEYBOARD SHORTCUTS ─── */
+var _gChord=false,_gChordT=0;
+document.addEventListener('keydown',function(e){
+  var tag=(e.target&&e.target.tagName)||'';
+  var editing=tag==='INPUT'||tag==='TEXTAREA'||tag==='SELECT'||(e.target&&e.target.isContentEditable);
+  // Allow Esc from inputs
+  if(e.key==='Escape'){
+    closeHelp();cmdkClose();
+    if(typeof closeTV==='function')closeTV();
+    var n=document.getElementById('notif-drawer');if(n&&n.classList.contains('open')&&typeof toggleNotifDrawer==='function')toggleNotifDrawer();
+    var sd=document.getElementById('sig-detail-overlay');if(sd)sd.style.display='none';
+    return;
+  }
+  if(editing)return;
+  // ⌘K / Ctrl+K
+  if((e.metaKey||e.ctrlKey)&&(e.key==='k'||e.key==='K')){e.preventDefault();cmdkOpen();return;}
+  if(e.metaKey||e.ctrlKey||e.altKey)return;
+  if(e.key==='?'){e.preventDefault();openHelp(pg);return;}
+  if(e.key==='/'){
+    // focus the first search input on current page
+    var pe=document.getElementById('page-'+pg);
+    if(pe){var si=pe.querySelector('input.s-inp');if(si){e.preventDefault();si.focus();si.select();return;}}
+  }
+  if(e.key==='r'){
+    // refresh current page (safe: triggers load*)
+    e.preventDefault();nav(pg);return;
+  }
+  // g-chord sequences
+  var now=Date.now();
+  if(e.key==='g'){_gChord=true;_gChordT=now;return;}
+  if(_gChord&&(now-_gChordT)<1200){
+    _gChord=false;
+    var map={o:'overview',t:'positions',i:'smartmoney',p:'performance',r:'risk',s:'diagnostics',h:'guide'};
+    if(map[e.key]){e.preventDefault();nav(map[e.key]);}
+    return;
+  }
+  _gChord=false;
+});
+
+/* ─── P&L UNIT TOGGLE (R ↔ $) ─── */
+var pnlUnit=(function(){try{return localStorage.getItem('tb_pnl_unit')||'R';}catch(e){return'R';}})();
+function togglePnLUnit(){
+  pnlUnit=pnlUnit==='R'?'USD':'R';
+  try{localStorage.setItem('tb_pnl_unit',pnlUnit);}catch(e){}
+  document.querySelectorAll('.unit-toggle button').forEach(b=>{
+    b.classList.toggle('on',b.dataset.unit===pnlUnit);
+  });
+  // best-effort refresh of the current page so the unit is applied
+  nav(pg);
+}
+
+/* ─── FRESHNESS BADGE HELPER ─── */
+/* Callers pass a unix-seconds timestamp or ISO string. Returns HTML string. */
+function freshBadge(ts,ttlSec){
+  if(!ts)return '<span class="fresh fr-unknown">unknown</span>';
+  ttlSec=ttlSec||120;
+  var t=typeof ts==='string'?(new Date(ts).getTime()/1000):parseFloat(ts);
+  if(!t||isNaN(t))return '<span class="fresh fr-unknown">unknown</span>';
+  var age=Math.max(0,Math.floor(Date.now()/1000-t));
+  var cls='fr-fresh',lbl=age+'s';
+  if(age>=ttlSec*4){cls='fr-stale';}
+  else if(age>=ttlSec){cls='fr-aging';}
+  if(age>=60)lbl=Math.round(age/60)+'m';
+  if(age>=3600)lbl=Math.round(age/3600)+'h';
+  return '<span class="fresh '+cls+'" title="Data age: '+age+'s · TTL '+ttlSec+'s">'+lbl+'</span>';
+}
+
+/* ─── INFO BUTTON INJECTION (every page topbar gets an (i) ─── */
+function injectInfoButtons(){
+  document.querySelectorAll('.page').forEach(p=>{
+    var pid=p.id.replace(/^page-/,'');
+    if(pid==='guide')return; // guide has its own explicit help button
+    var topbar=p.querySelector('.topbar');
+    if(!topbar||topbar.querySelector('.ibt'))return;
+    var right=topbar.querySelector(':scope > div:last-child');
+    if(!right){
+      right=document.createElement('div');
+      right.style.cssText='display:flex;gap:7px;align-items:center';
+      topbar.appendChild(right);
+    }
+    var btn=document.createElement('button');
+    btn.className='ibt';btn.type='button';btn.textContent='i';
+    btn.title='What is this page? (shortcut: ?)';
+    btn.setAttribute('aria-label','Help for this page');
+    btn.onclick=function(){openHelp(pid);};
+    // insert as first child on the right so other buttons sit after
+    right.insertBefore(btn,right.firstChild);
+  });
+}
+
+/* ─── METRIC TOOLTIP HINT (adds native title on common metrics by label) ─── */
+function injectMetricTooltips(){
+  var TIPS={
+    'Sharpe':'(Mean return − risk-free) / std-dev, annualised. >1 good, >2 excellent.',
+    'Sharpe (ann.)':'(Mean return − risk-free) / std-dev, annualised. >1 good, >2 excellent.',
+    'Sortino':'Like Sharpe but penalises only downside volatility.',
+    'Calmar':'Annualised return / max drawdown. >1 sustainable.',
+    'Max Drawdown':'Largest peak-to-trough equity decline over the window.',
+    'Profit Factor':'Gross profits / gross losses. >1.5 healthy, <1 losing.',
+    'VaR 95% (worst 5% of trades)':'Loss threshold such that 95% of trades lose less.',
+    'CVaR 95% (expected shortfall)':'Average loss when VaR 95% is breached.',
+    'Omega Ratio (target > 1.5)':'Prob-weighted gain / prob-weighted loss ratio.',
+    'Win Rate':'Closed trades that won / total closed.',
+    'Avg R':'Average R-multiple across closed trades.',
+    'Fear & Greed':'0–100 sentiment. Trade extremes with confirmation.',
+    'Alt Season':'0–100 alt-dominance score. >75 alt-season, <25 BTC-dominant.',
+    'Capital at Risk':'Σ (entry − stop) × size across open positions.',
+    'BTC-Correlated':'Open positions with β vs BTC ≥ 0.70.',
+    'Risk Deployed':'Pre-stop capital at risk / total capital.',
+    'Trades Learned':'Closed trades feeding the Bayesian learner.',
+    'Evidence Factors':'Number of evidence types with posterior updates.',
+    'Calibration Samples':'Number of probability buckets with ≥1 prediction.',
+    'Cascade Pressure':'Composite liq-risk index across leveraged venues.',
+    'Flow Dynamics':'Net taker-flow imbalance across exchanges.',
+    'Drift Rate':'% of recent signals flagged by the validator.'
+  };
+  document.querySelectorAll('.stat-label,.ml,.bt-ml').forEach(el=>{
+    var t=(el.textContent||'').trim();
+    if(TIPS[t] && !el.hasAttribute('title')){el.setAttribute('title',TIPS[t]);el.style.cursor='help';}
+  });
+}
+
+/* ─── GUIDE PAGE RENDERER ─── */
+function renderGuide(){
+  // page-card grid
+  var g=document.getElementById('guide-cards');
+  if(g){
+    var order=['overview','positions','signals','markets','journal','smartmoney','microstructure','news','btcintel','notebook','performance','learning','backtester','risk','diagnostics','adaptive','sentinel','approvals','settings'];
+    g.innerHTML=order.map(p=>{
+      var h=HELP[p];if(!h)return '';
+      return '<div class="guide-card" onclick="nav(\''+p+'\')">'
+        +'<div class="guide-card-h"><span class="guide-card-ico">'+(h.ico||'•')+'</span><span class="guide-card-t">'+h.title+'</span><span class="guide-card-group">'+h.group+'</span></div>'
+        +'<div class="guide-card-desc">'+h.what+'</div>'
+        +'<div class="guide-card-actions"><span class="help-xlink" onclick="event.stopPropagation();openHelp(\''+p+'\')">Full help →</span></div>'
+        +'</div>';
+    }).join('');
+  }
+  // glossary
+  var gl=document.getElementById('guide-glossary-body');
+  if(gl){
+    var all={};
+    Object.keys(HELP).forEach(p=>{
+      (HELP[p].metrics||[]).forEach(m=>{if(!all[m[0]])all[m[0]]=m[1];});
+    });
+    var keys=Object.keys(all).sort();
+    gl.innerHTML=keys.map(k=>'<div class="help-gloss-row"><div class="help-gloss-k">'+esc(k)+'</div><div class="help-gloss-v">'+all[k]+'</div></div>').join('');
+  }
 }
 
 /* TICKER */
@@ -3740,6 +4488,14 @@ async function enterTrade(sigId,symbol,direction){
 // Initial load with retry: if first call returns no data (bot still starting),
 // retry after 5s and again at 15s so dashboard populates as soon as bot is ready
 async function initDashboard(){
+  // v4.1: one-time UX bootstrap — runs before any data load so controls are live even if API fails
+  try{injectInfoButtons();}catch(e){console.warn('injectInfoButtons',e);}
+  try{injectMetricTooltips();}catch(e){console.warn('injectMetricTooltips',e);}
+  try{
+    // Open the default group accordion based on the initial page (pg='overview')
+    var grp=PAGE_GROUPS[pg];
+    if(grp){var gEl=document.getElementById('grp-'+grp);if(gEl)gEl.classList.add('open');}
+  }catch(e){}
   await loadOverview();
   // Persistent retry until bot is ready (handles slow startups)
   var _retries=0;
@@ -3780,7 +4536,7 @@ function toggleTheme(){
     backtester:()=>{},smartmoney:loadSM,microstructure:loadMicro,
     news:()=>renderNews(),sentinel:()=>{loadSentinel();loadAIDecisions();},approvals:loadApprovals,
     notebook:()=>{},journal:()=>renderJournal(),settings:loadSettings,diagnostics:loadDiag,
-    btcintel:loadBtcIntel};
+    btcintel:loadBtcIntel,guide:renderGuide};
   reload[pg]?.();
 }
 (function applyStoredTheme(){
@@ -3852,6 +4608,36 @@ pollApprCnt();
     <div id="sdm-body" style="padding:20px;min-height:200px;font-size:13px;line-height:1.7;color:var(--text)">
       <div style="text-align:center;padding:30px;color:var(--text3)"><div class="spin"></div></div>
     </div>
+  </div>
+</div>
+
+<!-- ── HELP DRAWER ── -->
+<div class="help-drawer" id="help-drawer">
+  <div class="help-head">
+    <div>
+      <div class="help-title" id="help-title">Page Help</div>
+      <div class="help-sub" id="help-sub">—</div>
+    </div>
+    <div style="display:flex;gap:6px;align-items:center">
+      <button class="btn btn-sm" onclick="nav('guide');closeHelp()">Full Guide →</button>
+      <button class="btn btn-sm" onclick="closeHelp()">✕</button>
+    </div>
+  </div>
+  <div class="help-body" id="help-body">
+    <div class="loading"><div class="spin"></div> Loading help…</div>
+  </div>
+</div>
+<div id="help-overlay" style="display:none;position:fixed;inset:0;z-index:699" onclick="closeHelp()"></div>
+
+<!-- ── COMMAND PALETTE ── -->
+<div class="cmdk-bg" id="cmdk-bg" onclick="if(event.target===this)cmdkClose()">
+  <div class="cmdk">
+    <div class="cmdk-in-wrap">
+      <span class="cmdk-hint">⌘</span>
+      <input type="text" id="cmdk-in" class="cmdk-in" placeholder="Jump to page, search symbol, run command…" oninput="cmdkRender()" onkeydown="cmdkKey(event)">
+      <span class="cmdk-kbd">Esc</span>
+    </div>
+    <div class="cmdk-list" id="cmdk-list"></div>
   </div>
 </div>
 
