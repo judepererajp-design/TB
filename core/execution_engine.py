@@ -233,6 +233,16 @@ class TrackedExecution:
     has_momentum_expansion: bool = False
     has_liquidity_reaction: bool = False
 
+    # Gap 5 — per-trigger magnitude multipliers (populated by _check_triggers).
+    # Each defaults to 1.0 (no scaling) and is clamped to [0.5, 2.0] by
+    # core._exec_helpers.magnitude_multiplier.  A small wick on a thin alt
+    # gets 0.5; a $5M whale sweep vs a $500K median gets 2.0.  The multiplier
+    # is applied to the fixed nominal weight in ``triggers_met``.
+    rejection_magnitude: float = 1.0
+    structure_magnitude: float = 1.0
+    momentum_magnitude:  float = 1.0
+    liquidity_magnitude: float = 1.0
+
     # FIX STICKY-TRIGGERS: record when trigger accumulation window started.
     # Triggers older than TRIGGER_WINDOW_SECS are stale and must be reset —
     # a rejection candle from 2 hours ago + structure shift from now is NOT
@@ -275,10 +285,20 @@ class TrackedExecution:
         New weights make liquidity alone (score=1.0) insufficient to trigger entry.
         """
         score = 0.0
-        if self.has_structure_shift:    score += 2.0  # Real structural break
-        if self.has_momentum_expansion: score += 2.0  # Real buyer/seller participation
-        if self.has_liquidity_reaction: score += 1.0  # Valid but not standalone
-        if self.has_rejection_candle:   score += 1.0  # Valid but not standalone
+        # Gap 5 — magnitude multiplier scales each trigger's nominal weight
+        # by how decisively it fired relative to its own baseline.  A full
+        # structural break on real volume counts 2.0; a marginal break on
+        # thin volume counts 1.0 (multiplier clamped to floor 0.5 at the
+        # magnitude source).  This prevents a threshold-grazing shift from
+        # carrying the same weight as a decisive one.
+        if self.has_structure_shift:
+            score += 2.0 * float(self.structure_magnitude or 1.0)
+        if self.has_momentum_expansion:
+            score += 2.0 * float(self.momentum_magnitude or 1.0)
+        if self.has_liquidity_reaction:
+            score += 1.0 * float(self.liquidity_magnitude or 1.0)
+        if self.has_rejection_candle:
+            score += 1.0 * float(self.rejection_magnitude or 1.0)
         return score
 
 
@@ -1239,6 +1259,12 @@ class ExecutionEngine:
                 sig.has_structure_shift    = False
                 sig.has_momentum_expansion = False
                 sig.has_liquidity_reaction = False
+                # Gap 5: clear magnitudes too so stale multipliers don't leak
+                # into the next window's fresh trigger detections.
+                sig.rejection_magnitude = 1.0
+                sig.structure_magnitude = 1.0
+                sig.momentum_magnitude  = 1.0
+                sig.liquidity_magnitude = 1.0
                 sig.trigger_window_since   = now
                 if any(_was):
                     logger.info(
@@ -1363,6 +1389,14 @@ class ExecutionEngine:
                 sig.has_rejection_candle = True
             elif sig.direction == "SHORT" and c < o:
                 sig.has_rejection_candle = True
+        # Gap 5: magnitude — wick-size relative to ATR.  A rejection on a
+        # 2×ATR bar carries more information than one on a 0.5×ATR bar.
+        if sig.has_rejection_candle and atr_14 > 0:
+            try:
+                from core._exec_helpers import magnitude_multiplier as _mm
+                sig.rejection_magnitude = _mm(rng, atr_14)
+            except Exception:
+                pass
 
         # Fix E2: momentum expansion — requires volume spike AND large body
         vol_spike = float(vols[-1]) > avg_vol * 1.3
@@ -1373,6 +1407,18 @@ class ExecutionEngine:
                 sig.has_momentum_expansion = True
             elif sig.direction == "SHORT" and c < o:
                 sig.has_momentum_expansion = True
+        # Gap 5: magnitude — body size * vol ratio, normalized by ATR & avg vol.
+        # A 2×ATR candle on 3× volume is a much stronger signal than a
+        # 0.6×ATR candle on 1.3× volume (the threshold floor).
+        if sig.has_momentum_expansion and atr_14 > 0 and avg_vol > 0:
+            try:
+                from core._exec_helpers import magnitude_multiplier as _mm
+                body_mag = _mm(body, atr_14 * 0.6)
+                vol_mag = _mm(float(vols[-1]), avg_vol * 1.3)
+                # Combined magnitude is the geometric-ish mean, clamped.
+                sig.momentum_magnitude = max(0.5, min(2.0, (body_mag * vol_mag) ** 0.5))
+            except Exception:
+                pass
 
         # STRATEGIST FIX E: structure shift with volume validation
         # "Structure shift = break of structure (real demand/supply)" → score=2
@@ -1396,10 +1442,24 @@ class ExecutionEngine:
                 recent_swing_high = float(np.max(swing_lookback))
                 if c > recent_swing_high * 1.002 and _vol_confirms_structure:
                     sig.has_structure_shift = True
+                    # Gap 5: magnitude — how far past the swing high we broke.
+                    # 0.2% clearance = baseline (floor 0.5); 1%+ clearance = 2.0.
+                    try:
+                        from core._exec_helpers import magnitude_multiplier as _mm
+                        clearance_pct = (c - recent_swing_high) / recent_swing_high
+                        sig.structure_magnitude = _mm(clearance_pct, 0.002)
+                    except Exception:
+                        pass
             elif sig.direction == "SHORT":
                 recent_swing_low = float(np.min(swing_lookback))
                 if c < recent_swing_low * 0.998 and _vol_confirms_structure:
                     sig.has_structure_shift = True
+                    try:
+                        from core._exec_helpers import magnitude_multiplier as _mm
+                        clearance_pct = (recent_swing_low - c) / recent_swing_low
+                        sig.structure_magnitude = _mm(clearance_pct, 0.002)
+                    except Exception:
+                        pass
 
         # Trigger 4: liquidity reaction — use pre-computed market_state (Fix E3: no double fetch)
         if market_state is None:
@@ -1407,6 +1467,18 @@ class ExecutionEngine:
 
         if detect_liquidity_reaction({"direction": sig.direction}, market_state):
             sig.has_liquidity_reaction = True
+            # Gap 5: magnitude — sweep USD relative to per-symbol baseline.
+            # build_market_state typically exposes `liquidity_sweep_usd` in the
+            # liquidity block; we fall back gracefully if absent.
+            try:
+                from core._exec_helpers import magnitude_multiplier as _mm
+                liq_block = dict((market_state or {}).get('liquidity') or {})
+                sweep_usd = float(liq_block.get('sweep_usd') or 0.0)
+                median_usd = float(liq_block.get('median_sweep_usd') or 0.0)
+                if sweep_usd > 0 and median_usd > 0:
+                    sig.liquidity_magnitude = _mm(sweep_usd, median_usd)
+            except Exception:
+                pass
 
         # Persist trigger flags whenever any of them is now set.
         # This is a cheap UPDATE (only touched if at least one flag is True) so
