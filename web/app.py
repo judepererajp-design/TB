@@ -1154,6 +1154,7 @@ class DashboardApp:
 
             # AI analysis - capped at 45s so total scan stays under 90s client timeout
             try:
+                from analyzers.ai_analyst import ai_analyst
                 analysis = await asyncio.wait_for(
                     ai_analyst.analyse_symbol(
                         symbol=symbol,
