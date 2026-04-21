@@ -959,16 +959,24 @@ class TelegramFormatter:
                              fill_price: float, signal_id: int,
                              scored=None) -> str:
         """
-        IN TRADE card — levels always visible so you never have to hunt for them.
+        PRICE AT ENTRY ZONE card — levels always visible so you never have to hunt for them.
+
+        NOTE: This is emitted when price TOUCHES the entry zone, not when an order is
+        actually filled. A true fill only happens after the execution engine confirms
+        triggers and publishes "⚡ EXECUTION CONFIRMED" (see core.engine EXECUTE branch).
+        The headline and price label reflect that — do NOT call this "IN TRADE" or
+        "Filled" here because the subsequent WATCHING → ALMOST → EXPIRED lifecycle
+        would contradict it for the same signal id.
+
         scored: optional ScoredSignal — used to show entry zone / SL / TP levels.
         """
         dir_emoji = "🟢" if direction == "LONG" else "🔴"
         dir_label = "LONG ▲" if direction == "LONG" else "SHORT ▼"
         now_utc = datetime.now(timezone.utc).strftime("%H:%M UTC · %d %b %Y")
         msg = (
-            f"✅ <b>IN TRADE</b>  ·  {dir_emoji} <b>{dir_label}  {symbol}</b>\n"
+            f"📍 <b>PRICE AT ENTRY ZONE</b>  ·  {dir_emoji} <b>{dir_label}  {symbol}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Filled:  <code>{fmt_price(fill_price)}</code>\n"
+            f"Price:   <code>{fmt_price(fill_price)}</code>\n"
         )
         if scored:
             sig = scored.base_signal

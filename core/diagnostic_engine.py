@@ -354,6 +354,25 @@ class DiagnosticEngine:
 
     # ── Approval system ───────────────────────────────────────
 
+    @staticmethod
+    def _proposal_target_key(change_type: str, new_value) -> str:
+        """
+        Build a stable key identifying the TARGET of a proposal (not its value),
+        so two proposals that mutate the same knob (e.g., swing RR floor 1.75 vs
+        1.77) collapse to one pending approval instead of stacking.
+        """
+        try:
+            if isinstance(new_value, dict):
+                if change_type == "rr_floor":
+                    return f"rr_floor:{new_value.get('setup_class', '_')}"
+                if change_type == "suppress_strategy":
+                    return f"suppress_strategy:{new_value.get('strategy', '_')}"
+                if change_type == "exclude_symbol":
+                    return f"exclude_symbol:{new_value.get('symbol', '_')}"
+        except Exception:
+            pass
+        return change_type
+
     async def propose_change(self, change_type: str, description: str,
                               old_value, new_value, reason: str,
                               risk_level: str = "LOW",
@@ -362,8 +381,52 @@ class DiagnosticEngine:
         Propose a runtime config change. Sends Telegram approval request.
         Does NOT apply anything until user taps YES.
         """
-        # ── Global rate cap — prevent more than N proposals per hour ──────────
+        # ── Dedup against existing non-expired pending approvals ─────────────
+        # Without this, if the user never taps YES/NO, the diagnostic loop keeps
+        # firing a new approval every 30 min (value-specific time dedup at the
+        # call site only prevents *call* frequency, not queue buildup).
+        # Result seen in the field: 6 identical "Lower swing RR floor: 2.0 → 1.x"
+        # proposals piled up with 5 still pending, all showing From: 2.0.
+        # Instead of creating a new approval, update the existing one in place
+        # with the fresher proposed value/reason and keep the same approval_id
+        # so the Telegram card can be edited rather than duplicated.
         now = time.time()
+        try:
+            _target_key = self._proposal_target_key(change_type, new_value)
+        except Exception:
+            _target_key = None
+        if _target_key:
+            for _existing in list(self._pending_approvals.values()):
+                if _existing.change_type != change_type:
+                    continue
+                if _existing.expires_at and _existing.expires_at <= now:
+                    continue
+                try:
+                    _existing_key = self._proposal_target_key(
+                        _existing.change_type, _existing.new_value
+                    )
+                except Exception:
+                    _existing_key = None
+                if _existing_key != _target_key:
+                    continue
+                # Found a matching pending proposal — refresh it in place.
+                _existing.description = description
+                _existing.new_value = new_value
+                _existing.reason = reason
+                _existing.risk_level = risk_level
+                _existing.estimated_impact = estimated_impact
+                logger.info(
+                    f"🔬 Approval refreshed [{_existing.approval_id}] "
+                    f"(duplicate suppressed): {description}"
+                )
+                if self.on_send_approval:
+                    try:
+                        await self.on_send_approval(_existing)
+                    except Exception as _e:
+                        logger.debug(f"on_send_approval on refresh failed: {_e}")
+                return
+
+        # ── Global rate cap — prevent more than N proposals per hour ──────────
         cutoff = now - 3600
         recent_proposals = [t for t in self._proposal_timestamps if t > cutoff]
         if len(recent_proposals) >= self._max_proposals_per_hour:
