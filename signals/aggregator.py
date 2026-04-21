@@ -1901,7 +1901,7 @@ class SignalAggregator:
             f"strategy={signal.strategy}"
         )
         if _tl:
-            _tl.signal(symbol=signal.symbol, direction=_sig_dir, grade=scored.grade, confidence=final, entry_low=signal.entry_low, entry_high=signal.entry_high, stop_loss=signal.stop_loss, tp1=signal.tp1, tp2=signal.tp2, rr=signal.rr_ratio, strategy=signal.strategy, regime=scored.regime, tech=scored.technical_score, vol=scored.volume_score, flow=scored.orderflow_score, deriv=scored.derivatives_score, sent=scored.sentiment_score, corr=scored.correlation_score, result="APPROVED")
+            _tl.signal(symbol=signal.symbol, direction=_sig_dir, grade=scored.grade, confidence=final, entry_low=signal.entry_low, entry_high=signal.entry_high, stop_loss=signal.stop_loss, tp1=signal.tp1, tp2=signal.tp2, rr=signal.rr_ratio, strategy=signal.strategy, regime=scored.regime, tech=scored.technical_score, vol=scored.volume_score, flow=scored.orderflow_score, deriv=scored.derivatives_score, sent=scored.sentiment_score, corr=scored.correlation_score, result="PASSED_AGGREGATOR")
 
         return scored
 

@@ -53,9 +53,14 @@ class _TradeLogger:
         deriv: float = 0.0,
         sent: float = 0.0,
         corr: float = 0.0,
-        result: str = "APPROVED",   # "APPROVED" or "REJECTED(REASON ...)"
+        result: str = "PASSED_AGGREGATOR",   # "PASSED_AGGREGATOR" or "REJECTED(REASON ...)"
     ) -> None:
-        """Log a signal that was either approved or rejected by the aggregator."""
+        """Log a signal that was either approved or rejected by the aggregator.
+
+        Note: "PASSED_AGGREGATOR" means the signal survived aggregator gating.
+        It does NOT mean the signal was sent to Telegram or entered execution
+        tracking — see ``published()`` and ``tracked()`` for those stages.
+        """
         _tlog.info(
             "SIGNAL | %s %s | grade=%s conf=%.1f"
             " | entry=%.4f-%.4f sl=%.4f tp1=%.4f tp2=%.4f"
@@ -70,7 +75,59 @@ class _TradeLogger:
         )
 
     # ──────────────────────────────────────────────────────────────
-    # 2. Execution trigger update (→ ALMOST)
+    # 2. Published to Telegram (publisher confirmed delivery)
+    # ──────────────────────────────────────────────────────────────
+    def published(
+        self,
+        *,
+        signal_id: int,
+        symbol: str,
+        direction: str,
+        grade: str,
+        strategy: str,
+        message_id: Optional[int] = None,
+    ) -> None:
+        """Log that a signal was successfully delivered to Telegram.
+
+        This is written by signals/signal_publisher.publish() after the
+        Telegram publish succeeds (or the raw fallback lands). It marks
+        the boundary between "aggregator accepted" and "user saw the alert".
+        """
+        _tlog.info(
+            "PUBLISHED | %s %s #%d | grade=%s | strategy=%s | msg_id=%s",
+            symbol, direction, signal_id, grade, strategy,
+            message_id if message_id is not None else "n/a",
+        )
+
+    # ──────────────────────────────────────────────────────────────
+    # 3. Added to execution engine tracking (awaiting entry triggers)
+    # ──────────────────────────────────────────────────────────────
+    def tracked(
+        self,
+        *,
+        signal_id: int,
+        symbol: str,
+        direction: str,
+        grade: str,
+        strategy: str,
+        min_triggers: float,
+        setup_class: str = "intraday",
+    ) -> None:
+        """Log that execution_engine.track() has registered this signal.
+
+        This is the third stage after PASSED_AGGREGATOR and PUBLISHED.
+        The signal is now in the execution queue waiting for entry triggers
+        (structure shift / momentum / liquidity / rejection).
+        """
+        _tlog.info(
+            "TRACKED | %s %s #%d | grade=%s | strategy=%s"
+            " | min_triggers=%.1f | setup=%s",
+            symbol, direction, signal_id, grade, strategy,
+            min_triggers, setup_class,
+        )
+
+    # ──────────────────────────────────────────────────────────────
+    # 4. Execution trigger update (→ ALMOST)
     # ──────────────────────────────────────────────────────────────
     def trigger(
         self,

@@ -571,6 +571,18 @@ class ExecutionEngine:
         )
         self._tracked[signal_id].TRIGGER_WINDOW_SECS = _get_trigger_window_secs(setup_class)
         price_cache.subscribe(symbol)
+        # Trade-tape marker (Apr 2026): distinguish TRACKED from PUBLISHED
+        # so the tape shows the handoff from publisher to execution engine.
+        try:
+            if _tl:
+                _tl.tracked(
+                    signal_id=signal_id, symbol=symbol, direction=direction,
+                    grade=grade, strategy=strategy,
+                    min_triggers=float(_min_trig),
+                    setup_class=setup_class,
+                )
+        except Exception:
+            pass
         # Persist (best-effort, fire-and-forget) so a crash/restart shortly after
         # track() doesn't lose this signal. Errors are surfaced via the
         # _safe_ensure_future done-callback rather than swallowed.

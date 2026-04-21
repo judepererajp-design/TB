@@ -148,6 +148,56 @@ class BTCEventContext:
             return f"🕐 Published {age:.0f}m ago"
         return "🕐 Just now"
 
+    def conf_mult_for_direction(self, direction: str) -> float:
+        """
+        Direction-aware confidence multiplier.
+
+        Apr 2026 audit fix: the flat ``confidence_mult`` was getting applied
+        uniformly to both LONGs and SHORTs during a bearish BTC macro event,
+        so a ×0.70 on a MACRO_RISK_OFF was cutting SHORTs (the trade direction
+        the news actually supports) as hard as LONGs.
+
+        The event's ``direction`` attribute encodes what the news implies for
+        price. The ``confidence_mult`` is calibrated for the *adverse*
+        direction. For a trade in the *friendly* direction we soften the
+        penalty to one-third of its magnitude (so a ×0.70 becomes ×0.90 for
+        the friendly side), leaving the adverse side at the full calibration.
+
+        NEUTRAL events (e.g. BTC_TECHNICAL liquidation) apply uniformly.
+        """
+        mult = float(self.confidence_mult)
+        if mult >= 1.0:
+            # Boost (e.g. risk-on +10%) — only apply to the supported direction.
+            ev_dir = (self.direction or "NEUTRAL").upper()
+            sig_dir = (direction or "").upper()
+            if ev_dir == "BULLISH" and sig_dir == "LONG":
+                return mult
+            if ev_dir == "BEARISH" and sig_dir == "SHORT":
+                return mult
+            if ev_dir in ("BULLISH", "BEARISH"):
+                # Counter to the boost direction: no boost.
+                return 1.0
+            return mult
+
+        # mult < 1.0 — penalty case.
+        ev_dir = (self.direction or "NEUTRAL").upper()
+        sig_dir = (direction or "").upper()
+        if ev_dir not in ("BULLISH", "BEARISH") or sig_dir not in ("LONG", "SHORT"):
+            return mult  # Uniform application for NEUTRAL events / unknown dirs.
+
+        # Adverse side = the trade direction the news works against.
+        #   BEARISH news + LONG  → adverse
+        #   BULLISH news + SHORT → adverse
+        adverse = (ev_dir == "BEARISH" and sig_dir == "LONG") or (
+            ev_dir == "BULLISH" and sig_dir == "SHORT"
+        )
+        if adverse:
+            return mult
+        # Friendly side: soften to one-third of the penalty magnitude.
+        # Penalty magnitude = (1.0 - mult), softened = penalty * 0.33.
+        softened = 1.0 - (1.0 - mult) * 0.33
+        return softened
+
 
 # ── Keyword classification tables ────────────────────────────
 
