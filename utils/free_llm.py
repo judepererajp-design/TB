@@ -38,6 +38,11 @@ _RETRY_DELAY_S  = 2      # seconds between attempt 1 and attempt 2 (non-429 fail
 _RATE_LIMIT_BASE_S      = 12.0   # first 429 wait (pre-jitter)
 _RATE_LIMIT_JITTER_S    = 6.0    # +/- range on each sleep
 _RATE_LIMIT_MAX_S       = 90.0   # cap single backoff to 90 s
+# Hard ceiling on accumulated rate-limit sleeps within a single call_llm().
+# Prevents one blocked LLM from stalling upstream pipelines when all three
+# attempts hit 429 — once this budget is exhausted we stop retrying and
+# return None so callers can fall back to rule-based logic immediately.
+_RATE_LIMIT_TOTAL_BUDGET_S = 75.0
 _RATE_LIMITED_SENTINEL  = "__RATE_LIMITED__"
 _FALLBACK_MODEL = "openai"  # most stable Pollinations model
 
@@ -166,6 +171,11 @@ async def call_llm(
     if close_session:
         session = aiohttp.ClientSession(timeout=_TIMEOUT)
 
+    # Track cumulative rate-limit sleep within this call so one blocked LLM
+    # can't stall the pipeline: once we exceed _RATE_LIMIT_TOTAL_BUDGET_S
+    # of accumulated 429-backoff, we short-circuit remaining attempts.
+    _rate_limit_sleep_total = 0.0
+
     try:
         # Attempt 1
         result = await _single_call(session, payload, model, attempt=1)
@@ -196,10 +206,18 @@ async def call_llm(
         _first_was_429 = result == _RATE_LIMITED_SENTINEL
         _sleep2 = _rate_limit_backoff_secs(1) if _first_was_429 else _RETRY_DELAY_S
         if _first_was_429:
+            if _rate_limit_sleep_total + _sleep2 > _RATE_LIMIT_TOTAL_BUDGET_S:
+                logger.warning(
+                    "FreeLLM %s rate-limit budget exhausted (%.1fs / %.1fs) — "
+                    "skipping remaining retries, returning None",
+                    model, _rate_limit_sleep_total, _RATE_LIMIT_TOTAL_BUDGET_S,
+                )
+                return None
             logger.info(
                 "FreeLLM %s rate-limited — sleeping %.1fs before attempt 2",
                 model, _sleep2,
             )
+            _rate_limit_sleep_total += _sleep2
         await asyncio.sleep(_sleep2)
         result = await _single_call(session, payload, model, attempt=2)
         if attempts_out is not None:
@@ -228,10 +246,18 @@ async def call_llm(
             # If the last attempt was rate-limited, wait longer before falling over
             if result == _RATE_LIMITED_SENTINEL:
                 _sleep3 = _rate_limit_backoff_secs(2)
+                if _rate_limit_sleep_total + _sleep3 > _RATE_LIMIT_TOTAL_BUDGET_S:
+                    logger.warning(
+                        "FreeLLM %s rate-limit budget exhausted (%.1fs / %.1fs) — "
+                        "skipping fallback, returning None",
+                        model, _rate_limit_sleep_total, _RATE_LIMIT_TOTAL_BUDGET_S,
+                    )
+                    return None
                 logger.info(
                     "FreeLLM %s still rate-limited — sleeping %.1fs before fallback to %s",
                     model, _sleep3, _FALLBACK_MODEL,
                 )
+                _rate_limit_sleep_total += _sleep3
                 await asyncio.sleep(_sleep3)
             logger.warning(
                 "FreeLLM %s failed after 2 attempts -- falling back to %s",

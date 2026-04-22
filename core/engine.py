@@ -4827,16 +4827,51 @@ class Engine:
                     _current_regime = _hra.regime.value if _hra.regime else "UNKNOWN"
                 except Exception:
                     _current_regime = "UNKNOWN"
-                # Strategies that are expected to be silent in this regime
-                _regime_expected_silent = {
-                    "VOLATILE":       {"mean_reversion", "range_scalper", "momentum", "wyckoff",
-                                       "institutional_breakout", "geometric", "harmonic"},
-                    "VOLATILE_PANIC": {"mean_reversion", "range_scalper", "momentum", "wyckoff",
-                                       "institutional_breakout", "geometric", "harmonic",
-                                       "elliott_wave", "price_action"},
-                    "BEAR_TREND":     {"mean_reversion"},
-                    "CHOPPY":         {"momentum", "institutional_breakout"},
-                }.get(_current_regime, set())
+
+                # Derive expected-silent set from each strategy's own VALID_REGIMES.
+                # Single source of truth: a strategy is expected-silent in the
+                # current regime iff the regime is NOT in its VALID_REGIMES (or
+                # its own gate returns early before generating signals).
+                #
+                # Log-audit 2026-04-22: the previous hard-coded map lacked a
+                # BULL_TREND entry, so mean_reversion/reversal/range_scalper
+                # (all hard-gated to CHOPPY or explicitly blocked on trends)
+                # always alerted as "real" in BULL_TREND.  Deriving from the
+                # strategy instances themselves keeps this in sync as VALID_
+                # REGIMES evolves.
+                _regime_expected_silent: set = set()
+                try:
+                    for _inst in self._strategies:
+                        _valid = getattr(_inst, "VALID_REGIMES", None)
+                        if not _valid:
+                            continue
+                        # VALID_REGIMES may be a frozenset of regime-name strings
+                        # or already a set of enum values — normalise to str.
+                        _valid_names = {
+                            (getattr(r, "value", None) or str(r))
+                            for r in _valid
+                        }
+                        if _current_regime not in _valid_names:
+                            _key = self._strat_key_map.get(
+                                _inst.name, _inst.name.lower()
+                            )
+                            _regime_expected_silent.add(_key)
+                except Exception as _derive_err:
+                    logger.debug(f"Expected-silent derivation fallback: {_derive_err}")
+
+                # Hand-maintained overrides for strategies whose "valid regime"
+                # is implicit (e.g. RangeScalper explicitly blocks BULL/BEAR
+                # inside analyse() rather than via VALID_REGIMES).  Kept
+                # minimal and only for cases the reflection above can't catch.
+                _MANUAL_OVERRIDES = {
+                    "BULL_TREND":     {"range_scalper"},
+                    "BEAR_TREND":     {"range_scalper"},
+                    "VOLATILE":       {"range_scalper"},
+                    "VOLATILE_PANIC": {"range_scalper"},
+                }
+                _regime_expected_silent |= _MANUAL_OVERRIDES.get(
+                    _current_regime, set()
+                )
 
                 # Split into real alerts vs expected
                 _real_alerts   = [(s, h) for s, h in silent_strats if s not in _regime_expected_silent]
