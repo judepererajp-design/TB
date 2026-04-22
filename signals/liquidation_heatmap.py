@@ -531,7 +531,24 @@ class LiquidationHeatmap:
                 # but subsequent identical failures go to DEBUG.
                 _neg_key = (symbol, exchange)
                 _prev_fail = self._symbol_negcache.get(_neg_key, 0.0)
-                if now - _prev_fail > self._symbol_negcache_ttl:
+                # Classify the error: permanent HTTP 4xx (symbol not listed,
+                # malformed query) should never be logged at WARN — they're
+                # structural and will keep failing identically until the
+                # venue adds the symbol.  Transient/network errors still
+                # get WARN on first hit per TTL.
+                # Log-audit 2026-04-22: 192 WARN/day were HTTP 400/404 on
+                # unlisted symbols.  This bucket moves them to DEBUG
+                # immediately and extends their negcache TTL so we don't
+                # keep retrying a guaranteed-fail request every 30 min.
+                import re as _re
+                _err_text = str(result).lower()
+                _is_4xx_perm = bool(_re.search(r'\bhttp 4\d\d\b', _err_text)) or \
+                               ' 400' in _err_text or ' 404' in _err_text
+                if _is_4xx_perm:
+                    logger.debug(
+                        f"Liquidation fetch failed [{exchange}] {symbol}: {result} (permanent 4xx)"
+                    )
+                elif now - _prev_fail > self._symbol_negcache_ttl:
                     logger.warning(
                         f"Liquidation fetch failed [{exchange}] {symbol}: {result}"
                     )
@@ -539,17 +556,20 @@ class LiquidationHeatmap:
                     logger.debug(
                         f"Liquidation fetch failed [{exchange}] {symbol}: {result} (suppressed, in negcache)"
                     )
-                self._symbol_negcache[_neg_key] = now
+                # Permanent 4xx: long TTL (24h) — symbol is not listed,
+                # don't bother retrying until the next day.
+                self._symbol_negcache[_neg_key] = (
+                    now + (86400.0 - self._symbol_negcache_ttl)
+                    if _is_4xx_perm else now
+                )
                 # Global exchange cooldown is only appropriate for network-
                 # level failures (timeouts, 5xx). Per-symbol 400/404 (symbol
                 # not listed there) must NOT pause the whole endpoint for
                 # unrelated symbols — which was happening before and stopped
                 # ~1/3 of symbols from reaching a healthy venue for 5 min.
-                _err_text = str(result).lower()
                 # Proper HTTP 5xx detector — looks for "http 5XX" or " 5XX "
                 # as a status token rather than matching any " 5" substring
                 # which would have false-matched things like "volume 5000".
-                import re as _re
                 _is_5xx = bool(_re.search(r'\b5\d\d\b', _err_text))
                 _is_network = (
                     isinstance(result, (asyncio.TimeoutError,)) or

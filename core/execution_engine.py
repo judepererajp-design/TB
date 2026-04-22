@@ -103,6 +103,11 @@ LOCAL_RANGE_EXECUTE_BYPASS_STRATEGIES = frozenset({
     "RangeScalper",
 })
 LOCAL_RANGE_WRONG_SIDE_THRESHOLD = 0.20
+# Minimum ATR-multiple of drift from EQ before a "late execute" block can fire.
+# Below this, a pullback into the wrong half of a tight local range is still a
+# normal continuation rather than a late entry.  Tuned from live logs where
+# 0.22-0.41 range-position drifts blocked sub-ATR pullbacks on wedge entries.
+LATE_MIN_ATR_MULTIPLE = 0.5
 
 def _get_watching_timeout(sig) -> int:
     """Return setup-class-aware watching timeout in seconds."""
@@ -127,7 +132,18 @@ def _timeframe_to_seconds(timeframe: str) -> int:
 
 
 def _late_local_range_reason(sig, price: float, ohlcv: list) -> Optional[str]:
-    """Block live execute calls that have drifted into the wrong side of a tight local range."""
+    """Block live execute calls that have drifted into the wrong side of a tight local range.
+
+    Two-gate check (both must trigger to block):
+      (a) Range-position: price is > LOCAL_RANGE_WRONG_SIDE_THRESHOLD of the
+          half-range past the equilibrium on the wrong side.
+      (b) ATR-normalised drift: displacement from EQ is > LATE_MIN_ATR_MULTIPLE × ATR.
+
+    Rationale (log-audit 2026-04-22): gate (a) alone was firing on 5–12% ranges
+    where a normal sub-ATR pullback carries price 20% past the mid — a valid
+    continuation, not late entry. Adding (b) means a drift inside one ATR of
+    EQ is never called "late", regardless of how tight the local range is.
+    """
     if getattr(sig, "strategy", "") in LOCAL_RANGE_EXECUTE_BYPASS_STRATEGIES:
         return None
     if price <= 0 or not ohlcv or len(ohlcv) < 10:
@@ -136,6 +152,7 @@ def _late_local_range_reason(sig, price: float, ohlcv: list) -> Optional[str]:
     try:
         highs = [float(bar[2]) for bar in ohlcv]
         lows = [float(bar[3]) for bar in ohlcv]
+        closes = [float(bar[4]) for bar in ohlcv]
     except Exception:
         return None
 
@@ -156,15 +173,37 @@ def _late_local_range_reason(sig, price: float, ohlcv: list) -> Optional[str]:
         return None
 
     position = max(-1.0, min(1.0, (price - eq) / half_range))
+
+    # ATR (simplified: mean of |high-low| over last 14 bars — sufficient here
+    # because we only use it for relative drift gating, not for sizing).
+    _atr_bars = min(14, len(highs) - 1)
+    if _atr_bars >= 3:
+        _tr_sum = 0.0
+        for i in range(len(highs) - _atr_bars, len(highs)):
+            _h, _l = highs[i], lows[i]
+            _pc = closes[i - 1] if i >= 1 else closes[i]
+            _tr = max(_h - _l, abs(_h - _pc), abs(_l - _pc))
+            _tr_sum += _tr
+        atr = _tr_sum / _atr_bars
+    else:
+        atr = 0.0
+
+    drift_abs = abs(price - eq)
+    atr_drift_ratio = drift_abs / atr if atr > MIN_PRICE_DENOMINATOR else 0.0
+    # Only "late" if drift exceeds a meaningful ATR multiple. A pullback that is
+    # still within ~0.5 ATR of mid-range is a normal continuation, not late entry.
+    if atr > MIN_PRICE_DENOMINATOR and atr_drift_ratio < LATE_MIN_ATR_MULTIPLE:
+        return None
+
     if getattr(sig, "direction", "") == "LONG" and position > LOCAL_RANGE_WRONG_SIDE_THRESHOLD:
         return (
             f"Late LONG execute blocked: price drifted into premium of tight local range "
-            f"({position:+.2f}, range {range_pct*100:.1f}%)"
+            f"({position:+.2f}, range {range_pct*100:.1f}%, drift {atr_drift_ratio:.2f}×ATR)"
         )
     if getattr(sig, "direction", "") == "SHORT" and position < -LOCAL_RANGE_WRONG_SIDE_THRESHOLD:
         return (
             f"Late SHORT execute blocked: price drifted into discount of tight local range "
-            f"({position:+.2f}, range {range_pct*100:.1f}%)"
+            f"({position:+.2f}, range {range_pct*100:.1f}%, drift {atr_drift_ratio:.2f}×ATR)"
         )
     return None
 

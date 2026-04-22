@@ -3828,6 +3828,10 @@ function initSSE(){
           if(!_nsig._notified){_nsig._notified=true;handleNotification({...d.new_signal,type:'new_signal',ts:Date.now()/1000});}
           var bs=document.getElementById('bdg-sigs');if(bs){var n=(parseInt(bs.textContent||0)||0)+1;bs.textContent=n;bs.classList.add('show');}
           if(pg==='overview')setTimeout(loadOverview,1500);
+          // Log-audit 2026-04-22 (Q4): if the Signals page is currently visible,
+          // reload it immediately so the new card appears without waiting for
+          // the 15s auto-poll.
+          if(pg==='signals')setTimeout(loadSignals,300);
         }
       }catch{}
     };
@@ -4636,6 +4640,10 @@ initSSE();
 setInterval(refreshTicker,20000);
 setInterval(()=>{if(pg==='overview')loadOverview();},60000);
 setInterval(()=>{if(pg==='positions')loadPositions();},10000);
+// Log-audit 2026-04-22 (Q4): Signals page had no auto-poll — users had to
+// hit ↻ Refresh for new/updated/invalidated signals to appear.  15s matches
+// typical SSE latency without thrashing the DB.
+setInterval(()=>{if(pg==='signals')loadSignals();},15000);
 setInterval(()=>{if(pg==='overview'){
   // Force status badge refresh every 30s regardless
   api('/api/status',3000).then(st=>{
