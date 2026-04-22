@@ -1197,7 +1197,11 @@ tr:hover td{background:rgba(255,255,255,.015)}
 <div class="page" id="page-btcintel">
 <div class="topbar">
   <div><div class="ph">BTC News Intelligence</div><div class="pm">Event classification · Altcoin signal adjustments · Why is BTC moving?</div></div>
-  <div><button class="btn" onclick="loadBtcIntel()">↻ Refresh</button></div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap">
+    <button class="btn btn-p" onclick="openBtcOverride()">📝 Manual Override</button>
+    <button class="btn btn-r" id="btc-override-clear-btn" onclick="clearBtcOverride()" style="display:none">✕ Clear Override</button>
+    <button class="btn" onclick="loadBtcIntel()">↻ Refresh</button>
+  </div>
 </div>
 <div class="page-scroll">
   <!-- Event Status Banner -->
@@ -1209,6 +1213,13 @@ tr:hover td{background:rgba(255,255,255,.015)}
         <div style="font-size:12px;color:var(--text2);margin-top:4px" id="btc-banner-expl">—</div>
       </div>
       <div style="display:flex;gap:8px;flex-shrink:0;flex-wrap:wrap" id="btc-banner-pills"></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:12px">
+    <div class="card-h"><div class="card-t">Manual Override</div></div>
+    <div class="card-b" id="btc-override-body">
+      <div class="empty">No active manual override</div>
     </div>
   </div>
 
@@ -1810,6 +1821,7 @@ var nbCtx={},nbHist=[],curNbSym='';
 var eqDays=30,pfDays=30;
 var charts={},_prices={},_sigMap={};
 var newsPg=0;
+var _btcIntelState=null;
 
 async function api(p,ms=8000){
   try{
@@ -2916,13 +2928,91 @@ async function loadLearning(){
 const BNI_COLORS={MACRO_RISK_ON:'rgba(0,232,122,.7)',MACRO_RISK_OFF:'rgba(255,51,85,.7)',BTC_FUNDAMENTAL:'rgba(41,121,255,.7)',BTC_TECHNICAL:'rgba(240,180,41,.7)',EXCHANGE_EVENT:'rgba(255,51,85,.85)',REGULATORY:'rgba(124,58,237,.7)',ALTCOIN_SPECIFIC:'rgba(6,182,212,.7)',UNKNOWN:'rgba(90,106,138,.5)'};
 const BNI_SEV_COLOR={LOW:'var(--text3)',MEDIUM:'var(--amber)',HIGH:'var(--red)',EXTREME:'#ff0055'};
 const BNI_SEV_BG={LOW:'rgba(90,106,138,.15)',MEDIUM:'rgba(240,180,41,.12)',HIGH:'rgba(255,51,85,.15)',EXTREME:'rgba(255,0,85,.2)'};
+async function btcOverridePost(path,payload){
+  var token=(localStorage.getItem('dashboard_auth_token')||'').trim();
+  for(var attempt=0;attempt<2;attempt++){
+    try{
+      var headers={'Content-Type':'application/json'};
+      if(token)headers['X-Auth-Token']=token;
+      var r=await fetch(A+path,{method:'POST',headers,body:JSON.stringify(payload||{})});
+      var d={};try{d=await r.json();}catch(_e){}
+      if(r.status!==401){
+        if(r.ok&&token)localStorage.setItem('dashboard_auth_token',token);
+        return {ok:r.ok,status:r.status,data:d};
+      }
+    }catch(e){
+      return {ok:false,status:0,data:{error:e.message||'request failed'}};
+    }
+    token=(prompt('Dashboard auth token required for override actions.\n\nEnter DASHBOARD_AUTH_TOKEN:',token)||'').trim();
+    if(!token)return {ok:false,status:401,data:{error:'Dashboard auth token required'}};
+  }
+  return {ok:false,status:401,data:{error:'Unauthorized'}};
+}
+function renderBtcOverrideCard(data){
+  var box=document.getElementById('btc-override-body');
+  var clearBtn=document.getElementById('btc-override-clear-btn');
+  if(!box)return;
+  var ov=data&&data.override&&data.override.active?data.override.active:null;
+  if(clearBtn)clearBtn.style.display=ov?'inline-flex':'none';
+  if(!ov){
+    box.innerHTML='<div class="empty">No active manual override</div>';
+    return;
+  }
+  var remaining=((data.override&&data.override.expires_in_minutes)||0);
+  box.innerHTML=`
+    <div class="mrow"><span class="ml">Event</span><span class="mv mono" style="color:${BNI_COLORS[ov.event_type]||'var(--text2)'}">${ov.event_type}</span></div>
+    <div class="mrow"><span class="ml">Direction</span><span class="mv">${ov.direction}</span></div>
+    <div class="mrow"><span class="ml">Confidence mult</span><span class="mv mono">×${(+ov.confidence_mult||1).toFixed(2)}</span></div>
+    <div class="mrow"><span class="ml">Size mult</span><span class="mv mono">×${(+ov.size_mult||1).toFixed(2)}</span></div>
+    <div class="mrow"><span class="ml">Expires</span><span class="mv muted">${remaining>0?remaining.toFixed(0)+'m remaining':'—'}</span></div>
+    <div class="mrow"><span class="ml">Set by</span><span class="mv muted">${ov.set_by||'dashboard'}</span></div>
+    <div class="mrow" style="align-items:flex-start"><span class="ml">Reason</span><span class="mv muted" style="font-size:10.5px;line-height:1.45;max-width:320px">${esc(ov.reason||'—')}</span></div>`;
+}
+async function openBtcOverride(){
+  var meta=_btcIntelState||{};
+  var current=meta.override&&meta.override.active?meta.override.active:null;
+  var defaults=meta.override_defaults||{};
+  var currentCtx=meta.context||{};
+  var eventTypes=(meta.event_types||[]).filter(v=>v&&v!=='UNKNOWN');
+  var directions=meta.directions||['BULLISH','BEARISH','NEUTRAL'];
+  var eventType=(prompt('Override event type:\n'+eventTypes.join(', '),current&&current.event_type||((currentCtx.event_type&&currentCtx.event_type!=='UNKNOWN')?currentCtx.event_type:'MACRO_RISK_OFF'))||'').trim().toUpperCase();
+  if(!eventType)return;
+  if(eventTypes.indexOf(eventType)===-1){alert('Invalid event type. Choose one of:\n'+eventTypes.join(', '));return;}
+  var direction=(prompt('Direction:\n'+directions.join(', '),current&&current.direction||currentCtx.direction||'NEUTRAL')||'').trim().toUpperCase();
+  if(!direction)return;
+  if(directions.indexOf(direction)===-1){alert('Invalid direction. Choose one of:\n'+directions.join(', '));return;}
+  var confRaw=(prompt('Confidence multiplier',current&&current.confidence_mult!=null?String(current.confidence_mult):'1.0')||'').trim();
+  if(!confRaw)return;
+  var sizeRaw=(prompt('Size multiplier',current&&current.size_mult!=null?String(current.size_mult):'1.0')||'').trim();
+  if(!sizeRaw)return;
+  var ttlInput=(prompt('TTL minutes',current&&current.expires_at_utc?String(Math.max(1,Math.round((current.expires_at_utc-Date.now()/1000)/60))):String(defaults.ttl_minutes||60))||'').trim();
+  if(!ttlInput)return;
+  var reason=(prompt('Reason / note',current&&current.reason||currentCtx.headline||'')||'').trim();
+  var conf=parseFloat(confRaw),size=parseFloat(sizeRaw),ttl=parseInt(ttlInput,10);
+  if(!isFinite(conf)||!isFinite(size)||!isFinite(ttl)){alert('Confidence, size, and TTL must be numeric.');return;}
+  var resp=await btcOverridePost('/api/btc-news/override',{event_type:eventType,direction:direction,confidence_mult:conf,size_mult:size,ttl_minutes:ttl,reason:reason});
+  if(!resp.ok||!resp.data||resp.data.error){alert('Override failed: '+((resp.data&&resp.data.error)||'unknown'));return;}
+  alert('✓ BTC news override saved');
+  await loadBtcIntel();
+}
+async function clearBtcOverride(){
+  var current=_btcIntelState&&_btcIntelState.override?_btcIntelState.override.active:null;
+  if(!current){alert('No active override to clear.');return;}
+  if(!confirm('Clear the active BTC news override?\n\n'+current.event_type+' / '+current.direction))return;
+  var resp=await btcOverridePost('/api/btc-news/override/clear',{});
+  if(!resp.ok||!resp.data||resp.data.error){alert('Clear failed: '+((resp.data&&resp.data.error)||'unknown'));return;}
+  alert('✓ BTC news override cleared');
+  await loadBtcIntel();
+}
 async function loadBtcIntel(){
   var d=await api('/api/btc-news');if(!d||d.error){return;}
+  _btcIntelState=d;
   var ctx=d.context||{};
   var active=ctx.active&&ctx.event_type!=='UNKNOWN';
   var sev=ctx.severity||'LOW';
   var sevColor=BNI_SEV_COLOR[sev]||'var(--text3)';
   var sevBg=BNI_SEV_BG[sev]||'rgba(90,106,138,.15)';
+  renderBtcOverrideCard(d);
 
   // Banner
   var banner=document.getElementById('btc-banner');

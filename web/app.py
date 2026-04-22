@@ -2059,13 +2059,59 @@ class DashboardApp:
         except Exception as e:
             return _json_response({"error": str(e), "decisions": []})
 
+    def _btc_news_context_payload(self, btc_news_intelligence, ctx) -> Dict[str, Any]:
+        """Serialize a BTC news context for dashboard consumers."""
+        move_window_minutes = 30
+        move_pct, move_dir = btc_news_intelligence._move_analyzer.get_move(move_window_minutes)
+        since_pct, since_dir = (
+            btc_news_intelligence._move_analyzer.get_move_since(ctx.detected_at)
+            if getattr(ctx, "detected_at", 0) > 0
+            else (0.0, "FLAT")
+        )
+        event_type = getattr(getattr(ctx, "event_type", "UNKNOWN"), "value", getattr(ctx, "event_type", "UNKNOWN"))
+        expires_at = float(getattr(ctx, "expires_at", 0) or 0)
+        return {
+            "active": getattr(ctx, "is_active", False),
+            "event_type": event_type,
+            "direction": getattr(ctx, "direction", "NEUTRAL"),
+            "confidence": round(float(getattr(ctx, "confidence", 0.0) or 0.0), 3),
+            "severity": getattr(ctx, "severity", "LOW"),
+            "headline": getattr(ctx, "headline", ""),
+            "explanation": getattr(ctx, "explanation", ""),
+            "impact_type": getattr(ctx, "impact_type", ""),
+            "impact_detail": getattr(ctx, "impact_detail", ""),
+            "age_minutes": round(float(getattr(ctx, "age_minutes", 0.0) or 0.0), 1),
+            "headline_age_minutes": round(float(getattr(ctx, "headline_age_minutes", 0.0) or 0.0), 1),
+            "headline_published_at": getattr(ctx, "headline_published_at", 0.0),
+            "expires_in_mins": round(max(0.0, (expires_at - time.time()) / 60.0), 1) if expires_at else 0.0,
+            "block_longs": bool(getattr(ctx, "block_longs", False)),
+            "block_shorts": bool(getattr(ctx, "block_shorts", False)),
+            "confidence_mult": float(getattr(ctx, "confidence_mult", 1.0) or 1.0),
+            "reduce_size_mult": float(getattr(ctx, "reduce_size_mult", 1.0) or 1.0),
+            "require_low_corr": bool(getattr(ctx, "require_low_corr", False)),
+            "btc_30m_move_pct": move_pct,
+            "btc_30m_direction": move_dir,
+            "btc_move_since_event_pct": since_pct,
+            "btc_move_since_event_dir": since_dir,
+            "sources": list(getattr(ctx, "sources", []) or []),
+            "is_mixed_signal": bool(getattr(ctx, "is_mixed_signal", False)),
+            "reaction_validated": bool(getattr(ctx, "reaction_validated", False)),
+            "reaction_confirmed": bool(getattr(ctx, "reaction_confirmed", False)),
+            "net_news_score": round(float(getattr(ctx, "net_news_score", 0.0) or 0.0), 3),
+        }
+
     async def _handle_btc_news(self, request: "web.Request") -> "web.Response":
         """GET /api/btc-news - BTC news event classification and altcoin impact context."""
         try:
             from analyzers.btc_news_intelligence import btc_news_intelligence, BTCEventType
+            from analyzers.news_override import news_override_store
             from analyzers.news_scraper import news_scraper
+            from config.constants import NewsOverrideDefaults
 
-            status = btc_news_intelligence.get_status()
+            await news_override_store.load()
+            effective_ctx = btc_news_intelligence.get_event_context()
+            automatic_status = btc_news_intelligence.get_status()
+            override_status = news_override_store.status()
 
             # Attach recent BTC/macro headlines for the dashboard feed
             recent_btc = [
@@ -2090,15 +2136,81 @@ class DashboardApp:
                         bear_pressure += 1
 
             return _json_response({
-                "context":       status,
-                "headlines":     recent_btc,
-                "type_counts":   dict(type_counts),
+                "context": self._btc_news_context_payload(btc_news_intelligence, effective_ctx),
+                "auto_context": automatic_status,
+                "override": override_status,
+                "headlines": recent_btc,
+                "type_counts": dict(type_counts),
                 "bull_pressure": bull_pressure,
                 "bear_pressure": bear_pressure,
-                "event_types":   [t.value for t in BTCEventType],
+                "event_types": [t.value for t in BTCEventType],
+                "directions": ["BULLISH", "BEARISH", "NEUTRAL"],
+                "override_defaults": {
+                    "ttl_minutes": NewsOverrideDefaults.DEFAULT_TTL_MINUTES,
+                    "min_ttl_minutes": NewsOverrideDefaults.MIN_TTL_MINUTES,
+                    "max_ttl_minutes": NewsOverrideDefaults.MAX_TTL_MINUTES,
+                    "min_conf_mult": NewsOverrideDefaults.MIN_CONF_MULT,
+                    "max_conf_mult": NewsOverrideDefaults.MAX_CONF_MULT,
+                    "min_size_mult": NewsOverrideDefaults.MIN_SIZE_MULT,
+                    "max_size_mult": NewsOverrideDefaults.MAX_SIZE_MULT,
+                },
             })
         except Exception as e:
-            return _json_response({"error": str(e), "context": {}, "headlines": []})
+            logger.warning("BTC news dashboard load failed: %s", e)
+            return _json_response({
+                "error": "Failed to load BTC news dashboard data",
+                "context": {},
+                "headlines": [],
+            }, status=500)
+
+    async def _handle_btc_news_override(self, request: "web.Request") -> "web.Response":
+        """POST /api/btc-news/override - install a manual BTC news override."""
+        try:
+            _auth_err = self._auth_required(request)
+            if _auth_err:
+                return _auth_err
+
+            from analyzers.news_override import news_override_store
+
+            body = await request.json()
+            override = await news_override_store.set_override(
+                event_type=str(body.get("event_type", "")).upper(),
+                direction=str(body.get("direction", "NEUTRAL")).upper(),
+                confidence_mult=float(body.get("confidence_mult", 1.0)),
+                size_mult=float(body.get("size_mult", 1.0)),
+                reason=str(body.get("reason", "")),
+                set_by="dashboard",
+                ttl_minutes=body.get("ttl_minutes"),
+            )
+            status = news_override_store.status()
+            return _json_response({
+                "ok": True,
+                "override": status.get("active") or override.to_dict(),
+                "expires_in_minutes": status.get("expires_in_minutes", 0),
+            })
+        except ValueError as e:
+            return _json_response({"ok": False, "error": str(e)}, status=400)
+        except Exception as e:
+            logger.warning("BTC news override save failed: %s", e)
+            return _json_response({"ok": False, "error": "Failed to save BTC news override"}, status=500)
+
+    async def _handle_btc_news_override_clear(self, request: "web.Request") -> "web.Response":
+        """POST /api/btc-news/override/clear - remove the active manual override."""
+        try:
+            _auth_err = self._auth_required(request)
+            if _auth_err:
+                return _auth_err
+
+            from analyzers.news_override import news_override_store
+
+            prev = await news_override_store.clear(reason="dashboard clear")
+            return _json_response({
+                "ok": True,
+                "cleared": prev.to_dict() if prev else None,
+            })
+        except Exception as e:
+            logger.warning("BTC news override clear failed: %s", e)
+            return _json_response({"ok": False, "error": "Failed to clear BTC news override"}, status=500)
 
     async def _build_signal_detail_payload(self, signal_id: int, sig: Dict[str, Any]) -> Dict[str, Any]:
         # Get live scored signal from bot memory if available
@@ -2525,6 +2637,8 @@ class DashboardApp:
         app.router.add_get("/api/journal",               self._handle_journal)
         app.router.add_get("/api/institutional",          self._handle_institutional)
         app.router.add_get("/api/btc-news",               self._handle_btc_news)   # NEW: BTC event intelligence
+        app.router.add_post("/api/btc-news/override",      self._handle_btc_news_override)
+        app.router.add_post("/api/btc-news/override/clear", self._handle_btc_news_override_clear)
         app.router.add_get("/api/drawdown",                       self._handle_drawdown)
         app.router.add_get("/api/btc-intel-history",              self._handle_btc_intel_history)
         app.router.add_get("/api/approvals/impact-preview/{id}",  self._handle_approval_impact_preview)
