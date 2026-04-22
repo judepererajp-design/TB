@@ -38,6 +38,15 @@ class CorrelationAnalyzer:
         self._cache: Dict[str, Tuple[float, float, float, int]] = {}
         self._cache_ttl = 1800   # 30 minutes
 
+        # Log-audit 2026-04-22 (Q2): BTC-correlation was working but invisible
+        # in logs — operators assumed it was off.  Emit an INFO heartbeat at
+        # most once every _HEARTBEAT_INTERVAL_SEC summarising the live cache
+        # (symbol count, avg β, avg ρ, window).  Implementation note: we log
+        # from get_btc_beta() itself right after a miss-refresh, so the line
+        # reflects actual recompute activity rather than a wall-clock timer.
+        self._last_heartbeat_ts: float = 0.0
+        self._HEARTBEAT_INTERVAL_SEC: float = 900.0  # 15 min
+
         # Active signals for portfolio tracking
         self._active_signals: Dict[str, str] = {}   # symbol -> direction
 
@@ -111,7 +120,36 @@ class CorrelationAnalyzer:
         corr = float(corr_matrix[0, 1]) if not np.isnan(corr_matrix[0, 1]) else 0.5
 
         self._cache[symbol] = (beta, corr, time.time(), dynamic_window)
+        self._maybe_log_heartbeat(dynamic_window)
         return float(beta), float(corr)
+
+    def _maybe_log_heartbeat(self, current_window: int) -> None:
+        """Emit an aggregated INFO line on BTC-corr cache activity.
+
+        Rate-limited to one line every ``_HEARTBEAT_INTERVAL_SEC`` regardless
+        of how many symbols refresh in between.  Summarises only cache entries
+        that are still within TTL so the averages reflect live state.
+        """
+        import time as _t
+        now = _t.time()
+        if now - self._last_heartbeat_ts < self._HEARTBEAT_INTERVAL_SEC:
+            return
+        try:
+            live = [
+                (b, c) for (b, c, ts, _w) in self._cache.values()
+                if now - ts < self._cache_ttl
+            ]
+            if not live:
+                return
+            avg_beta = sum(b for b, _ in live) / len(live)
+            avg_corr = sum(c for _, c in live) / len(live)
+            logger.info(
+                "📊 BTC Corr Refresh | %d symbols | avg β=%.2f | avg ρ=%.2f | window=%dh",
+                len(live), avg_beta, avg_corr, current_window,
+            )
+            self._last_heartbeat_ts = now
+        except Exception as _hb_err:
+            logger.debug(f"BTC-corr heartbeat skipped: {_hb_err}")
 
     def assess_portfolio_exposure(self, symbol: str, direction: str) -> Tuple[float, List[str]]:
         """

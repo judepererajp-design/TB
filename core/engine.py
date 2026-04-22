@@ -5958,8 +5958,8 @@ class Engine:
             # Previously only exec_state was persisted at execution_engine:1045, leaving
             # `signals.outcome` NULL/PENDING — indistinguishable from live setups.
             # The EXPIRED branch above already does this; the INVALIDATED branch was
-            # missing it. update_signal_outcome is COALESCE-safe so a later monitor
-            # call can't regress an intentionally-set terminal state.
+            # missing it.  The subsequent outcome_monitor.remove_signal() call below
+            # guarantees the monitor can't subsequently overwrite this terminal row.
             try:
                 from data.database import db as _db_inv
                 await _db_inv.update_signal_outcome(exec_sig.signal_id, "INVALIDATED", 0.0)
