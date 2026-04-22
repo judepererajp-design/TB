@@ -5953,6 +5953,18 @@ class Engine:
             if time.time() - _last_cancel < 120:  # 2 min suppress window
                 return  # Duplicate cancellation — skip silently
             setattr(self, _cancel_key, time.time())
+            # LOG-AUDIT FIX (Q3): persist INVALIDATED outcome to DB so the dashboard
+            # stops showing staleness/BTC-news/corrupt-level kills as "pending".
+            # Previously only exec_state was persisted at execution_engine:1045, leaving
+            # `signals.outcome` NULL/PENDING — indistinguishable from live setups.
+            # The EXPIRED branch above already does this; the INVALIDATED branch was
+            # missing it. update_signal_outcome is COALESCE-safe so a later monitor
+            # call can't regress an intentionally-set terminal state.
+            try:
+                from data.database import db as _db_inv
+                await _db_inv.update_signal_outcome(exec_sig.signal_id, "INVALIDATED", 0.0)
+            except Exception as _db_err:
+                logger.debug(f"Could not write INVALIDATED outcome to DB: {_db_err}")
             # Release the hourly rate-limit slot so a fresh signal can take this one's place
             try:
                 from signals.aggregator import signal_aggregator as _sa
